@@ -117,7 +117,7 @@ struct ReplySidebarView: View {
                 Button(monitor.isRunning ? "Deactivate" : "Activate") { monitor.isRunning ? monitor.stop() : monitor.start() }
                     .buttonStyle(.bordered).controlSize(.small)
             }
-            Text(monitor.isRunning ? "New message bursts are sent to OpenAI for suggestions." : "Paused. No chat is being monitored or sent.")
+            Text(monitor.isRunning ? "New message bursts are sent to OpenAI for suggestions." : "Paused. No new chat is monitored or sent.")
                 .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(12)
     }
