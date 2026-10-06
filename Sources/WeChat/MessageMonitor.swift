@@ -9,6 +9,7 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var messages: [ChatMessage] = []
     @Published private(set) var status = "Paused"
     var onBurst: ((String, [ChatMessage]) -> Void)?
+    var onDeactivated: (() -> Void)?
 
     private let bridge = WeChatBridge.shared
     private var timer: Timer?
@@ -36,7 +37,13 @@ final class MessageMonitor: ObservableObject {
         isRunning = false
         timer?.invalidate(); timer = nil
         debounce?.cancel(); debounce = nil
+        generation += 1
+        messages = []
+        lastIDs = []
+        contactName = nil
+        lastObservedContact = nil
         status = "Paused"
+        onDeactivated?()
     }
 
     func pollNow() { poll() }
@@ -62,7 +69,7 @@ final class MessageMonitor: ObservableObject {
         let added = newMessages(snapshot, old: lastIDs)
         lastIDs = ids
         guard added.contains(where: { !$0.isFromMe }) else { status = "Monitoring"; return }
-        scheduleBurst(contact: contact ?? "WeChat", context: snapshot)
+        scheduleBurst(contact: contact ?? "WeChat")
     }
 
     private func newMessages(_ current: [ChatMessage], old: [String]) -> [ChatMessage] {
@@ -74,7 +81,7 @@ final class MessageMonitor: ObservableObject {
         return Array(current.suffix(1))
     }
 
-    private func scheduleBurst(contact: String, context: [ChatMessage]) {
+    private func scheduleBurst(contact: String) {
         generation += 1
         let token = generation
         debounce?.cancel()

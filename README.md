@@ -33,7 +33,7 @@ The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuildi
 2. Open WeChat and navigate to a direct conversation.
 3. Choose **Continue with ChatGPT** and finish sign-in in the browser. The app uses OAuth/OIDC with PKCE and a loopback callback.
 4. Choose an account-available model in Settings.
-5. Choose **Resume**. New incoming messages are grouped until roughly two seconds of quiet, then the app requests three suggestions.
+5. Choose **Activate**. The app reads the current visible context into memory. New incoming messages are grouped until roughly two seconds of quiet, then the app requests three suggestions.
 6. Review the assessment and candidates. **Copy** puts only the selected candidate on the clipboard; paste and send it yourself if you want.
 
 ## What is kept and sent
@@ -43,7 +43,8 @@ The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuildi
 - `store: false` prevents Responses application-state storage; it is not a zero-retention guarantee. OpenAI's current API data controls say abuse-monitoring logs may contain prompts and responses and are generally retained for up to 30 days. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
 - Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
 - Relationship profile details are stored in local app preferences and are not encrypted separately by the app. Raw chat text and credentials are not written to logs.
-- Each incoming burst triggers inference automatically while monitoring is enabled. Copying a suggestion leaves it in the system clipboard, where clipboard managers or Universal Clipboard may retain or sync it.
+- Each incoming burst triggers inference automatically while monitoring is enabled. Deactivating clears the in-memory conversation snapshot and suggestions and cancels pending local work. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
+- Copying a suggestion leaves it in the system clipboard, where clipboard managers or Universal Clipboard may retain or sync it.
 - The model list is fetched from the account's `/v1/models` catalog. There is no API-key or separately billed fallback.
 
 ## Architecture
@@ -67,7 +68,8 @@ The monitor reads the currently selected WeChat window. It does not read WeChat'
 - [ ] Sign in with ChatGPT, select a model shown for that account, and confirm three distinct labeled candidates appear.
 - [ ] Copy each candidate and verify the clipboard contains its text.
 - [ ] Use Regenerate and a special instruction.
-- [ ] Pause and resume monitoring; switch conversations and verify old context is not reused.
+- [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
+- [ ] Switch conversations and verify old context and suggestions are cleared.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 

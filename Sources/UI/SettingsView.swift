@@ -28,7 +28,7 @@ struct SettingsView: View {
                 }
             }
             Section("Privacy") {
-                Text("While monitoring, each incoming burst automatically sends up to 20 recent messages, the contact name, your local relationship profile, and any special instruction to OpenAI for suggestions. Chat text is not saved by this app. Your profile is saved in local app preferences without separate app-level encryption. store=false prevents Responses application-state storage, but is not a zero-retention guarantee; OpenAI may retain abuse-monitoring logs. Copying a reply leaves it on the system clipboard.")
+                Text("While monitoring, each incoming burst automatically sends up to 20 recent messages, the contact name, your local relationship profile, and any special instruction to OpenAI for suggestions. Deactivate before opening sensitive chats. Deactivation clears the local session and cancels pending work, but cannot recall a request OpenAI has already received. Chat text is not saved by this app. Your profile is saved in local app preferences without separate app-level encryption. store=false is not a zero-retention guarantee. Copying a reply leaves it on the system clipboard.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Link("OpenAI data controls", destination: URL(string: "https://developers.openai.com/api/docs/guides/your-data")!)
                     .font(.caption)

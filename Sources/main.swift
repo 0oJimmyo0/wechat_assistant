@@ -2,10 +2,9 @@ import SwiftUI
 import AppKit
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var statusItem: NSStatusItem?
-    private weak var monitorMenuItem: NSMenuItem?
     private let monitor = MessageMonitor.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -22,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "WeChat Reply Copilot"
         window.contentView = NSHostingView(rootView: ReplySidebarView())
+        window.delegate = self
         window.isReleasedWhenClosed = false
         window.setFrameAutosaveName("WeChatReplyCopilotSidebar")
         window.level = .floating
@@ -35,10 +35,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "bubble.left.and.text.bubble.right.fill", accessibilityDescription: "WeChat Reply Copilot")
         let menu = NSMenu()
-        let toggle = NSMenuItem(title: "Start monitoring", action: #selector(toggleMonitoring), keyEquivalent: "")
-        toggle.target = self
-        menu.addItem(toggle)
-        monitorMenuItem = toggle
         menu.addItem(NSMenuItem(title: "Show Copilot", action: #selector(showCopilot), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
@@ -46,12 +42,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
-    @objc private func toggleMonitoring() {
-        monitor.isRunning ? monitor.stop() : monitor.start()
-        monitorMenuItem?.title = monitor.isRunning ? "Pause monitoring" : "Start monitoring"
+    @objc private func showCopilot() {
+        if let window { window.makeKeyAndOrderFront(nil) } else { showSidebar() }
+        NSApp.activate(ignoringOtherApps: true)
     }
-    @objc private func showCopilot() { window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc private func quit() { monitor.stop(); NSApp.terminate(nil) }
+    func windowWillClose(_ notification: Notification) {
+        monitor.stop()
+        window = nil
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 

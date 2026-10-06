@@ -60,6 +60,7 @@ struct ReplySidebarView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             monitor.onBurst = { contact, context in generate(context: context, contact: contact) }
+            monitor.onDeactivated = { clearSession() }
             if auth.isSignedIn, monitor.messages.isEmpty { monitor.pollNow() }
         }
         .onChange(of: monitor.contactName) { _, _ in
@@ -72,10 +73,12 @@ struct ReplySidebarView: View {
         }
         .onDisappear {
             monitor.onBurst = nil
+            monitor.onDeactivated = nil
             generationTask?.cancel()
             generationTask = nil
             generationID = nil
             isGenerating = false
+            suggestion = nil
         }
         .sheet(isPresented: $showSettings) { SettingsView(profileStore: profileStore).frame(width: 390, height: 380) }
     }
@@ -111,13 +114,25 @@ struct ReplySidebarView: View {
             HStack {
                 Label("Monitor", systemImage: monitor.isRunning ? "eye.fill" : "eye.slash")
                 Spacer()
-                Button(monitor.isRunning ? "Pause" : "Resume") { monitor.isRunning ? monitor.stop() : monitor.start() }
+                Button(monitor.isRunning ? "Deactivate" : "Activate") { monitor.isRunning ? monitor.stop() : monitor.start() }
                     .buttonStyle(.bordered).controlSize(.small)
             }
+            Text(monitor.isRunning ? "New message bursts are sent to OpenAI for suggestions." : "Paused. No chat is being monitored or sent.")
+                .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(12)
     }
 
     private func sectionLabel(_ text: String) -> some View { Text(text).font(.system(size: 10, weight: .bold)).tracking(0.8).foregroundStyle(.tertiary) }
+
+    private func clearSession() {
+        generationTask?.cancel()
+        generationTask = nil
+        generationID = nil
+        isGenerating = false
+        suggestion = nil
+        errorMessage = nil
+        instruction = ""
+    }
 
     private func generate(context: [ChatMessage], contact: String) {
         guard auth.isSignedIn, !isGenerating else { return }
