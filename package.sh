@@ -2,7 +2,7 @@
 set -e
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/.build"
-APP_NAME="WeChatAutoReply"
+APP_NAME="WeChatReplyCopilot"
 DMG_NAME="${APP_NAME}.dmg"
 
 # Ensure we have the built app

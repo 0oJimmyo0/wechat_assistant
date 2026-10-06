@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_NAME="WeChatAutoReply"
+APP_NAME="WeChatReplyCopilot"
 BUILD_DIR="$PROJECT_DIR/.build"
 MACOS_DIR="$BUILD_DIR/$APP_NAME.app/Contents/MacOS"
 RESOURCES_DIR="$BUILD_DIR/$APP_NAME.app/Contents/Resources"
@@ -40,7 +40,7 @@ echo ""
 echo "Compiling..."
 
 SDK_PATH="$(xcrun --show-sdk-path --sdk macosx)"
-TARGET="arm64-apple-macos15.0"
+TARGET="arm64-apple-macos14.0"
 
 swiftc \
     -sdk "$SDK_PATH" \
@@ -50,6 +50,9 @@ swiftc \
     -framework Carbon \
     -framework ApplicationServices \
     -framework Combine \
+    -framework Network \
+    -framework Security \
+    -framework CryptoKit \
     -parse-as-library \
     -O \
     -o "$MACOS_DIR/$APP_NAME" \
@@ -99,7 +102,7 @@ if [[ "${1:-}" == "--install" ]]; then
     if [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
         ICON_PATH="$PROJECT_DIR/Resources/AppIcon.icns"
     elif [ -f "/Users/junxibao/Desktop/Subject.png" ]; then
-        ICON_PATH="/Users/junxibao/Desktop/Subject.png"
+        ICON_PATH=""
     fi
     if [ -n "${ICON_PATH:-}" ]; then
         swift -e "import Cocoa; NSWorkspace.shared.setIcon(NSImage(contentsOfFile: \"$ICON_PATH\")!, forFile: \"/Applications/$APP_NAME.app\", options: [])" 2>/dev/null
@@ -109,6 +112,6 @@ if [[ "${1:-}" == "--install" ]]; then
     if [ "$CURRENT_HASH" != "$PREV_HASH" ] || [ -z "$PREV_HASH" ]; then
         echo ""
         echo "⚠️  Source changed — if you already granted permission, it should survive."
-        echo "   If not: System Settings → Privacy → Accessibility → WeChatAutoReply"
+        echo "   If not: System Settings → Privacy & Security → Accessibility → WeChat Reply Copilot"
     fi
 fi
