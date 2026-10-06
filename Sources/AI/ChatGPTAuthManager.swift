@@ -154,7 +154,6 @@ final class ChatGPTAuthManager: ObservableObject {
                      URLQueryItem(name: "state", value: state), URLQueryItem(name: "nonce", value: nonce),
                      URLQueryItem(name: "code_challenge_method", value: "S256"), URLQueryItem(name: "code_challenge", value: challenge)]
         if old == nil { items.append(URLQueryItem(name: "agent_name_hint", value: "WeChat Reply Copilot")) }
-        else { items.append(URLQueryItem(name: "id_token_hint", value: old?.idToken)); if let email = old?.email { items.append(URLQueryItem(name: "login_hint", value: email)) } }
         var components = URLComponents(url: discovery.authorization_endpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = items
         guard let url = components.url else { listener.cancel(); throw CopilotError.service("Could not start ChatGPT sign-in.") }
@@ -164,15 +163,23 @@ final class ChatGPTAuthManager: ObservableObject {
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
                     guard let data, error == nil, let requestText = String(data: data, encoding: .utf8),
                           let line = requestText.components(separatedBy: "\r\n").first,
+                          line.hasPrefix("GET "),
                           let path = line.split(separator: " ").dropFirst().first,
                           let callback = URLComponents(string: "http://127.0.0.1\(path)"),
                           callback.path == "/auth/callback" else {
                         continuation.resume(throwing: CopilotError.service("Invalid local sign-in callback.")); return
                     }
                     let values = Dictionary((callback.queryItems ?? []).compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { _, latest in latest })
-                    let html = "<html><body><h2>WeChat Reply Copilot</h2><p>You can return to the app.</p></body></html>"
+                    guard values["state"] == state else {
+                        let body = Data("Invalid sign-in callback".utf8)
+                        var response = Data("HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+                        response.append(body)
+                        connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                        return
+                    }
+                    let html = "<html><head><meta name=\"referrer\" content=\"no-referrer\"></head><body><h2>WeChat Reply Copilot</h2><p>You can return to the app.</p><script>history.replaceState(null, \"\", \"/auth/callback\")</script></body></html>"
                     let body = Data(html.utf8)
-                    var response = Data("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+                    var response = Data("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
                     response.append(body)
                     connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
                     continuation.resume(returning: values)

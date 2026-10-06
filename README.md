@@ -40,8 +40,10 @@ The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuildi
 
 - Chat context is held in memory, limited to the latest 20 messages, and sent only with the current suggestion request.
 - Responses API requests use `stream: true` and `store: false` with the selected account's OAuth access token.
+- `store: false` prevents Responses application-state storage; it is not a zero-retention guarantee. OpenAI's current API data controls say abuse-monitoring logs may contain prompts and responses and are generally retained for up to 30 days. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
 - Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
-- Relationship profile details are stored locally. Raw chat text and credentials are not written to logs.
+- Relationship profile details are stored in local app preferences and are not encrypted separately by the app. Raw chat text and credentials are not written to logs.
+- Each incoming burst triggers inference automatically while monitoring is enabled. Copying a suggestion leaves it in the system clipboard, where clipboard managers or Universal Clipboard may retain or sync it.
 - The model list is fetched from the account's `/v1/models` catalog. There is no API-key or separately billed fallback.
 
 ## Architecture

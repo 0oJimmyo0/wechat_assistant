@@ -9,6 +9,8 @@ struct ReplySidebarView: View {
     @State private var errorMessage: String?
     @State private var isGenerating = false
     @State private var showSettings = false
+    @State private var generationTask: Task<Void, Never>?
+    @State private var generationID: UUID?
 
     private var latestIncoming: String { monitor.messages.last(where: { !$0.isFromMe })?.text ?? "等待对方的新消息" }
 
@@ -60,7 +62,21 @@ struct ReplySidebarView: View {
             monitor.onBurst = { contact, context in generate(context: context, contact: contact) }
             if auth.isSignedIn, monitor.messages.isEmpty { monitor.pollNow() }
         }
-        .onDisappear { monitor.onBurst = nil }
+        .onChange(of: monitor.contactName) { _, _ in
+            generationTask?.cancel()
+            generationTask = nil
+            generationID = nil
+            isGenerating = false
+            suggestion = nil
+            errorMessage = nil
+        }
+        .onDisappear {
+            monitor.onBurst = nil
+            generationTask?.cancel()
+            generationTask = nil
+            generationID = nil
+            isGenerating = false
+        }
         .sheet(isPresented: $showSettings) { SettingsView(profileStore: profileStore).frame(width: 390, height: 380) }
     }
 
@@ -106,14 +122,26 @@ struct ReplySidebarView: View {
     private func generate(context: [ChatMessage], contact: String) {
         guard auth.isSignedIn, !isGenerating else { return }
         guard !auth.selectedModel.isEmpty else { errorMessage = "Choose an available model in settings."; return }
+        let requestID = UUID()
+        generationID = requestID
         isGenerating = true; errorMessage = nil; suggestion = nil
         let profile = profileStore.profile
         let specialInstruction = instruction
         let model = auth.selectedModel
-        Task {
-            defer { isGenerating = false }
-            do { suggestion = try await SuggestionEngine.shared.generate(contact: contact, context: context, profile: profile, instruction: specialInstruction, model: model) }
-            catch { errorMessage = error.localizedDescription }
+        generationTask?.cancel()
+        generationTask = Task { @MainActor in
+            do {
+                let result = try await SuggestionEngine.shared.generate(contact: contact, context: context, profile: profile, instruction: specialInstruction, model: model)
+                guard !Task.isCancelled, generationID == requestID,
+                      monitor.contactName == nil || monitor.contactName == contact else { return }
+                suggestion = result
+            } catch {
+                guard !Task.isCancelled, generationID == requestID else { return }
+                errorMessage = error.localizedDescription
+            }
+            guard generationID == requestID else { return }
+            isGenerating = false
+            generationTask = nil
         }
     }
 }
