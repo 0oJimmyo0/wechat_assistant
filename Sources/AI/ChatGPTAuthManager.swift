@@ -158,8 +158,6 @@ final class ChatGPTAuthManager: ObservableObject {
         var components = URLComponents(url: discovery.authorization_endpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = items
         guard let url = components.url else { listener.cancel(); throw CopilotError.service("Could not start ChatGPT sign-in.") }
-        NSWorkspace.shared.open(url)
-
         let result: [String: String] = try await withCheckedThrowingContinuation { continuation in
             listener.newConnectionHandler = { connection in
                 connection.start(queue: .main)
@@ -180,6 +178,7 @@ final class ChatGPTAuthManager: ObservableObject {
                     continuation.resume(returning: values)
                 }
             }
+            NSWorkspace.shared.open(url)
         }
         listener.cancel()
         guard result["state"] == state else { throw CopilotError.service("ChatGPT sign-in state check failed.") }
