@@ -60,8 +60,9 @@ swiftc \
 
 echo "Compilation successful!"
 
-# Copy Info.plist
-cp "$PROJECT_DIR/Resources/Info.plist" "$RESOURCES_DIR/Info.plist"
+# The bundle manifest belongs directly under Contents; resources such as the icon
+# stay under Contents/Resources.
+cp "$PROJECT_DIR/Resources/Info.plist" "$BUILD_DIR/$APP_NAME.app/Contents/Info.plist"
 
 # Copy App Icon
 if [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
