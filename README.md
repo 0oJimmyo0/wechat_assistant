@@ -1,114 +1,78 @@
-# WeChat Auto Reply
+# WeChat Reply Copilot
 
-<p align="center">
-  <img src="Resources/AppIcon.png" width="128" height="128" alt="WeChat Auto Reply App Icon">
-</p>
+A suggestion-only macOS sidebar for the currently open WeChat conversation. It watches the visible chat, waits for an incoming message burst to settle, and asks the signed-in ChatGPT account for exactly three reply ideas. You choose and copy a candidate yourself.
 
-> **macOS only.** Automatically read and reply to WeChat messages using macOS Accessibility API and DeepSeek AI.
-
-## How It Works
-
-1. You open a WeChat chat window manually
-2. The app reads incoming messages via macOS Accessibility API
-3. DeepSeek generates a natural, human-like reply
-4. The reply is typed out **character by character** (with random delays) directly into WeChat — not pasted instantly
-
-This makes replies look natural and reduces the risk of detection.
-
-## Features
-
-- **Human-like typing** — 50-200ms random delay per character, occasional thinking pauses
-- **Burst message handling** — intelligently handles multiple messages sent in rapid succession by waiting for the sender to finish
-- **Skip probability** — randomly ignore some messages to avoid replying to everything
-- **Work hours** — only auto-reply during specified hours
-- **Per-contact system prompts** — control tone, style, and behavior of replies globally or individually for different contacts
-- **Model language control** — seamlessly force the AI model to reply in a specific language (e.g., Chinese, English)
-- **Proactive mode** — let AI send the first message to start a conversation
-- **Conversation memory** — keeps context from recent messages (last 20 rounds)
+**The app does not type into WeChat, paste into WeChat, or send messages.** Candidate buttons only copy text to the macOS clipboard.
 
 ## Requirements
 
-- **macOS 14.0 or later** (Apple Silicon)
-- **WeChat.app** (Mac version) running and logged in
-- **DeepSeek API key** ([platform.deepseek.com](https://platform.deepseek.com))
-- **Accessibility permission** — grant in System Settings → Privacy & Security → Accessibility
+- Apple Silicon Mac with macOS 14 or later
+- WeChat for Mac, open to the conversation you want to monitor
+- Xcode Command Line Tools (`xcrun`, `swiftc`, `codesign`)
+- A ChatGPT account that authorizes ChatGPT plan usage for this app
 
-## Installation
+## Build and install
 
 ```bash
-# Clone and build
-git clone https://github.com/JunxiBao/WeChatAutoReply.git
-cd WeChatAutoReply
+bash build.sh
+open .build/WeChatReplyCopilot.app
+```
+
+To copy the app into `/Applications`:
+
+```bash
 bash build.sh --install
+open /Applications/WeChatReplyCopilot.app
 ```
 
-The app will be installed to `/Applications/WeChatAutoReply.app`.
+The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuilding can require granting Accessibility permission again. The app bundle name is `WeChatReplyCopilot.app`.
 
-## Usage
+## First run
 
-1. Launch the app — the settings window opens automatically
-2. Paste your DeepSeek API key (click the eye icon to reveal the text field for pasting)
-3. Grant accessibility permission when prompted
-4. Open WeChat and navigate to the chat you want to auto-reply to
-5. Click **Start** to begin monitoring, or **AI Send** to send an opening message
+1. Open **System Settings → Privacy & Security → Accessibility** and allow **WeChat Reply Copilot**. The app prompts for this permission when needed.
+2. Open WeChat and navigate to a direct conversation.
+3. Choose **Continue with ChatGPT** and finish sign-in in the browser. The app uses OAuth/OIDC with PKCE and a loopback callback.
+4. Choose an account-available model in Settings.
+5. Choose **Resume**. New incoming messages are grouped until roughly two seconds of quiet, then the app requests three suggestions.
+6. Review the assessment and candidates. **Copy** puts only the selected candidate on the clipboard; paste and send it yourself if you want.
 
-### Buttons
+## What is kept and sent
 
-| Button | What it does |
-|--------|-------------|
-| **Start** | Begin monitoring — replies to new incoming messages |
-| **AI Send** | AI sends one proactive message to the current chat |
-| **Reset Memory** | Clear conversation history |
-
-### Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Poll interval | 3s | How often to check for new messages |
-| Min reply delay | 3s | Minimum wait before replying |
-| Max reply delay | 15s | Maximum wait before replying |
-| Skip probability | 20% | Chance to randomly skip a message |
-| Work hours | Off | Only auto-reply during set hours |
-| Model Language | Chinese | Output language setting for the AI model |
-| System Prompt | Default | Customize prompt per-contact for varied personalities |
-
-## System Prompt (Recommended)
-
-```
-You are a real person replying to a friend on WeChat.
-Rules:
-- Casual, natural tone with filler words (嗯, 哈, 啦, 吧)
-- Occasional typos or abbreviations
-- Never say "Hello, how can I help you" or other AI phrases
-- Keep replies short, 1-3 sentences
-- If you need time to think, say "Let me check" or "One sec"
-- Always reply in Chinese
-```
+- Chat context is held in memory, limited to the latest 20 messages, and sent only with the current suggestion request.
+- Responses API requests use `stream: true` and `store: false` with the selected account's OAuth access token.
+- Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
+- Relationship profile details are stored locally. Raw chat text and credentials are not written to logs.
+- The model list is fetched from the account's `/v1/models` catalog. There is no API-key or separately billed fallback.
 
 ## Architecture
 
-```
-WeChatAutoReply.app/
-├── Sources/
-│   ├── main.swift              # App entry point & menu bar
-│   ├── WeChatBridge.swift      # Accessibility API bridge
-│   ├── DeepSeekClient.swift    # DeepSeek API client
-│   ├── AutoReplyEngine.swift   # Core polling & reply logic
-│   └── SettingsView.swift      # SwiftUI settings window
-├── Resources/
-│   ├── Info.plist
-│   └── AppIcon.icns
-└── build.sh                    # Build script
+```text
+Sources/
+├── WeChat/       Accessibility bridge, message model, polling and burst debounce
+├── AI/           ChatGPT OAuth, Keychain, model discovery, streaming Responses API, prompt parsing
+├── Profile/      Local relationship profile
+├── UI/           Suggestion sidebar, copy-only cards, account/profile settings
+└── main.swift    App and menu-bar lifecycle
 ```
 
-The app uses `CGEventPostToPid` to send keystrokes directly to the WeChat process, so it doesn't require WeChat to be in the foreground.
+The monitor reads the currently selected WeChat window. It does not read WeChat's local database, access chat history outside the visible/retrievable Accessibility tree, or automatically scroll older messages.
 
-## Safety & Disclaimer
+## Manual acceptance checklist
 
-This app uses **only system-level Accessibility APIs** — no network interception, no code injection, no reverse engineering of WeChat protocols. The app reads what's visible on screen and simulates keyboard input, just like a human would.
+- [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission.
+- [ ] With WeChat open to a direct conversation, verify the contact and latest visible messages appear.
+- [ ] Send a few incoming messages quickly; verify one suggestion request starts after the burst settles.
+- [ ] Sign in with ChatGPT, select a model shown for that account, and confirm three distinct labeled candidates appear.
+- [ ] Copy each candidate and verify the clipboard contains its text.
+- [ ] Use Regenerate and a special instruction.
+- [ ] Pause and resume monitoring; switch conversations and verify old context is not reused.
+- [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
+- [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 
-However, WeChat's Terms of Service **prohibit automated behavior**. While the app includes anti-detection measures (random delays, skip probability, human-like typing), use at your own risk.
+## Known limitations
 
-## License
-
-MIT
+- Accessibility structure varies by WeChat release. If message rows are not exposed, the fallback can read visible text but cannot reliably distinguish your own messages from incoming ones.
+- Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
+- OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
+- ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.
+- Live WeChat and OAuth behavior must be manually checked on the target Mac; a successful compile cannot verify those integrations.
