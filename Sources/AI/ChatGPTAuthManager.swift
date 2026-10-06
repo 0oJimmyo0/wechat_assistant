@@ -21,6 +21,7 @@ private struct DiscoveryDocument: Decodable {
     let authorization_endpoint: URL
     let token_endpoint: URL
     let jwks_uri: URL
+    let revocation_endpoint: URL?
 }
 
 @MainActor
@@ -30,7 +31,8 @@ final class ChatGPTAuthManager: ObservableObject {
     @Published private(set) var accountLabel = "Not signed in"
     @Published private(set) var authStatus = "ChatGPT account required"
     @Published private(set) var modelCatalog: [AvailableModel] = []
-    @Published var selectedModel = "" { didSet { UserDefaults.standard.set(selectedModel, forKey: "selected_chatgpt_model") } }
+    @Published var everydayModel = "" { didSet { UserDefaults.standard.set(everydayModel, forKey: "everyday_chatgpt_model") } }
+    @Published var carefulModel = "" { didSet { UserDefaults.standard.set(carefulModel, forKey: "careful_chatgpt_model") } }
 
     private let keychainService = "com.wechatreplycopilot.chatgpt"
     private let credentialAccount = "active-account"
@@ -73,8 +75,29 @@ final class ChatGPTAuthManager: ObservableObject {
         modelCatalog = try await ChatGPTClient.shared.availableModels()
             .filter { !$0.slug.isEmpty && $0.visibility == "list" }
         guard !modelCatalog.isEmpty else { throw CopilotError.noModels }
-        if !modelCatalog.contains(where: { $0.slug == selectedModel }) { selectedModel = modelCatalog[0].slug }
+        if !modelCatalog.contains(where: { $0.slug == everydayModel }) { everydayModel = modelCatalog[0].slug }
+        if !carefulModel.isEmpty && !modelCatalog.contains(where: { $0.slug == carefulModel }) { carefulModel = "" }
+        if carefulModel.isEmpty, modelCatalog.count > 1 { carefulModel = modelCatalog[1].slug }
         authStatus = "Signed in · \(modelCatalog.count) models available"
+    }
+
+    func signOut() async {
+        let current = credentials
+        var revoked = false
+        if let current, let endpoint = try? await loadDiscovery().revocation_endpoint {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.httpBody = form(["token": current.refreshToken, "token_type_hint": "refresh_token", "client_id": current.clientID])
+            if let (_, response) = try? await URLSession.shared.data(for: request),
+               let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) { revoked = true }
+        }
+        credentials = nil
+        modelCatalog = []
+        everydayModel = ""
+        carefulModel = ""
+        deleteCredentials()
+        authStatus = revoked ? "Signed out · refresh token revoked" : "Signed out locally · disconnect this app in ChatGPT Settings if needed"
     }
 
     func validAccessToken() async throws -> String {
@@ -131,6 +154,7 @@ final class ChatGPTAuthManager: ObservableObject {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
         let listener = try NWListener(using: parameters)
+        defer { listener.cancel() }
         let port = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NWEndpoint.Port, Error>) in
             listener.stateUpdateHandler = { state in
                 switch state {
@@ -161,13 +185,14 @@ final class ChatGPTAuthManager: ObservableObject {
             listener.newConnectionHandler = { connection in
                 connection.start(queue: .main)
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
+                    listener.newConnectionHandler = nil
                     guard let data, error == nil, let requestText = String(data: data, encoding: .utf8),
                           let line = requestText.components(separatedBy: "\r\n").first,
                           line.hasPrefix("GET "),
                           let path = line.split(separator: " ").dropFirst().first,
                           let callback = URLComponents(string: "http://127.0.0.1\(path)"),
                           callback.path == "/auth/callback" else {
-                        continuation.resume(throwing: CopilotError.service("Invalid local sign-in callback.")); return
+                        continuation.resume(throwing: CopilotError.service("Invalid local sign-in callback.")); listener.cancel(); return
                     }
                     let values = Dictionary((callback.queryItems ?? []).compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { _, latest in latest })
                     guard values["state"] == state else {
@@ -175,6 +200,8 @@ final class ChatGPTAuthManager: ObservableObject {
                         var response = Data("HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
                         response.append(body)
                         connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                        continuation.resume(throwing: CopilotError.service("ChatGPT sign-in state check failed."))
+                        listener.cancel()
                         return
                     }
                     let html = "<html><head><meta name=\"referrer\" content=\"no-referrer\"></head><body><h2>WeChat Reply Copilot</h2><p>You can return to the app.</p><script>history.replaceState(null, \"\", \"/auth/callback\")</script></body></html>"
@@ -267,7 +294,8 @@ final class ChatGPTAuthManager: ObservableObject {
         isSignedIn = credentials != nil
         accountLabel = credentials?.email ?? (credentials == nil ? "Not signed in" : "ChatGPT account")
         authStatus = credentials == nil ? "Sign in with ChatGPT to begin" : "ChatGPT account connected"
-        if let model = UserDefaults.standard.string(forKey: "selected_chatgpt_model") { selectedModel = model }
+        if let model = UserDefaults.standard.string(forKey: "everyday_chatgpt_model") { everydayModel = model }
+        if let model = UserDefaults.standard.string(forKey: "careful_chatgpt_model") { carefulModel = model }
         if isSignedIn { Task { try? await refreshModels() } }
     }
 
@@ -283,13 +311,14 @@ final class ChatGPTAuthManager: ObservableObject {
         let data = try JSONEncoder().encode(value)
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: credentialAccount]
         SecItemDelete(query as CFDictionary)
-        var item = query; item[kSecValueData as String] = data; item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        var item = query; item[kSecValueData as String] = data; item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw CopilotError.service("Could not save ChatGPT credentials to Keychain.") }
     }
 
     private func deleteCredentials() {
         SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: credentialAccount] as CFDictionary)
         isSignedIn = false; accountLabel = "Not signed in"; authStatus = "Sign in with ChatGPT to begin"
+        modelCatalog = []
     }
 }
 
@@ -326,8 +355,9 @@ private func rsaPublicKeyDER(modulus: Data, exponent: Data) -> Data {
 private func joseECDSASignatureToDER(_ signature: Data) -> Data {
     guard signature.count == 64 else { return signature }
     func integer(_ bytes: Data) -> Data {
-        var body = bytes.drop { $0 == 0 }
+        var body = Data(bytes.drop { $0 == 0 })
         if body.isEmpty { body = Data([0]) }
+        else if body[0] & 0x80 != 0 { body.insert(0, at: 0) }
         var out = Data([0x02]); out.append(derLength(body.count)); out.append(body); return out
     }
     let payload = integer(signature.prefix(32)) + integer(signature.suffix(32))

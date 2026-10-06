@@ -45,6 +45,7 @@ final class ChatGPTClient {
             if type == "response.failed" {
                 let error = event["response"] as? [String: Any]
                 let code = (error?["error"] as? [String: Any])?["code"] as? String ?? "unknown_error"
+                if code == "subscription_sharing_usage_limit_exceeded" { throw CopilotError.usageLimitExceeded }
                 throw CopilotError.service("ChatGPT could not complete this request (\(code)).")
             }
             if type == "response.incomplete" { throw CopilotError.streamIncomplete }

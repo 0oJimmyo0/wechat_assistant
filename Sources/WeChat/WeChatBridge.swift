@@ -83,9 +83,8 @@ final class WeChatBridge {
                 if !messages.isEmpty { return Array(messages.suffix(limit)) }
             }
         }
-        // Keep the original bridge's visible-text fallback for WeChat builds that do
-        // not expose the message list through Accessibility. Sender identity is
-        // unknown in this fallback, so treat these rows as incoming suggestions only.
+        // Manual analysis may use visible text when WeChat exposes no message list,
+        // but sender identity is unknown and the monitor must never auto-analyze it.
         let panelLeft = windowFrame.minX + 250
         let visibleText = find(window, depth: 30) {
             guard self.string($0, "AXRole") == "AXStaticText" else { return false }
@@ -95,7 +94,7 @@ final class WeChatBridge {
         let fallback = visibleText.compactMap { element -> ChatMessage? in
             let text = self.string(element, "AXValue") ?? self.string(element, "AXTitle") ?? ""
             guard text.count >= 2 else { return nil }
-            return ChatMessage(text: text, isFromMe: false)
+            return ChatMessage(text: text, isFromMe: false, senderIdentified: false)
         }
         return Array(fallback.suffix(limit))
     }
@@ -107,8 +106,10 @@ final class WeChatBridge {
                 ?? self.string(row, "AXValue") ?? self.string(row, "AXTitle") ?? ""
             guard text.count >= 1 else { return nil }
             let description = self.string(row, "AXDescription") ?? ""
-            let mine = description.lowercased().hasPrefix("sent") || description.hasPrefix("发出") || description.hasPrefix("我说")
-            return ChatMessage(text: text, isFromMe: mine)
+            let normalized = description.lowercased()
+            let mine = normalized.hasPrefix("sent") || description.hasPrefix("发出") || description.hasPrefix("我说")
+            let received = normalized.hasPrefix("received") || description.hasPrefix("收到") || description.hasPrefix("对方")
+            return ChatMessage(text: text, isFromMe: mine, senderIdentified: mine || received)
         }
     }
 }

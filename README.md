@@ -32,8 +32,8 @@ The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuildi
 1. Open **System Settings → Privacy & Security → Accessibility** and allow **WeChat Reply Copilot**. The app prompts for this permission when needed.
 2. Open WeChat and navigate to a direct conversation.
 3. Choose **Continue with ChatGPT** and finish sign-in in the browser. The app uses OAuth/OIDC with PKCE and a loopback callback.
-4. Choose an account-available model in Settings.
-5. Choose **Activate**. The app reads the current visible context into memory. New incoming messages are grouped until roughly two seconds of quiet, then the app requests three suggestions.
+4. Choose account-available Everyday and Careful models in Settings.
+5. Choose **Activate** while the intended conversation is open. The app locks monitoring to that conversation and reads visible context into memory. A conversation change stops monitoring and clears the local session. By default, new messages stay local until you choose **Analyze latest message**. You can opt into automatic analysis for clearly identified incoming messages.
 6. Review the assessment and candidates. **Copy** puts only the selected candidate on the clipboard; paste and send it yourself if you want.
 
 ## What is kept and sent
@@ -43,9 +43,12 @@ The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuildi
 - `store: false` prevents Responses application-state storage; it is not a zero-retention guarantee. OpenAI's current API data controls say abuse-monitoring logs may contain prompts and responses and are generally retained for up to 30 days. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
 - Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
 - Relationship profile details are stored in local app preferences and are not encrypted separately by the app. Raw chat text and credentials are not written to logs.
-- Each incoming burst triggers inference automatically while monitoring is enabled. Deactivating clears the in-memory conversation snapshot and suggestions and cancels pending local work. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
+- Monitoring is locked to the conversation active at activation. Switching conversations stops monitoring, clears the in-memory snapshot and suggestions, and requires activation again. Automatic analysis is off by default; when enabled, only bursts with identified senders can trigger requests. Generic Accessibility text fallback is available for manual analysis only. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
+- The model prompt uses speaker labels such as “我”, “对方”, or “说话方不确定”; it does not include the contact's display name. Analysis still sends up to 20 visible messages and the configured local relationship profile.
+- Everyday and Careful model choices come from the signed-in account's live model catalog. A usage-limit response stops monitoring and disables automatic analysis until you reactivate.
+- Sign out attempts to revoke the refresh token and always removes local credentials. Keychain credentials are available only while the device is unlocked.
 - Copying a suggestion leaves it in the system clipboard, where clipboard managers or Universal Clipboard may retain or sync it.
-- The model list is fetched from the account's `/v1/models` catalog. There is no API-key or separately billed fallback.
+- The model list is fetched from the account's `/v1/models` catalog. If the account reports `subscription_sharing_usage_limit_exceeded`, monitoring stops and the app points you to ChatGPT Settings → Usage. There is no API-key or separately billed fallback.
 
 ## Architecture
 
@@ -64,18 +67,19 @@ The monitor reads the currently selected WeChat window. It does not read WeChat'
 
 - [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission.
 - [ ] With WeChat open to a direct conversation, verify the contact and latest visible messages appear.
-- [ ] Send a few incoming messages quickly; verify one suggestion request starts after the burst settles.
+- [ ] Activate in one conversation, switch to another, and verify monitoring stops and the local session clears.
+- [ ] Verify manual mode does not make requests until Analyze is clicked; opt into automatic analysis and verify only identified incoming messages trigger it.
 - [ ] Sign in with ChatGPT, select a model shown for that account, and confirm three distinct labeled candidates appear.
 - [ ] Copy each candidate and verify the clipboard contains its text.
-- [ ] Use Regenerate and a special instruction.
+- [ ] Use Analyze, Regenerate carefully, and a special instruction.
 - [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
-- [ ] Switch conversations and verify old context and suggestions are cleared.
+- [ ] Confirm generic static-text fallback never automatically triggers inference.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 
 ## Known limitations
 
-- Accessibility structure varies by WeChat release. If message rows are not exposed, the fallback can read visible text but cannot reliably distinguish your own messages from incoming ones.
+- Accessibility structure varies by WeChat release. If message rows or sender identities are not exposed, visible text is marked uncertain and can only be sent through a manual Analyze action.
 - Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.

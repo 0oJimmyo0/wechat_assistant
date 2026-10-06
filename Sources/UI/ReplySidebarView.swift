@@ -11,8 +11,10 @@ struct ReplySidebarView: View {
     @State private var showSettings = false
     @State private var generationTask: Task<Void, Never>?
     @State private var generationID: UUID?
+    @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
+    @State private var usageLimitReached = false
 
-    private var latestIncoming: String { monitor.messages.last(where: { !$0.isFromMe })?.text ?? "等待对方的新消息" }
+    private var latestIncoming: String { monitor.messages.last(where: { !$0.senderIdentified || !$0.isFromMe })?.text ?? "等待对方的新消息" }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,10 +48,14 @@ struct ReplySidebarView: View {
                         Text("Special instruction").font(.caption.weight(.medium)).foregroundStyle(.secondary)
                         TextField("e.g. keep it light", text: $instruction, axis: .vertical).lineLimit(1...3).textFieldStyle(.roundedBorder)
                     }
-                    Button { generate(context: monitor.messages, contact: monitor.contactName ?? "WeChat") } label: {
-                        Label(isGenerating ? "Generating…" : "Regenerate", systemImage: "arrow.clockwise")
+                    Toggle("Automatically analyze identified messages", isOn: $autoAnalyze).font(.caption)
+                    Button { generate(context: monitor.messages, model: auth.everydayModel) } label: {
+                        Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent).disabled(isGenerating || !auth.isSignedIn || monitor.messages.isEmpty)
+                    }.buttonStyle(.borderedProminent).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
+                    Button { generate(context: monitor.messages, model: auth.carefulModel) } label: {
+                        Label("Regenerate carefully", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
+                    }.buttonStyle(.bordered).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
                 }
                 .padding(16)
             }
@@ -59,7 +65,10 @@ struct ReplySidebarView: View {
         .frame(minWidth: 320, idealWidth: 360, maxWidth: 390, minHeight: 620)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            monitor.onBurst = { contact, context in generate(context: context, contact: contact) }
+            monitor.onBurst = { _, context, canAutoAnalyze in
+                guard autoAnalyze && canAutoAnalyze else { return }
+                generate(context: context, model: auth.everydayModel)
+            }
             monitor.onDeactivated = { clearSession() }
             if auth.isSignedIn, monitor.messages.isEmpty { monitor.pollNow() }
         }
@@ -114,10 +123,12 @@ struct ReplySidebarView: View {
             HStack {
                 Label("Monitor", systemImage: monitor.isRunning ? "eye.fill" : "eye.slash")
                 Spacer()
-                Button(monitor.isRunning ? "Deactivate" : "Activate") { monitor.isRunning ? monitor.stop() : monitor.start() }
+                Button(monitor.isRunning ? "Deactivate" : "Activate") {
+                    if monitor.isRunning { monitor.stop() } else { usageLimitReached = false; monitor.start() }
+                }
                     .buttonStyle(.bordered).controlSize(.small)
             }
-            Text(monitor.isRunning ? "New message bursts are sent to OpenAI for suggestions." : "Paused. No new chat is monitored or sent.")
+            Text(monitor.isRunning ? (autoAnalyze ? "Identified incoming bursts may be sent to OpenAI automatically." : "Messages stay local until you choose Analyze.") : "Paused. No new chat is monitored or sent.")
                 .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(12)
     }
@@ -134,25 +145,28 @@ struct ReplySidebarView: View {
         instruction = ""
     }
 
-    private func generate(context: [ChatMessage], contact: String) {
+    private func generate(context: [ChatMessage], model: String) {
         guard auth.isSignedIn, !isGenerating else { return }
-        guard !auth.selectedModel.isEmpty else { errorMessage = "Choose an available model in settings."; return }
+        guard !model.isEmpty else { errorMessage = "Choose an available model in settings."; return }
         let requestID = UUID()
         generationID = requestID
         isGenerating = true; errorMessage = nil; suggestion = nil
         let profile = profileStore.profile
         let specialInstruction = instruction
-        let model = auth.selectedModel
         generationTask?.cancel()
         generationTask = Task { @MainActor in
             do {
-                let result = try await SuggestionEngine.shared.generate(contact: contact, context: context, profile: profile, instruction: specialInstruction, model: model)
-                guard !Task.isCancelled, generationID == requestID,
-                      monitor.contactName == nil || monitor.contactName == contact else { return }
+                let result = try await SuggestionEngine.shared.generate(context: context, profile: profile, instruction: specialInstruction, model: model)
+                guard !Task.isCancelled, generationID == requestID else { return }
                 suggestion = result
             } catch {
                 guard !Task.isCancelled, generationID == requestID else { return }
-                errorMessage = error.localizedDescription
+                if case CopilotError.usageLimitExceeded = error {
+                    usageLimitReached = true
+                    autoAnalyze = false
+                    monitor.stop()
+                    errorMessage = "ChatGPT plan usage limit reached. Check ChatGPT Settings → Usage. Monitoring stopped to prevent repeated requests."
+                } else { errorMessage = error.localizedDescription }
             }
             guard generationID == requestID else { return }
             isGenerating = false
@@ -162,5 +176,5 @@ struct ReplySidebarView: View {
 }
 
 private extension ChatGPTAuthManager {
-    var selectedModelDisplay: String { modelCatalog.first(where: { $0.slug == selectedModel })?.displayName ?? selectedModel }
+    var selectedModelDisplay: String { modelCatalog.first(where: { $0.slug == everydayModel })?.displayName ?? everydayModel }
 }

@@ -28,7 +28,7 @@ struct ReplySuggestion: Codable, Equatable {
 }
 
 enum CopilotError: LocalizedError {
-    case notSignedIn, missingPermission, noModels, invalidResponse, streamIncomplete, service(String)
+    case notSignedIn, missingPermission, noModels, invalidResponse, streamIncomplete, usageLimitExceeded, service(String)
     var errorDescription: String? {
         switch self {
         case .notSignedIn: "Sign in with ChatGPT to generate suggestions."
@@ -36,6 +36,7 @@ enum CopilotError: LocalizedError {
         case .noModels: "No models are available for this ChatGPT account."
         case .invalidResponse: "The model response did not contain three valid reply candidates. Regenerate to try again."
         case .streamIncomplete: "The response stream ended before completion. Please try again."
+        case .usageLimitExceeded: "ChatGPT plan usage limit reached. Check ChatGPT Settings → Usage before trying again."
         case .service(let message): message
         }
     }
