@@ -21,6 +21,7 @@ final class MessageMonitor: ObservableObject {
     private var generation = 0
     private var isCheckingConversation = false
     private var isPolling = false
+    private var isUsingVision = false
     private var unidentifiedPolls = 0
     private var candidateContact: String?
     private var candidateContactPolls = 0
@@ -46,20 +47,19 @@ final class MessageMonitor: ObservableObject {
         let token = generation
         let bridge = self.bridge
         accessibilityQueue.async { [weak self] in
-            let contact = bridge.currentContact()
-            let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
-            let screenCaptureAllowed = WeChatScreenReader.hasScreenCapturePermission
+            let detection = bridge.detectCurrentConversation()
+            let contact = detection.contact
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
                 guard let contact, !contact.isEmpty else {
-                    self.status = treeCollapsed
-                        ? self.collapsedTreeStatus(screenCaptureAllowed: screenCaptureAllowed)
-                        : "Could not identify the open WeChat conversation"
+                    self.requestScreenCaptureAccessIfNeeded(detection.visionSnapshot?.captureState)
+                    self.status = self.detectionFailureStatus(detection)
                     return
                 }
                 self.contactName = contact
                 self.lockedContact = contact
+                self.isUsingVision = detection.visionSnapshot != nil
                 self.isRunning = true
                 self.status = "Connected · reading recent messages"
             }
@@ -93,6 +93,7 @@ final class MessageMonitor: ObservableObject {
         lastIDs = []
         contactName = nil
         lockedContact = nil
+        isUsingVision = false
         status = "Paused"
         onDeactivated?()
     }
@@ -106,8 +107,8 @@ final class MessageMonitor: ObservableObject {
         let bridge = self.bridge
         let lockedContact = self.lockedContact
         accessibilityQueue.async { [weak self] in
-            let contact = bridge.currentContact()
-            let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
+            let detection = bridge.detectCurrentConversation()
+            let contact = detection.contact
             let result = contact == nil || contact != lockedContact ? nil : bridge.readMessages(limit: 50)
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -121,11 +122,9 @@ final class MessageMonitor: ObservableObject {
                     self.messages = []
                     if self.unidentifiedPolls >= self.unidentifiedPollLimit {
                         self.stop()
-                        self.status = treeCollapsed
-                            ? "Could not verify the conversation after several checks. Bring the chat to the front and activate again."
-                            : "Could not identify the open WeChat conversation. Activate again when the chat is open."
+                        self.status = self.detectionFailureStatus(detection)
                     } else {
-                        self.status = "Conversation check missed (\(self.unidentifiedPolls)/\(self.unidentifiedPollLimit)) · retrying…"
+                        self.status = self.detectionFailureStatus(detection)
                     }
                     return
                 }
@@ -150,19 +149,24 @@ final class MessageMonitor: ObservableObject {
                 }
                 self.candidateContact = nil
                 self.candidateContactPolls = 0
+                self.isUsingVision = detection.visionSnapshot != nil
                 guard let result else { return }
                 switch result {
-                case .messageListUnavailable(let collapsed):
+                case .messageListUnavailable(let collapsed, let visionState):
+                    self.requestScreenCaptureAccessIfNeeded(visionState)
                     self.messages = self.contextHistory
-                    self.status = collapsed
+                    self.status = visionState.map(self.visionCaptureFailureStatus) ?? (collapsed
                         ? self.collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
-                        : "Conversation detected, but message list is unavailable"
-                case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
+                        : "Conversation detected, but message list is unavailable")
+                case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _, let isVision):
+                    self.isUsingVision = self.isUsingVision || isVision
                     guard !snapshot.isEmpty else {
                         self.messages = self.contextHistory
-                        self.status = renderedRows == 0 || bubbleRows == 0
+                        self.status = isVision
+                            ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision OCR found text, but no message bubbles were recognized")
+                            : (renderedRows == 0 || bubbleRows == 0
                             ? "Message list found, but no rendered message rows are available"
-                            : "Message rows found, but message text is unavailable"
+                            : "Message rows found, but message text is unavailable")
                         return
                     }
                     self.processSnapshot(snapshot, contact: contact)
@@ -173,33 +177,78 @@ final class MessageMonitor: ObservableObject {
 
     private func applyInitialReadResult(_ result: MessageReadResult, contact: String) {
         switch result {
-        case .messageListUnavailable(let collapsed):
+        case .messageListUnavailable(let collapsed, let visionState):
+            requestScreenCaptureAccessIfNeeded(visionState)
             messages = contextHistory
-            status = collapsed
+            status = visionState.map(visionCaptureFailureStatus) ?? (collapsed
                 ? collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
-                : "Conversation detected: \(contact) · message list is unavailable"
-        case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
+                : "Conversation detected: \(contact) · message list is unavailable")
+        case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _, let isVision):
+            isUsingVision = isUsingVision || isVision
             contextHistory = Array(snapshot.suffix(contextHistoryLimit))
             messages = contextHistory
             lastIDs = snapshot.map(contextKey)
             if snapshot.isEmpty {
-                status = renderedRows == 0 || bubbleRows == 0
+                status = isVision
+                    ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision OCR found text, but no message bubbles were recognized")
+                    : (renderedRows == 0 || bubbleRows == 0
                     ? "Message list found, but no rendered message rows are available"
-                    : "Message rows found, but message text is unavailable"
+                    : "Message rows found, but message text is unavailable")
             } else if snapshot.allSatisfy({ !$0.senderIdentified }) {
-                status = "Message rows found, sender identity unavailable"
+                status = isUsingVision ? "Vision mode · sender identity tentative" : "Message rows found, sender identity unavailable"
             } else if snapshot.contains(where: { !$0.senderIdentified }) {
-                status = "Message rows found, some sender identities are unavailable"
+                status = isUsingVision ? "Vision mode · some sender identities tentative" : "Message rows found, some sender identities are unavailable"
             } else {
-                status = "Monitoring this conversation"
+                status = isUsingVision ? "Vision mode · monitoring this conversation" : "Monitoring this conversation"
             }
         }
     }
 
     private func collapsedTreeStatus(screenCaptureAllowed: Bool) -> String {
         screenCaptureAllowed
-            ? "WeChat's visible conversation could not be read; bring its window to the front and try again"
-            : "Allow Screen Recording for WeChat Reply Copilot in System Settings, then activate again"
+            ? "WeChat window capture failed · keep the main chat window open and on screen"
+            : "Screen Recording permission required · enable it in System Settings, then activate again"
+    }
+
+    private func detectionFailureStatus(_ detection: WeChatConversationDetection) -> String {
+        guard detection.windowFound else { return "WeChat window not found" }
+        guard let vision = detection.visionSnapshot else {
+            return detection.treeCollapsed
+                ? "Screen Recording permission required or WeChat window capture failed"
+                : "Could not identify the open WeChat conversation"
+        }
+        guard vision.captureSucceeded else {
+            return visionCaptureFailureStatus(vision.captureState)
+        }
+        if vision.ocrObservationCount == 0 { return "Vision OCR found no text" }
+        if vision.title == nil {
+            return vision.messages.isEmpty
+                ? "Vision OCR found text, but no message bubbles were recognized"
+                : "Conversation visible, but title OCR failed"
+        }
+        return "Conversation detected · reading messages"
+    }
+
+    private func visionCaptureFailureStatus(_ state: VisionCaptureState) -> String {
+        switch state {
+        case .screenRecordingPermissionRequired:
+            return "Screen Recording permission required"
+        case .weChatWindowNotFound:
+            return "WeChat window not found"
+        case .invalidWindow:
+            return "WeChat window capture failed · selected window did not match the main chat"
+        case .windowCaptureFailed:
+            return "WeChat window capture failed"
+        case .visionFailed:
+            return "Vision OCR failed"
+        case .success:
+            return "WeChat window capture failed"
+        }
+    }
+
+    private func requestScreenCaptureAccessIfNeeded(_ state: VisionCaptureState?) {
+        guard state == .screenRecordingPermissionRequired else { return }
+        WeChatScreenReader.requestScreenCapturePermissionOnce()
     }
 
     private func processSnapshot(_ snapshot: [ChatMessage], contact: String) {
@@ -221,12 +270,12 @@ final class MessageMonitor: ObservableObject {
         guard ids != lastIDs else {
             status = snapshot.allSatisfy { !$0.senderIdentified }
                 ? "Monitoring · OCR senders are tentative"
-                : "Monitoring this conversation"
+                : (isUsingVision ? "Vision mode · monitoring this conversation" : "Monitoring this conversation")
             return
         }
         lastIDs = ids
         guard !added.isEmpty else {
-            status = historyChanged ? "Conversation context updated" : "Monitoring this conversation"
+            status = historyChanged ? "Conversation context updated" : (isUsingVision ? "Vision mode · monitoring this conversation" : "Monitoring this conversation")
             return
         }
         let hasIncoming = added.contains(where: { $0.senderIdentified && !$0.isFromMe })

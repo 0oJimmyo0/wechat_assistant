@@ -2,8 +2,15 @@ import Cocoa
 import ApplicationServices
 
 enum MessageReadResult: Sendable {
-    case messageListUnavailable(treeCollapsed: Bool)
-    case messageListFound(messages: [ChatMessage], renderedRows: Int, bubbleRows: Int, placeholders: Int)
+    case messageListUnavailable(treeCollapsed: Bool, visionState: VisionCaptureState?)
+    case messageListFound(messages: [ChatMessage], renderedRows: Int, bubbleRows: Int, placeholders: Int, isVision: Bool)
+}
+
+struct WeChatConversationDetection: Sendable {
+    let contact: String?
+    let windowFound: Bool
+    let treeCollapsed: Bool
+    let visionSnapshot: VisibleWeChatSnapshot?
 }
 
 /// Read-only Accessibility access to the active WeChat conversation.
@@ -139,7 +146,13 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     func currentContact() -> String? {
-        guard let window = mainWindow() else { return nil }
+        detectCurrentConversation().contact
+    }
+
+    func detectCurrentConversation() -> WeChatConversationDetection {
+        guard let window = mainWindow() else {
+            return WeChatConversationDetection(contact: nil, windowFound: false, treeCollapsed: false, visionSnapshot: nil)
+        }
 
         // 1. WeChat 4.x's stable conversation-title node.
         if let titleNode = firstMatch(window, where: {
@@ -147,7 +160,9 @@ final class WeChatBridge: @unchecked Sendable {
         }) {
             let raw = string(titleNode, "AXValue") ?? string(titleNode, "AXTitle") ?? ""
             let name = WeChatParsing.normalizeChatTitle(raw)
-            if !name.isEmpty && !WeChatParsing.isGenericWindowTitle(name) { return name }
+            if !name.isEmpty && !WeChatParsing.isGenericWindowTitle(name) {
+                return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false, visionSnapshot: nil)
+            }
         }
 
         // 2. Session item identifiers are useful only when WeChat explicitly
@@ -155,13 +170,19 @@ final class WeChatBridge: @unchecked Sendable {
         if let selectedSessionRow = firstMatch(window, where: {
             identifier($0).hasPrefix("session_item_") && bool($0, "AXSelected")
         }), let name = WeChatParsing.selectedSessionName(from: identifier(selectedSessionRow), isSelected: true) {
-            return name
+            return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false, visionSnapshot: nil)
         }
-        return visibleSnapshot(for: window)?.title
+        let snapshot = visibleSnapshot(for: window)
+        return WeChatConversationDetection(
+            contact: snapshot?.title,
+            windowFound: true,
+            treeCollapsed: accessibilityTreeAppearsCollapsed(in: window),
+            visionSnapshot: snapshot
+        )
     }
 
     func readMessages(limit: Int = 50) -> MessageReadResult {
-        guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false) }
+        guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
 
         // 1. Stable WeChat 4.x message-list identifier.
         if let list = firstMatch(window, where: {
@@ -181,7 +202,7 @@ final class WeChatBridge: @unchecked Sendable {
         // large right-side scroll area when the chat composer is also present.
         guard hasConversationComposer(in: window) else {
             if let result = readVisibleMessages(in: window, limit: limit) { return result }
-            return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window))
+            return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window), visionState: nil)
         }
         let windowFrame = frame(window)
         let paneAreas = find(window) {
@@ -196,23 +217,45 @@ final class WeChatBridge: @unchecked Sendable {
             }
         }
         if let result = readVisibleMessages(in: window, limit: limit) { return result }
-        return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window))
+        return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window), visionState: nil)
     }
 
     private func readVisibleMessages(in window: AXUIElement, limit: Int) -> MessageReadResult? {
         guard let snapshot = visibleSnapshot(for: window) else { return nil }
+        guard snapshot.captureSucceeded else {
+            return .messageListUnavailable(
+                treeCollapsed: accessibilityTreeAppearsCollapsed(in: window),
+                visionState: snapshot.captureState
+            )
+        }
         let messages = Array(snapshot.messages.suffix(limit))
         return .messageListFound(
             messages: messages,
-            renderedRows: messages.count,
+            renderedRows: snapshot.ocrObservationCount,
             bubbleRows: messages.count,
-            placeholders: 0
+            placeholders: 0,
+            isVision: true
         )
     }
 
     private func visibleSnapshot(for window: AXUIElement) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
         return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window))
+    }
+
+    func visionDiagnosticReport() -> String {
+        guard let app = weChatApplication() else {
+            return "Screen Recording permission: \(WeChatScreenReader.hasScreenCapturePermission ? "granted" : "not granted")\nTarget WeChat PID: unavailable\nWindow capture: WeChat window not found\n"
+        }
+        guard let window = mainWindow() else {
+            return "Screen Recording permission: \(WeChatScreenReader.hasScreenCapturePermission ? "granted" : "not granted")\nTarget WeChat PID: \(app.processIdentifier)\nWindow capture: WeChat window not found\n"
+        }
+        return WeChatScreenReader.shared.diagnosticReport(pid: app.processIdentifier, windowFrame: frame(window))
+    }
+
+    func annotatedVisionPreview() -> NSImage? {
+        guard let app = weChatApplication(), let window = mainWindow() else { return nil }
+        return WeChatScreenReader.shared.annotatedPreview(pid: app.processIdentifier, windowFrame: frame(window))
     }
 
     private func readRows(in list: AXUIElement, limit: Int) -> MessageReadResult {
@@ -244,7 +287,8 @@ final class WeChatBridge: @unchecked Sendable {
             messages: Array(messages.suffix(limit)),
             renderedRows: rows.count,
             bubbleRows: bubbleRows,
-            placeholders: placeholders
+            placeholders: placeholders,
+            isVision: false
         )
     }
 

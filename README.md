@@ -39,7 +39,7 @@ For a personal local build, create a self-signed code-signing identity in **Keyc
 
 ## First run
 
-1. Open **System Settings → Privacy & Security → Accessibility** and allow **WeChat Reply Copilot**. The app prompts for this permission when needed.
+1. Open **System Settings → Privacy & Security → Accessibility** and allow **WeChat Reply Copilot**. The app prompts for this permission when needed. If the Accessibility tree is collapsed, it requests Screen Recording permission once; enable the app in **System Settings → Privacy & Security → Screen Recording** if macOS asks. Later capture checks only preflight permission and do not repeatedly open prompts.
 2. Open WeChat and navigate to a direct conversation.
 3. Choose **Continue with ChatGPT** and finish sign-in in the browser. The app uses OAuth/OIDC with PKCE and a loopback callback.
 4. Choose account-available Everyday and Careful models in Settings.
@@ -71,9 +71,9 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it can request Screen Recording access and OCR only that WeChat window locally, including while another app is in front, as long as the WeChat window remains open and on screen. OCR is limited to the conversation header and right-hand message pane; clear left/right bubble alignment may be labeled Target/Self, ambiguous rows stay unknown, and OCR never triggers automatic analysis. The monitor accumulates up to 100 recognized bubbles in memory by merging overlapping snapshots; the user can scroll to older messages to add context when the visible rows overlap the captured timeline. It does not read WeChat's local database or automatically scroll older messages. Captured images and OCR text are not saved; text stays local until the user chooses Analyze, which sends up to 100 recent captured messages.
+The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it uses Screen Recording permission to capture and OCR only that WeChat window locally, including while another app is in front, as long as the WeChat window remains open and on screen. Header OCR uses a separate accurate pass and ranks title candidates; title failure is reported separately from capture or message OCR failure. A title is still required before monitoring locks to a conversation. OCR is limited to the conversation header and right-hand message pane; clear left/right bubble alignment may be labeled Target/Self, ambiguous rows stay unknown, and OCR never triggers automatic analysis. The monitor accumulates up to 100 recognized bubbles in memory by merging overlapping snapshots; the user can scroll to older messages to add context when the visible rows overlap the captured timeline. It does not read WeChat's local database or automatically scroll older messages. Captured images and OCR text are not saved automatically; text stays local until the user chooses Analyze, which sends up to 100 recent captured messages.
 
-For target-Mac Accessibility troubleshooting, open **Settings → Developer diagnostics → Inspect WeChat AX**. The report is saved only after you choose a location and contains structural roles, sanitized identifiers, frames, and row counts; it omits message text, contact names, profile notes, and credentials.
+For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only. **Inspect Vision Capture** reports window/crop geometry and observation counts; it omits recognized text, contact names, and messages. **Save Annotated Vision Preview** saves an image only after you explicitly choose a destination; the image contains visible WeChat content and colored crop/message boxes, so handle and remove it as sensitive data after debugging.
 
 ## Manual acceptance checklist
 
@@ -87,6 +87,7 @@ For target-Mac Accessibility troubleshooting, open **Settings → Developer diag
 - [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
 - [ ] Confirm OCR fallback is limited to the WeChat conversation pane, remains manual-only, and sends no text until Analyze is clicked.
 - [ ] Save an **Inspect WeChat AX** report and verify only structural metadata is included.
+- [ ] On collapsed-tree WeChat builds, save an **Inspect Vision Capture** report and confirm it contains counts/geometry only; save an annotated preview only when explicitly needed and treat the image as sensitive.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 

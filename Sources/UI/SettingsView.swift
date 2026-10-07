@@ -50,7 +50,17 @@ struct SettingsView: View {
                     saveWeChatAccessibilityDiagnostic()
                 }
                 .disabled(isInspectingWeChat)
-                Text(diagnosticStatus ?? "Saves structural Accessibility metadata only. Message text, contact names, notes, and credentials are excluded.")
+                Button(isInspectingWeChat ? "Inspecting Vision Capture…" : "Inspect Vision Capture") {
+                    saveVisionCaptureDiagnostic()
+                }
+                .disabled(isInspectingWeChat)
+                Button("Save Annotated Vision Preview…") {
+                    saveAnnotatedVisionPreview()
+                }
+                .disabled(isInspectingWeChat)
+                Text(diagnosticStatus ?? "Accessibility and Vision reports contain structure, counts, and geometry only; recognized text, names, and credentials are excluded.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("Vision reports contain counts and geometry only. An explicitly saved preview contains the visible WeChat window, so store it privately and delete it when debugging is complete.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section("Relationship profile") {
@@ -65,7 +75,7 @@ struct SettingsView: View {
                 }
             }
             Section("Privacy") {
-                Text("The conversation is locked to the chat active when you activate monitoring. The app accumulates up to 100 recognized message bubbles in memory for this session and clears them on deactivation or a confirmed chat change. If WeChat hides its Accessibility tree, the app can request Screen Recording to capture only the visible WeChat window for local OCR; screenshots and OCR text are not saved. OCR may label clear left/right bubble alignment as Target/Self; uncertain labels remain unclear, and OCR never triggers automatic analysis. By default, chat text stays local until you choose Analyze. A manual analysis sends up to 100 recent captured messages, your local relationship profile, and any special instruction to OpenAI; the contact name is not sent. Optional automatic analysis sends up to 50 recent captured messages when sender identity is supplied by Accessibility. Deactivation cannot recall a request OpenAI has already received. Chat text is not saved by this app. Your profile is saved in local app preferences without separate app-level encryption. store=false is not a zero-retention guarantee. Copying a reply leaves it on the system clipboard.")
+                Text("The conversation is locked to the chat active when you activate monitoring. The app accumulates up to 100 recognized message bubbles in memory for this session and clears them on deactivation or a confirmed chat change. If WeChat hides its Accessibility tree, the app uses Screen Recording permission to capture only the WeChat window for local OCR; it requests permission once, then checks preflight status without repeated prompts. Screenshots and OCR text are not saved automatically. The explicitly saved annotated debug preview contains visible chat content. OCR may label clear left/right bubble alignment as Target/Self; uncertain labels remain unclear, and OCR never triggers automatic analysis. By default, chat text stays local until you choose Analyze. A manual analysis sends up to 100 recent captured messages, your local relationship profile, and any special instruction to OpenAI; the contact name is not sent. Optional automatic analysis sends up to 50 recent captured messages when sender identity is supplied by Accessibility. Deactivation cannot recall a request OpenAI has already received. Chat text is not saved by this app. Your profile is saved in local app preferences without separate app-level encryption. store=false is not a zero-retention guarantee. Copying a reply leaves it on the system clipboard.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Link("OpenAI data controls", destination: URL(string: "https://developers.openai.com/api/docs/guides/your-data")!)
                     .font(.caption)
@@ -95,6 +105,59 @@ struct SettingsView: View {
                 diagnosticStatus = "Structural report saved. It contains no message or contact text."
             } catch {
                 diagnosticStatus = "Could not save the diagnostic report."
+            }
+        }
+    }
+
+    private func saveVisionCaptureDiagnostic() {
+        isInspectingWeChat = true
+        diagnosticStatus = nil
+        Task {
+            let report = await Task.detached(priority: .utility) {
+                WeChatBridge.shared.visionDiagnosticReport()
+            }.value
+            isInspectingWeChat = false
+
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = "wechat-vision-diagnostic.txt"
+            panel.allowedContentTypes = [.plainText]
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            do {
+                try report.write(to: url, atomically: true, encoding: .utf8)
+                diagnosticStatus = "Vision report saved. It contains no recognized message or contact text."
+            } catch {
+                diagnosticStatus = "Could not save the Vision diagnostic report."
+            }
+        }
+    }
+
+    private func saveAnnotatedVisionPreview() {
+        isInspectingWeChat = true
+        diagnosticStatus = nil
+        Task {
+            let preview = await Task.detached(priority: .utility) {
+                WeChatBridge.shared.annotatedVisionPreview()
+            }.value
+            isInspectingWeChat = false
+            guard let preview,
+                  let tiff = preview.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiff),
+                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                diagnosticStatus = "Could not capture an annotated WeChat preview. Check Screen Recording permission and keep WeChat open."
+                return
+            }
+
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = "wechat-vision-preview.png"
+            panel.allowedContentTypes = [.png]
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            do {
+                try png.write(to: url, options: .atomic)
+                diagnosticStatus = "Annotated preview saved to your chosen location. It contains visible WeChat content."
+            } catch {
+                diagnosticStatus = "Could not save the annotated Vision preview."
             }
         }
     }
