@@ -6,6 +6,11 @@ enum WeChatParsingTests {
         expect(WeChatParsing.normalizeChatTitle("  Group   Name(23)  ") == "Group Name", "normalizes whitespace and removes group count")
         expect(WeChatParsing.normalizeChatTitle("Project Room (active)") == "Project Room (active)", "preserves non-numeric suffix")
         expect(WeChatParsing.conversationIdentityKey(" Alex (23) ") == WeChatParsing.conversationIdentityKey("alex"), "normalizes conversation identity for comparison")
+        expect(WeChatParsing.isPlausibleChatText("嗯", confidence: 0.46), "keeps short Chinese messages")
+        expect(WeChatParsing.isPlausibleChatText("哈哈", confidence: 0.50), "keeps short Chinese laughter")
+        expect(WeChatParsing.isPlausibleChatText("😂", confidence: 0.50), "keeps emoji-only messages")
+        expect(!WeChatParsing.isPlausibleChatText("*FF\"ILET", confidence: 0.50), "rejects symbol-heavy OCR artifacts")
+        expect(!WeChatParsing.isPlausibleChatText("?!", confidence: 0.90), "rejects punctuation-only OCR")
         expect(WeChatParsing.isGenericWindowTitle("WeChat (Chats)"), "recognizes generic WeChat window title")
         expect(!WeChatParsing.isGenericWindowTitle("Alex"), "does not classify a contact name as generic")
 

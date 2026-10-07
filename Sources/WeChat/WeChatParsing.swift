@@ -20,6 +20,24 @@ enum WeChatParsing {
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 
+    static func isPlausibleChatText(_ text: String, confidence: Float) -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, confidence >= 0.45 else { return false }
+        let scalars = Array(text.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) })
+        guard !scalars.isEmpty else { return false }
+        let isCJK: (Unicode.Scalar) -> Bool = { scalar in
+            (0x3400...0x9FFF).contains(Int(scalar.value)) ||
+                (0xF900...0xFAFF).contains(Int(scalar.value)) ||
+                (0x20000...0x3134F).contains(Int(scalar.value))
+        }
+        if scalars.contains(where: isCJK) { return true }
+
+        let meaningfulCount = scalars.filter { CharacterSet.alphanumerics.contains($0) }.count
+        let emojiCount = scalars.filter { $0.value >= 0x1F000 && $0.value <= 0x1FAFF }.count
+        if meaningfulCount == 0 { return emojiCount > 0 }
+        let contentRatio = Double(meaningfulCount + emojiCount) / Double(scalars.count)
+        return contentRatio >= 0.72 && (confidence >= 0.60 || contentRatio >= 0.85)
+    }
+
     static func isGenericWindowTitle(_ title: String) -> Bool {
         let normalized = title.split(whereSeparator: \.isWhitespace).joined().lowercased()
         return ["wechat", "wechat(chats)", "wechat(contacts)", "wechat(discover)", "微信", "微信(聊天)", "微信(通讯录)"].contains(normalized)

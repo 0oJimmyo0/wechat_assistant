@@ -58,15 +58,50 @@ final class MessageMonitor: ObservableObject {
         generation += 1
         let token = generation
         let bridge = self.bridge
+        let minimumTitleConfidence = minimumVisionSwitchTitleConfidence
         accessibilityQueue.async { [weak self] in
-            let detection = bridge.detectCurrentConversation()
-            let contact = detection.contact
+            var detection = bridge.detectCurrentConversation()
+            var contact = detection.contact
+            var titleWasUnstable = false
+            if let firstVision = detection.visionSnapshot {
+                guard let firstTitle = contact,
+                      (firstVision.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence else {
+                    contact = nil
+                    titleWasUnstable = true
+                    let finalDetection = detection
+                    Task { @MainActor [weak self] in
+                        guard let self, self.generation == token else { return }
+                        self.isCheckingConversation = false
+                        self.requestScreenCaptureAccessIfNeeded(finalDetection.visionSnapshot?.captureState)
+                        self.status = "Title is uncertain · keep the chat open and activate again"
+                    }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+                let confirmation = bridge.detectCurrentConversation(forceFreshVision: true)
+                let confirmed = confirmation.visionSnapshot.map {
+                    ($0.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence &&
+                        confirmation.contact.map {
+                            WeChatParsing.conversationIdentityKey($0) == WeChatParsing.conversationIdentityKey(firstTitle)
+                        } == true
+                } ?? false
+                if confirmed {
+                    detection = confirmation
+                    contact = confirmation.contact
+                } else {
+                    detection = confirmation
+                    contact = nil
+                    titleWasUnstable = true
+                }
+            }
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
                 guard let contact, !contact.isEmpty else {
                     self.requestScreenCaptureAccessIfNeeded(detection.visionSnapshot?.captureState)
-                    self.status = self.detectionFailureStatus(detection)
+                    self.status = titleWasUnstable
+                        ? "Title changed between captures · keep the chat open and activate again"
+                        : self.detectionFailureStatus(detection)
                     return
                 }
                 self.contactName = contact
@@ -190,7 +225,7 @@ final class MessageMonitor: ObservableObject {
                     guard !snapshot.isEmpty else {
                         self.messages = self.contextHistory
                         self.status = isVision
-                            ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision OCR found text, but no message bubbles were recognized")
+                            ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision found \(renderedRows) text observations; 0 passed chat-message filtering")
                             : (renderedRows == 0 || bubbleRows == 0
                             ? "Message list found, but no rendered message rows are available"
                             : "Message rows found, but message text is unavailable")
@@ -217,7 +252,7 @@ final class MessageMonitor: ObservableObject {
             lastIDs = snapshot.map(contextKey)
             if snapshot.isEmpty {
                 status = isVision
-                    ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision OCR found text, but no message bubbles were recognized")
+                    ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision found \(renderedRows) text observations; 0 passed chat-message filtering")
                     : (renderedRows == 0 || bubbleRows == 0
                     ? "Message list found, but no rendered message rows are available"
                     : "Message rows found, but message text is unavailable")
@@ -250,7 +285,7 @@ final class MessageMonitor: ObservableObject {
         if vision.ocrObservationCount == 0 { return "Vision OCR found no text" }
         if vision.title == nil {
             return vision.messages.isEmpty
-                ? "Vision OCR found text, but no message bubbles were recognized"
+                ? "Vision found \(vision.messageObservationCount) text observations; 0 passed chat-message filtering"
                 : "Conversation visible, but title OCR failed"
         }
         return "Conversation detected · reading messages"

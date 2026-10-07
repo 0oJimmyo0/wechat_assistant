@@ -149,7 +149,7 @@ final class WeChatBridge: @unchecked Sendable {
         detectCurrentConversation().contact
     }
 
-    func detectCurrentConversation() -> WeChatConversationDetection {
+    func detectCurrentConversation(forceFreshVision: Bool = false) -> WeChatConversationDetection {
         guard let window = mainWindow() else {
             return WeChatConversationDetection(contact: nil, windowFound: false, treeCollapsed: false, visionSnapshot: nil)
         }
@@ -172,7 +172,7 @@ final class WeChatBridge: @unchecked Sendable {
         }), let name = WeChatParsing.selectedSessionName(from: identifier(selectedSessionRow), isSelected: true) {
             return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false, visionSnapshot: nil)
         }
-        let snapshot = visibleSnapshot(for: window)
+        let snapshot = visibleSnapshot(for: window, forceFresh: forceFreshVision)
         return WeChatConversationDetection(
             contact: snapshot?.title,
             windowFound: true,
@@ -238,9 +238,9 @@ final class WeChatBridge: @unchecked Sendable {
         )
     }
 
-    private func visibleSnapshot(for window: AXUIElement) -> VisibleWeChatSnapshot? {
+    private func visibleSnapshot(for window: AXUIElement, forceFresh: Bool = false) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
-        return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window))
+        return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window), forceFresh: forceFresh)
     }
 
     func visionDiagnosticReport() -> String {
