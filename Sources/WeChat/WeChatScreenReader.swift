@@ -17,8 +17,8 @@ final class WeChatScreenReader {
     private var cachedAt = Date.distantPast
     private var cachedSnapshot: VisibleWeChatSnapshot?
     // Reuse the title-detection capture for the immediately following message
-    // read. The monitor's regular polling interval is three seconds.
-    private let cacheDuration: TimeInterval = 2.7
+    // read, but expire quickly so a changed chat or incoming message is fresh.
+    private let cacheDuration: TimeInterval = 0.5
 
     static var hasScreenCapturePermission: Bool { CGPreflightScreenCaptureAccess() }
 
@@ -30,8 +30,8 @@ final class WeChatScreenReader {
             return cachedSnapshot
         }
         cachedKey = key
-        cachedAt = Date()
         cachedSnapshot = capture(pid: pid, windowFrame: windowFrame)
+        cachedAt = Date()
         return cachedSnapshot
     }
 

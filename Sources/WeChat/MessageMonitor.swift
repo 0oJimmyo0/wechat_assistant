@@ -28,6 +28,7 @@ final class MessageMonitor: ObservableObject {
     private let contactSwitchConfirmationCount = 2
     private let contextHistoryLimit = 100
     private let automaticAnalysisContextLimit = 50
+    private let pollingInterval: TimeInterval = 1
 
     func start() {
         guard !isRunning, !isCheckingConversation else { return }
@@ -70,7 +71,7 @@ final class MessageMonitor: ObservableObject {
                       self.isRunning,
                       self.lockedContact == contact else { return }
                 self.applyInitialReadResult(result, contact: contact)
-                self.timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                self.timer = Timer.scheduledTimer(withTimeInterval: self.pollingInterval, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.poll() }
                 }
             }

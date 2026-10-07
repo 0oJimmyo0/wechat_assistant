@@ -12,6 +12,7 @@ final class WeChatBridge: @unchecked Sendable {
 
     private let officialWeChatBundleID = "com.tencent.xinWeChat"
     private let helperBundleID = "com.wechatreplycopilot.app"
+    private let accessibilityTimeout: Float = 0.5
 
     var hasAccessibilityPermission: Bool { AXIsProcessTrusted() }
 
@@ -38,7 +39,7 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func value(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-        AXUIElementSetMessagingTimeout(element, 1.0)
+        AXUIElementSetMessagingTimeout(element, accessibilityTimeout)
         var result: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else { return nil }
         return result
@@ -68,6 +69,15 @@ final class WeChatBridge: @unchecked Sendable {
             results.append(contentsOf: find(child, depth: depth - 1, where: predicate))
         }
         return results
+    }
+
+    private func firstMatch(_ root: AXUIElement, depth: Int = 24, where predicate: (AXUIElement) -> Bool) -> AXUIElement? {
+        guard depth > 0 else { return predicate(root) ? root : nil }
+        if predicate(root) { return root }
+        for child in children(root) {
+            if let match = firstMatch(child, depth: depth - 1, where: predicate) { return match }
+        }
+        return nil
     }
 
     private func windows(in appElement: AXUIElement) -> [AXUIElement] {
@@ -132,24 +142,20 @@ final class WeChatBridge: @unchecked Sendable {
         guard let window = mainWindow() else { return nil }
 
         // 1. WeChat 4.x's stable conversation-title node.
-        let titleNodes = find(window) {
+        if let titleNode = firstMatch(window, where: {
             string($0, "AXRole") == "AXStaticText" && identifier($0) == WeChatParsing.chatTitleIdentifier
-        }
-        for node in titleNodes {
-            let raw = string(node, "AXValue") ?? string(node, "AXTitle") ?? ""
+        }) {
+            let raw = string(titleNode, "AXValue") ?? string(titleNode, "AXTitle") ?? ""
             let name = WeChatParsing.normalizeChatTitle(raw)
             if !name.isEmpty && !WeChatParsing.isGenericWindowTitle(name) { return name }
         }
 
         // 2. Session item identifiers are useful only when WeChat explicitly
         // exposes the row's selected state. Never guess from arbitrary text.
-        let selectedSessionRows = find(window) {
+        if let selectedSessionRow = firstMatch(window, where: {
             identifier($0).hasPrefix("session_item_") && bool($0, "AXSelected")
-        }
-        for row in selectedSessionRows {
-            if let name = WeChatParsing.selectedSessionName(from: identifier(row), isSelected: true) {
-                return name
-            }
+        }), let name = WeChatParsing.selectedSessionName(from: identifier(selectedSessionRow), isSelected: true) {
+            return name
         }
         return visibleSnapshot(for: window)?.title
     }
@@ -158,16 +164,16 @@ final class WeChatBridge: @unchecked Sendable {
         guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false) }
 
         // 1. Stable WeChat 4.x message-list identifier.
-        if let list = find(window, where: {
+        if let list = firstMatch(window, where: {
             string($0, "AXRole") == "AXList" && identifier($0) == WeChatParsing.messageListIdentifier
-        }).first {
+        }) {
             return readRows(in: list, limit: limit)
         }
 
         // 2. Localized AXTitle fallback.
-        if let list = find(window, where: {
+        if let list = firstMatch(window, where: {
             string($0, "AXRole") == "AXList" && ["Messages", "消息"].contains(string($0, "AXTitle") ?? "")
-        }).first {
+        }) {
             return readRows(in: list, limit: limit)
         }
 
@@ -185,7 +191,7 @@ final class WeChatBridge: @unchecked Sendable {
                 bounds.width > 220 && bounds.height > 300
         }
         for area in paneAreas {
-            if let list = find(area, depth: 8, where: { string($0, "AXRole") == "AXList" }).first {
+            if let list = firstMatch(area, depth: 8, where: { string($0, "AXRole") == "AXList" }) {
                 return readRows(in: list, limit: limit)
             }
         }
@@ -244,13 +250,13 @@ final class WeChatBridge: @unchecked Sendable {
 
     private func hasConversationComposer(in root: AXUIElement) -> Bool {
         let bounds = frame(root)
-        return !find(root, depth: 16) { element in
+        return firstMatch(root, depth: 16) { element in
             guard string(element, "AXRole") == "AXTextArea" else { return false }
             let rect = frame(element)
             return rect.minX > bounds.minX + bounds.width * 0.25 &&
                 rect.minY > bounds.minY + bounds.height * 0.65 &&
                 rect.width > 180 && rect.height > 30
-        }.isEmpty
+        } != nil
     }
 
     func accessibilityTreeAppearsCollapsed() -> Bool {
