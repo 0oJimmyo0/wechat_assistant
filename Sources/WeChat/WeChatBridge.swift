@@ -75,7 +75,7 @@ final class WeChatBridge: @unchecked Sendable {
     private func mainWindow() -> AXUIElement? {
         guard let app = applicationElement() else { return nil }
         if let focused = value(app, "AXFocusedWindow"), CFGetTypeID(focused) == AXUIElementGetTypeID() {
-            return focused as? AXUIElement
+            return (focused as! AXUIElement)
         }
         return (value(app, "AXWindows") as? [AXUIElement])?.first
     }
