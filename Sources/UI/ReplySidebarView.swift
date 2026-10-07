@@ -128,7 +128,7 @@ struct ReplySidebarView: View {
 
     private var recentMessagesSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("RECENT MESSAGES · LAST 5")
+            sectionLabel("RECENT MESSAGES · LAST \(min(5, monitor.messages.count)) OF \(monitor.messages.count)")
             if monitor.messages.isEmpty {
                 Text("No chat message text is available from this WeChat view yet.")
                     .font(.callout)

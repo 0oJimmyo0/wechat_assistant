@@ -154,7 +154,7 @@ final class WeChatBridge: @unchecked Sendable {
         return visibleSnapshot(for: window)?.title
     }
 
-    func readMessages(limit: Int = 20) -> MessageReadResult {
+    func readMessages(limit: Int = 50) -> MessageReadResult {
         guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false) }
 
         // 1. Stable WeChat 4.x message-list identifier.

@@ -16,6 +16,7 @@ final class MessageMonitor: ObservableObject {
     private var timer: Timer?
     private var debounce: Task<Void, Never>?
     private var lastIDs: [String] = []
+    private var contextHistory: [ChatMessage] = []
     private var lockedContact: String?
     private var generation = 0
     private var isCheckingConversation = false
@@ -25,6 +26,8 @@ final class MessageMonitor: ObservableObject {
     private var candidateContactPolls = 0
     private let unidentifiedPollLimit = 5
     private let contactSwitchConfirmationCount = 2
+    private let contextHistoryLimit = 100
+    private let automaticAnalysisContextLimit = 50
 
     func start() {
         guard !isRunning, !isCheckingConversation else { return }
@@ -34,6 +37,9 @@ final class MessageMonitor: ObservableObject {
         unidentifiedPolls = 0
         candidateContact = nil
         candidateContactPolls = 0
+        messages = []
+        contextHistory = []
+        lastIDs = []
         status = "Connected to WeChat · checking conversation"
         generation += 1
         let token = generation
@@ -82,6 +88,7 @@ final class MessageMonitor: ObservableObject {
         debounce?.cancel(); debounce = nil
         generation += 1
         messages = []
+        contextHistory = []
         lastIDs = []
         contactName = nil
         lockedContact = nil
@@ -100,7 +107,7 @@ final class MessageMonitor: ObservableObject {
         accessibilityQueue.async { [weak self] in
             let contact = bridge.currentContact()
             let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
-            let result = contact == nil || contact != lockedContact ? nil : bridge.readMessages(limit: 20)
+            let result = contact == nil || contact != lockedContact ? nil : bridge.readMessages(limit: 50)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
@@ -145,15 +152,13 @@ final class MessageMonitor: ObservableObject {
                 guard let result else { return }
                 switch result {
                 case .messageListUnavailable(let collapsed):
-                    self.messages = []
-                    self.lastIDs = []
+                    self.messages = self.contextHistory
                     self.status = collapsed
                         ? self.collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                         : "Conversation detected, but message list is unavailable"
                 case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
                     guard !snapshot.isEmpty else {
-                        self.messages = []
-                        self.lastIDs = []
+                        self.messages = self.contextHistory
                         self.status = renderedRows == 0 || bubbleRows == 0
                             ? "Message list found, but no rendered message rows are available"
                             : "Message rows found, but message text is unavailable"
@@ -168,14 +173,14 @@ final class MessageMonitor: ObservableObject {
     private func applyInitialReadResult(_ result: MessageReadResult, contact: String) {
         switch result {
         case .messageListUnavailable(let collapsed):
-            messages = []
-            lastIDs = []
+            messages = contextHistory
             status = collapsed
                 ? collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                 : "Conversation detected: \(contact) · message list is unavailable"
         case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
-            messages = snapshot
-            lastIDs = snapshot.map(\.id)
+            contextHistory = Array(snapshot.suffix(contextHistoryLimit))
+            messages = contextHistory
+            lastIDs = snapshot.map(contextKey)
             if snapshot.isEmpty {
                 status = renderedRows == 0 || bubbleRows == 0
                     ? "Message list found, but no rendered message rows are available"
@@ -198,38 +203,108 @@ final class MessageMonitor: ObservableObject {
 
     private func processSnapshot(_ snapshot: [ChatMessage], contact: String) {
         contactName = contact
-        messages = snapshot
         if snapshot.isEmpty {
-            lastIDs = []
-            status = "Chat opened · WeChat exposed no message text"
+            messages = contextHistory
+            status = contextHistory.isEmpty
+                ? "Chat opened · WeChat exposed no message text"
+                : "Keeping captured context · no new visible messages"
             return
         }
-        let ids = snapshot.map(\.id)
+        let ids = snapshot.map(contextKey)
+        let previousHistory = contextHistory
+        let mergedHistory = mergeContextHistory(snapshot)
+        let historyChanged = mergedHistory.map(\.id) != contextHistory.map(\.id)
+        let added = appendedMessages(previous: previousHistory, merged: mergedHistory)
+        contextHistory = mergedHistory
+        messages = contextHistory
         guard ids != lastIDs else {
             status = snapshot.allSatisfy { !$0.senderIdentified }
-                ? "Monitoring this conversation · sender unclear"
+                ? "Monitoring · OCR senders are tentative"
                 : "Monitoring this conversation"
             return
         }
-        let added = newMessages(snapshot, old: lastIDs)
         lastIDs = ids
-        guard !added.isEmpty else { status = "Monitoring this conversation"; return }
+        guard !added.isEmpty else {
+            status = historyChanged ? "Conversation context updated" : "Monitoring this conversation"
+            return
+        }
         let hasIncoming = added.contains(where: { $0.senderIdentified && !$0.isFromMe })
         let hasUnknown = added.contains(where: { !$0.senderIdentified })
         guard hasIncoming else {
             status = hasUnknown ? "Message rows found, sender identity unavailable" : "Monitoring this conversation"
             return
         }
-        scheduleBurst(contact: contact, canAutoAnalyze: WeChatParsing.canAutomaticallyAnalyze(snapshot))
+        scheduleBurst(contact: contact, canAutoAnalyze: WeChatParsing.canAutomaticallyAnalyze(contextHistory))
     }
 
-    private func newMessages(_ current: [ChatMessage], old: [String]) -> [ChatMessage] {
-        if old.isEmpty { return current }
-        let ids = current.map(\.id)
-        for length in stride(from: min(ids.count, old.count), through: 1, by: -1) {
-            if Array(old.suffix(length)) == Array(ids.prefix(length)) { return Array(current.dropFirst(length)) }
+    private func appendedMessages(previous: [ChatMessage], merged: [ChatMessage]) -> [ChatMessage] {
+        guard !previous.isEmpty else { return [] }
+        let previousKeys = previous.map(contextKey)
+        let mergedKeys = merged.map(contextKey)
+        for length in stride(from: min(previousKeys.count, mergedKeys.count), through: 1, by: -1) {
+            let previousSuffix = Array(previousKeys.suffix(length))
+            if Array(mergedKeys.prefix(length)) == previousSuffix {
+                return Array(merged.dropFirst(length))
+            }
         }
-        return Array(current.suffix(1))
+        return []
+    }
+
+    private func mergeContextHistory(_ visibleSnapshot: [ChatMessage]) -> [ChatMessage] {
+        guard !contextHistory.isEmpty else {
+            return Array(visibleSnapshot.suffix(contextHistoryLimit))
+        }
+
+        let historyIDs = contextHistory.map(contextKey)
+        let visibleIDs = visibleSnapshot.map(contextKey)
+        var refreshedHistory = contextHistory
+
+        // New live messages appear after an overlap with the accumulated tail.
+        for length in stride(from: min(historyIDs.count, visibleIDs.count), through: 1, by: -1) {
+            let historySuffix = Array(historyIDs.suffix(length))
+            for start in (0...(visibleIDs.count - length)).reversed() {
+                guard Array(visibleIDs[start..<(start + length)]) == historySuffix else { continue }
+                let historyStart = contextHistory.count - length
+                for offset in 0..<length {
+                    refreshedHistory[historyStart + offset] = visibleSnapshot[start + offset]
+                }
+                let tail = Array(visibleSnapshot.dropFirst(start + length))
+                if !tail.isEmpty {
+                    return Array((refreshedHistory + tail).suffix(contextHistoryLimit))
+                }
+                break
+            }
+        }
+
+        // If the user scrolls to older rows, prepend unseen rows before any
+        // matching portion of the captured timeline.
+        for length in stride(from: min(historyIDs.count, visibleIDs.count), through: 1, by: -1) {
+            for historyStart in 0...(historyIDs.count - length) {
+                let historySegment = Array(historyIDs[historyStart..<(historyStart + length)])
+                for visibleStart in 0...(visibleIDs.count - length) {
+                    guard Array(visibleIDs[visibleStart..<(visibleStart + length)]) == historySegment else { continue }
+                    for offset in 0..<length {
+                        refreshedHistory[historyStart + offset] = visibleSnapshot[visibleStart + offset]
+                    }
+                    if visibleStart > 0 {
+                        let older = Array(visibleSnapshot.prefix(visibleStart))
+                        return Array((older + refreshedHistory).suffix(contextHistoryLimit))
+                    }
+                    return refreshedHistory
+                }
+            }
+        }
+        return refreshedHistory
+    }
+
+    private func contextKey(_ message: ChatMessage) -> String {
+        let normalized = message.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let scalars = normalized.unicodeScalars.filter {
+            !CharacterSet.whitespacesAndNewlines.contains($0) &&
+                !CharacterSet.punctuationCharacters.contains($0)
+        }
+        let key = String(String.UnicodeScalarView(scalars))
+        return key.isEmpty ? message.text : key
     }
 
     private func scheduleBurst(contact: String, canAutoAnalyze: Bool) {
@@ -242,7 +317,7 @@ final class MessageMonitor: ObservableObject {
             guard !Task.isCancelled, let self, self.isRunning, self.generation == token else { return }
             self.status = canAutoAnalyze ? "Message ready · analyzing" : "Message ready · Analyze manually"
             if canAutoAnalyze {
-                self.onBurst?(contact, self.messages.suffix(20).map { $0 }, true)
+                self.onBurst?(contact, self.messages.suffix(self.automaticAnalysisContextLimit).map { $0 }, true)
             }
         }
     }

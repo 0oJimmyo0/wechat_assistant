@@ -48,13 +48,13 @@ For a personal local build, create a self-signed code-signing identity in **Keyc
 
 ## What is kept and sent
 
-- Chat context is held in memory, limited to the latest 20 messages, and sent only with the current suggestion request.
+- The active conversation accumulates up to 100 recognized message bubbles in memory. Overlapping screen snapshots are merged; scrolling older rows into view can add them when they overlap the captured timeline. Deactivation or a confirmed conversation change clears the buffer. A manual analysis sends up to the latest 100 captured messages; optional automatic analysis sends at most 50 Accessibility-identified messages.
 - Responses API requests use `stream: true` and `store: false` with the selected account's OAuth access token.
 - `store: false` prevents Responses application-state storage; it is not a zero-retention guarantee. OpenAI's current API data controls say abuse-monitoring logs may contain prompts and responses and are generally retained for up to 30 days. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
 - Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
 - Relationship profile details are stored in local app preferences and are not encrypted separately by the app. Raw chat text and credentials are not written to logs.
-- Monitoring is locked to the conversation active at activation. Switching conversations stops monitoring, clears the in-memory snapshot and suggestions, and requires activation again. Automatic analysis is off by default; when enabled, only bursts with identified senders can trigger requests. Text outside a recognized WeChat message list is ignored, including contact details and notes; if WeChat does not expose its message list, analysis remains unavailable. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
-- The model prompt uses speaker labels such as “我”, “对方”, or “说话方不确定”; it does not include the contact's display name. Analysis still sends up to 20 visible messages and the configured local relationship profile.
+- Monitoring is locked to the conversation active at activation. A confirmed conversation change stops monitoring and clears the in-memory context and suggestions. Automatic analysis is off by default; when enabled, only Accessibility messages with identified senders can trigger requests. If WeChat's Accessibility tree is collapsed, OCR reads only the visible conversation pane of the WeChat window. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
+- The model prompt uses speaker labels such as “我”, “对方”, or “说话方不确定”; it does not include the contact's display name. Manual analysis sends up to 100 recent captured messages and the configured local relationship profile.
 - Everyday and Careful model choices come from the signed-in account's live model catalog. A usage-limit response stops monitoring and disables automatic analysis until you reactivate.
 - Sign out attempts to revoke the refresh token and always removes local credentials. Keychain credentials are available only while the device is unlocked.
 - Copying a suggestion leaves it in the system clipboard, where clipboard managers or Universal Clipboard may retain or sync it.
@@ -71,7 +71,7 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it can request Screen Recording access and OCR only that visible WeChat window locally. OCR is limited to the conversation header and right-hand message pane; clear left/right bubble alignment may be labeled Target/Self, ambiguous rows stay unknown, and OCR never triggers automatic analysis. It does not read WeChat's local database, access chat history outside the visible window, or automatically scroll older messages. Captured images and OCR text are not saved; text stays local until the user chooses Analyze.
+The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it can request Screen Recording access and OCR only that visible WeChat window locally. OCR is limited to the conversation header and right-hand message pane; clear left/right bubble alignment may be labeled Target/Self, ambiguous rows stay unknown, and OCR never triggers automatic analysis. The monitor accumulates up to 100 recognized bubbles in memory by merging overlapping snapshots; the user can scroll to older messages to add context when the visible rows overlap the captured timeline. It does not read WeChat's local database or automatically scroll older messages. Captured images and OCR text are not saved; text stays local until the user chooses Analyze, which sends up to 100 recent captured messages.
 
 For target-Mac Accessibility troubleshooting, open **Settings → Developer diagnostics → Inspect WeChat AX**. The report is saved only after you choose a location and contains structural roles, sanitized identifiers, frames, and row counts; it omits message text, contact names, profile notes, and credentials.
 
@@ -93,7 +93,7 @@ For target-Mac Accessibility troubleshooting, open **Settings → Developer diag
 ## Known limitations
 
 - Accessibility structure varies by WeChat release. OCR fallback depends on Screen Recording permission and visible-window text recognition. OCR sender hints use conservative bubble alignment; uncertain rows remain unknown and all OCR rows are manual-only.
-- Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
+- Only visible/retrievable messages are available; the app does not read WeChat's database or scroll automatically. Manually scrolling to older messages can add context where snapshots overlap the captured timeline.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.
 - Live WeChat and OAuth behavior must be manually checked on the target Mac; a successful compile cannot verify those integrations.

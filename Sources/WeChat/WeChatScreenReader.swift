@@ -79,12 +79,10 @@ final class WeChatScreenReader {
 
         // Bubble alignment provides a conservative sender hint. Ambiguous rows
         // stay unknown, and every OCR row remains manual-only regardless.
-        let messages = lines
+        let messageLines = lines
             .filter { $0.1.minX >= 0.01 && $0.1.minY >= 0.14 && $0.1.maxY <= 0.80 }
             .filter { !looksLikeTimestampOrControl($0.0) }
-            .sorted { $0.1.maxY > $1.1.maxY }
-            .suffix(20)
-            .map { ChatMessage(text: $0.0, sender: sender(for: $0.1), allowsAutomaticAnalysis: false) }
+        let messages = groupMessageLines(messageLines).suffix(50)
 
         return VisibleWeChatSnapshot(title: title, messages: Array(messages))
     }
@@ -118,5 +116,28 @@ final class WeChatScreenReader {
         if textBounds.minX >= 0.55 { return .me }
         if textBounds.minX <= 0.20 && textBounds.maxX <= 0.55 { return .other }
         return .unknown
+    }
+
+    private func groupMessageLines(_ lines: [(String, CGRect, Float)]) -> [ChatMessage] {
+        var bubbles: [(text: String, bounds: CGRect, sender: MessageSender)] = []
+        for line in lines.sorted(by: { $0.1.maxY > $1.1.maxY }) {
+            let lineSender = sender(for: line.1)
+            if let previous = bubbles.last {
+                let verticalGap = previous.bounds.minY - line.1.maxY
+                let sameBubble = lineSender != .unknown &&
+                    lineSender == previous.sender &&
+                    abs(previous.bounds.minX - line.1.minX) <= 0.035 &&
+                    verticalGap >= -0.004 && verticalGap <= 0.008
+                if sameBubble {
+                    bubbles[bubbles.count - 1].text += "\n" + line.0
+                    bubbles[bubbles.count - 1].bounds = previous.bounds.union(line.1)
+                    continue
+                }
+            }
+            bubbles.append((line.0, line.1, lineSender))
+        }
+        return bubbles.map {
+            ChatMessage(text: $0.text, sender: $0.sender, allowsAutomaticAnalysis: false)
+        }
     }
 }
