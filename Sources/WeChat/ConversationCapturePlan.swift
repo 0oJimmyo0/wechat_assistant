@@ -4,12 +4,8 @@ import CoreGraphics
 /// Normalized rectangles are always relative to the complete WeChat window.
 /// Title and message pane geometry are intentionally independent.
 enum VisionLayoutRegions {
-    static func titleSearch(bottomY: CGFloat) -> CGRect {
-        CGRect(x: 0.005, y: bottomY, width: 0.99, height: 1 - bottomY)
-    }
-
     static func messagePane(leftX: CGFloat, verticalRegion: CGRect) -> CGRect {
-        let paneLeft = min(0.60, max(0.01, leftX))
+        let paneLeft = min(0.70, max(0.01, leftX))
         let availableWidth = 1 - paneLeft
         let x = paneLeft + verticalRegion.minX * availableWidth
         let width = verticalRegion.width * availableWidth
@@ -21,6 +17,45 @@ enum VisionLayoutRegions {
                y: region.minY + localBounds.minY * region.height,
                width: localBounds.width * region.width,
                height: localBounds.height * region.height)
+    }
+
+    static func geometry(leftX: CGFloat, headerBottomY: CGFloat, composerTopY: CGFloat,
+                         source: ConversationPaneGeometrySource, confidence: Float) -> ConversationPaneGeometry {
+        let safeLeft = min(0.70, max(0.01, leftX))
+        let header = CGRect(x: safeLeft, y: headerBottomY, width: 1 - safeLeft,
+                            height: 1 - headerBottomY)
+        let transcript = CGRect(x: 0.01, y: composerTopY, width: 0.98,
+                                height: headerBottomY - composerTopY - 0.02)
+        let messages = messagePane(leftX: safeLeft, verticalRegion: transcript)
+        return ConversationPaneGeometry(leftX: safeLeft, headerRegion: header,
+                                        messageRegion: messages, source: source,
+                                        confidence: confidence)
+    }
+}
+
+enum ConversationPaneGeometrySource: String, Sendable {
+    case accessibilityMessageList
+    case accessibilityComposer
+    case accessibilityScrollArea
+    case visualDivider
+    case detachedWindow
+    case configuredFallback
+}
+
+struct ConversationPaneGeometry: Sendable, Equatable {
+    let leftX: CGFloat
+    let headerRegion: CGRect
+    let messageRegion: CGRect
+    let source: ConversationPaneGeometrySource
+    let confidence: Float
+
+    var isValidated: Bool {
+        confidence >= 0.70 && source != .configuredFallback
+    }
+
+    func scrollTarget(in windowFrame: CGRect) -> CGPoint {
+        CGPoint(x: windowFrame.minX + windowFrame.width * messageRegion.midX,
+                y: windowFrame.minY + windowFrame.height * (1 - messageRegion.midY))
     }
 }
 

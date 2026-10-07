@@ -160,7 +160,8 @@ struct ReplySidebarView: View {
                 }
                 Spacer(minLength: 0)
             }
-            if monitor.isRunning && visibleMessages.count < displayedMessageLimit && monitor.canLoadOlderContext && monitor.viewportState == .liveTail {
+            if monitor.isRunning && visibleMessages.count < displayedMessageLimit && monitor.canLoadOlderContext &&
+                monitor.conversationIdentityState == .confirmed && monitor.acquisitionState == .ready {
                 Button {
                     monitor.loadOlderContext()
                 } label: {

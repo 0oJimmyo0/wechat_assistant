@@ -17,6 +17,7 @@ struct WeChatSnapshot: Sendable {
     let identitySource: ConversationCaptureSource
     let messageSource: ConversationCaptureSource
     let visionIdentity: VisionConversationIdentity?
+    let paneGeometry: ConversationPaneGeometry
     let messageFingerprint: String?
     let headerFingerprint: String?
     let messagePaneLeftX: CGFloat?
@@ -33,6 +34,7 @@ struct PendingConversationObservation: Sendable {
     let messageSource: ConversationCaptureSource
     let visionIdentity: VisionConversationIdentity?
     let headerFingerprint: String?
+    let paneGeometry: ConversationPaneGeometry
 }
 
 enum ConversationCaptureFailure: Sendable {
@@ -636,7 +638,8 @@ final class WeChatBridge: @unchecked Sendable {
                                     previousMessageFingerprint: String? = nil,
                                     lockedContact: String? = nil,
                                     initialActivation: Bool = false,
-                                    messagePaneLeftX: CGFloat? = nil) -> ConversationCaptureResult {
+                                    messagePaneLeftX: CGFloat? = nil,
+                                    paneGeometry: ConversationPaneGeometry? = nil) -> ConversationCaptureResult {
         let totalStarted = Date()
         guard let window = mainWindow(), let app = weChatApplication() else {
             updateCaptureDiagnostic(plan: nil, hasAXIdentity: false, hasAXMessages: false,
@@ -649,6 +652,14 @@ final class WeChatBridge: @unchecked Sendable {
                                     failure: "WeChat window identity unavailable")
             return .failure(.windowUnavailable)
         }
+        let windowFrame = frame(window, timeout: 0.08)
+        let calibration = VisionLayoutCalibration.current
+        let resolvedGeometry = paneGeometry ?? accessibilityPaneGeometry(in: window, windowFrame: windowFrame) ??
+            VisionLayoutRegions.geometry(
+                leftX: messagePaneLeftX ?? calibration.messagePaneLeftX,
+                headerBottomY: calibration.headerBottomY, composerTopY: calibration.composerTopY,
+                source: .configuredFallback, confidence: 0.40
+            )
 
         // Reuse the successful plan and its AX elements during monitoring. On
         // activation, the bounded probe is only a hint; a single targeted,
@@ -735,15 +746,14 @@ final class WeChatBridge: @unchecked Sendable {
         if usesVision {
             let observation = WeChatScreenReader.shared.readConversationObservation(
                 pid: app.processIdentifier,
-                windowFrame: frame(window, timeout: 0.08),
+                windowFrame: windowFrame,
                 includeTitle: capturePlan.identity == .vision,
                 includeMessages: capturePlan.messages == .vision,
                 forceFresh: forceFresh,
                 accurateMessages: accurateVision,
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
-                messagePaneLeftX: messagePaneLeftX,
-                allowWideMessageCropFallback: initialActivation
+                paneGeometry: resolvedGeometry
             )
             guard observation.captureSucceeded else {
                 updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
@@ -798,13 +808,15 @@ final class WeChatBridge: @unchecked Sendable {
                 return .identityPending(PendingConversationObservation(
                     messages: messages, messageRowCount: rowCount, messageSource: capturePlan.messages,
                     visionIdentity: visionIdentity,
-                    headerFingerprint: visionObservation?.headerFingerprint
+                    headerFingerprint: visionObservation?.headerFingerprint,
+                    paneGeometry: visionObservation?.paneGeometry ?? resolvedGeometry
                 ))
             }
             return .failure(.identityUnavailable)
         }
 
         let totalMilliseconds = Int(Date().timeIntervalSince(totalStarted) * 1000)
+        let capturedGeometry = visionObservation?.paneGeometry ?? resolvedGeometry
         let timing = [
             "Capture total: \(totalMilliseconds) ms",
             "AX capability probe: \(capability.probeMilliseconds) ms",
@@ -824,9 +836,10 @@ final class WeChatBridge: @unchecked Sendable {
         return .success(WeChatSnapshot(contact: contact, messages: messages, capturedAt: Date(),
                               messageRowCount: rowCount, identitySource: capturePlan.identity,
                               messageSource: capturePlan.messages, visionIdentity: visionIdentity,
+                              paneGeometry: capturedGeometry,
                               messageFingerprint: visionObservation?.messageFingerprint,
                               headerFingerprint: visionObservation?.headerFingerprint,
-                              messagePaneLeftX: visionObservation?.messagePaneLeftX,
+                              messagePaneLeftX: capturedGeometry.leftX,
                               messagesUnchanged: messagesUnchanged,
                               headerUnchanged: visionObservation?.headerFrameUnchanged ?? false,
                               captureTimingDiagnostic: timing))
@@ -839,14 +852,14 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func visionTimingDiagnostic(_ observation: VisibleWeChatSnapshot, titleFound: Bool) -> String {
-        let calibration = VisionLayoutCalibration.current
-        let titleROI = CGRect(x: 0.005, y: calibration.headerBottomY,
-                              width: 0.99, height: 1 - calibration.headerBottomY)
+        let titleROI = observation.paneGeometry.headerRegion
         return "Vision: window capture \(observation.captureSucceeded ? "success" : "failed") " +
         "(discovery \(observation.windowDiscoveryDurationMilliseconds) ms, screenshot \(observation.captureDurationMilliseconds) ms), " +
         "title OCR \(observation.headerOCRDurationMilliseconds) ms, message OCR \(observation.messageOCRDurationMilliseconds) ms, " +
         "title found \(titleFound ? "yes" : "no"), visible messages \(observation.messages.count)\n" +
-        "Identity: title ROI full-window \(String(format: "%.3f,%.3f,%.3f,%.3f", titleROI.minX, titleROI.minY, titleROI.width, titleROI.height)), " +
+        "Geometry: \(observation.paneGeometry.source.rawValue), confidence \(String(format: "%.2f", observation.paneGeometry.confidence)), pane left \(String(format: "%.3f", observation.paneGeometry.leftX)), " +
+        "scroll target x/y \(String(format: "%.3f", observation.paneGeometry.messageRegion.midX))/\(String(format: "%.3f", 1 - observation.paneGeometry.messageRegion.midY))\n" +
+        "Identity: title ROI inside pane \(String(format: "%.3f,%.3f,%.3f,%.3f", titleROI.minX, titleROI.minY, titleROI.width, titleROI.height)), " +
         "observations \(observation.headerObservationCount), candidates \(observation.headerCandidates.count), " +
         "selected \(observation.titleIdentity == nil ? "no" : "yes"), " +
         "confidence \(observation.acceptedTitleConfidence.map { String(format: "%.3f", $0) } ?? "unavailable"), " +
@@ -933,6 +946,63 @@ final class WeChatBridge: @unchecked Sendable {
         return backendState(for: app.processIdentifier, window: window).initialProbe?.messageListElement
     }
 
+    private func accessibilityPaneGeometry(in window: AXUIElement,
+                                           windowFrame: CGRect) -> ConversationPaneGeometry? {
+        guard windowFrame.width > 0, windowFrame.height > 0 else { return nil }
+        let calibration = VisionLayoutCalibration.current
+        func geometry(for element: AXUIElement, source: ConversationPaneGeometrySource,
+                      confidence: Float, minimumHeightRatio: CGFloat) -> ConversationPaneGeometry? {
+            let bounds = frame(element, timeout: 0.03)
+            let left = (bounds.minX - windowFrame.minX) / windowFrame.width
+            let width = bounds.width / windowFrame.width
+            let height = bounds.height / windowFrame.height
+            guard bounds.width > 180, (0.01...0.70).contains(left),
+                  width >= 0.28, height >= minimumHeightRatio,
+                  bounds.maxX <= windowFrame.maxX + 12 else { return nil }
+            let source: ConversationPaneGeometrySource = left <= 0.035 && width >= 0.90
+                ? .detachedWindow : source
+            return VisionLayoutRegions.geometry(
+                leftX: left, headerBottomY: calibration.headerBottomY,
+                composerTopY: calibration.composerTopY, source: source, confidence: confidence
+            )
+        }
+
+        if let list = messageListElement(in: window),
+           let result = geometry(for: list, source: .accessibilityMessageList,
+                                 confidence: 0.98, minimumHeightRatio: 0.30) {
+            return result
+        }
+        if let composer = firstMatch(window, depth: 18, where: { element in
+            guard string(element, "AXRole", timeout: 0.02) == "AXTextArea" else { return false }
+            let bounds = frame(element, timeout: 0.02)
+            return bounds.width > 180 && bounds.height > 30 &&
+                bounds.minY > windowFrame.minY + windowFrame.height * 0.60
+        }), let result = geometry(for: composer, source: .accessibilityComposer,
+                                  confidence: 0.90, minimumHeightRatio: 0.015) {
+            return result
+        }
+        if let area = find(window, depth: 18, where: { element in
+            guard string(element, "AXRole", timeout: 0.02) == "AXScrollArea" else { return false }
+            let bounds = frame(element, timeout: 0.02)
+            let left = (bounds.minX - windowFrame.minX) / windowFrame.width
+            let width = bounds.width / windowFrame.width
+            return (0.01...0.70).contains(left) && width >= 0.28 && bounds.height > windowFrame.height * 0.35
+        }).max(by: { frame($0).width < frame($1).width }),
+           let result = geometry(for: area, source: .accessibilityScrollArea,
+                                 confidence: 0.82, minimumHeightRatio: 0.35) {
+            return result
+        }
+        return nil
+    }
+
+    private func configuredPaneGeometry() -> ConversationPaneGeometry {
+        let calibration = VisionLayoutCalibration.current
+        return VisionLayoutRegions.geometry(
+            leftX: calibration.messagePaneLeftX, headerBottomY: calibration.headerBottomY,
+            composerTopY: calibration.composerTopY, source: .configuredFallback, confidence: 0.40
+        )
+    }
+
     private func hasMessageLikeRows(_ rows: [AXUIElement]) -> Bool {
         rows.contains { row in
             let id = identifier(row, timeout: 0.02)
@@ -957,7 +1027,7 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     func detectCurrentConversation(forceFreshVision: Bool = false,
-                                  messagePaneLeftX: CGFloat? = nil,
+                                  paneGeometry: ConversationPaneGeometry? = nil,
                                   onStage: ((String) -> Void)? = nil) -> WeChatConversationDetection {
         onStage?("Finding WeChat window…")
         let windowStarted = Date()
@@ -988,8 +1058,11 @@ final class WeChatBridge: @unchecked Sendable {
                                               mainWindowLookupMilliseconds: windowLookupMilliseconds,
                                               capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
         }
+        let currentFrame = frame(window, timeout: 0.08)
+        let geometry = paneGeometry ?? accessibilityPaneGeometry(in: window, windowFrame: currentFrame) ??
+            configuredPaneGeometry()
         let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision,
-                                            messagePaneLeftX: messagePaneLeftX)
+                                            paneGeometry: geometry)
         return WeChatConversationDetection(
             contact: snapshot?.title,
             windowFound: true,
@@ -1054,23 +1127,26 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
-        messagePaneLeftX: CGFloat? = nil,
+        paneGeometry: ConversationPaneGeometry? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
-                                               messagePaneLeftX: messagePaneLeftX,
+                                               paneGeometry: paneGeometry,
                                                cancellation: cancellation, direction: .older)
     }
 
-    func scrollMessagePaneUpOnePageIfConversationMatches(contact: String) -> OlderContextScrollResult {
-        scrollAccessibilityMessagePane(contact: contact, direction: .older)
+    func scrollMessagePaneUpOnePageIfConversationMatches(contact: String,
+                                                          paneGeometry: ConversationPaneGeometry? = nil) -> OlderContextScrollResult {
+        scrollAccessibilityMessagePane(contact: contact, paneGeometry: paneGeometry, direction: .older)
     }
 
-    func scrollMessagePaneDownOnePageIfConversationMatches(contact: String) -> OlderContextScrollResult {
-        scrollAccessibilityMessagePane(contact: contact, direction: .newer)
+    func scrollMessagePaneDownOnePageIfConversationMatches(contact: String,
+                                                            paneGeometry: ConversationPaneGeometry? = nil) -> OlderContextScrollResult {
+        scrollAccessibilityMessagePane(contact: contact, paneGeometry: paneGeometry, direction: .newer)
     }
 
-    private func scrollAccessibilityMessagePane(contact: String, direction: ChatScrollDirection) -> OlderContextScrollResult {
+    private func scrollAccessibilityMessagePane(contact: String, paneGeometry: ConversationPaneGeometry?,
+                                                direction: ChatScrollDirection) -> OlderContextScrollResult {
         guard let app = weChatApplication(), let window = mainWindow() else { return .windowUnavailable }
         guard accessibilityContact(in: window, app: app).map(WeChatParsing.conversationIdentityKey) ==
                 WeChatParsing.conversationIdentityKey(contact) else { return .identityUncertain }
@@ -1093,12 +1169,8 @@ final class WeChatBridge: @unchecked Sendable {
 
         // Fallback to a targeted scroll event after verifying the same AX chat.
         let windowFrame = frame(window, timeout: 0.08)
-        let calibration = VisionLayoutCalibration.current
-        let yRatioFromTop = 1 - ((calibration.composerTopY + calibration.headerBottomY) * 0.5)
-        let location = CGPoint(
-            x: windowFrame.minX + windowFrame.width * (calibration.messagePaneLeftX + (1 - calibration.messagePaneLeftX) * 0.5),
-            y: windowFrame.minY + windowFrame.height * yRatioFromTop
-        )
+        let geometry = paneGeometry ?? accessibilityPaneGeometry(in: window, windowFrame: windowFrame) ?? configuredPaneGeometry()
+        let location = geometry.scrollTarget(in: windowFrame)
         guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
         let amount = Int32(min(500, max(120, windowFrame.height * 0.45)))
         let signedAmount = direction == .older ? amount : -amount
@@ -1113,11 +1185,11 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
-        messagePaneLeftX: CGFloat? = nil,
+        paneGeometry: ConversationPaneGeometry? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
-                                               messagePaneLeftX: messagePaneLeftX,
+                                               paneGeometry: paneGeometry,
                                                cancellation: cancellation, direction: .newer)
     }
 
@@ -1125,13 +1197,12 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
-        messagePaneLeftX: CGFloat?,
+        paneGeometry: ConversationPaneGeometry?,
         cancellation: MonitorWorkCancellation?,
         direction: ChatScrollDirection
     ) -> OlderContextScrollResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
-        let detection = detectCurrentConversation(forceFreshVision: true,
-                                                  messagePaneLeftX: messagePaneLeftX)
+        let detection = detectCurrentConversation(forceFreshVision: true, paneGeometry: paneGeometry)
         switch olderContextIdentityCheck(detection, contact: contact, identity: identity) {
         case .changed: return .conversationChanged
         case .uncertain: return .identityUncertain
@@ -1141,15 +1212,10 @@ final class WeChatBridge: @unchecked Sendable {
         guard cancellation?.isCancelled != true else { return .cancelled }
         let windowFrame = frame(window, timeout: 0.08)
         guard windowFrame.width >= 400, windowFrame.height >= 300 else { return .windowUnavailable }
-        let calibration = VisionLayoutCalibration.current
-        let canvasHeight = calibration.headerBottomY - calibration.composerTopY
+        let geometry = paneGeometry ?? accessibilityPaneGeometry(in: window, windowFrame: windowFrame) ?? configuredPaneGeometry()
+        let canvasHeight = geometry.messageRegion.height
         guard canvasHeight > 0.1 else { return .scrollUnavailable }
-        let xRatio = calibration.messagePaneLeftX + (1 - calibration.messagePaneLeftX) * 0.5
-        let yRatioFromTop = 1 - ((calibration.composerTopY + calibration.headerBottomY) * 0.5)
-        let location = CGPoint(
-            x: windowFrame.minX + windowFrame.width * xRatio,
-            y: windowFrame.minY + windowFrame.height * yRatioFromTop
-        )
+        let location = geometry.scrollTarget(in: windowFrame)
         guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
         let amount = Int32(min(500, max(120, windowFrame.height * canvasHeight * min(0.60, max(0.40, fraction)))))
         // Positive vertical wheel delta scrolls toward older transcript rows;
@@ -1170,7 +1236,7 @@ final class WeChatBridge: @unchecked Sendable {
         forceFresh: Bool = true,
         previousHeaderFingerprint: String? = nil,
         previousMessageFingerprint: String? = nil,
-        messagePaneLeftX: CGFloat? = nil,
+        paneGeometry: ConversationPaneGeometry? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextReadResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
@@ -1179,7 +1245,7 @@ final class WeChatBridge: @unchecked Sendable {
                                                   previousHeaderFingerprint: previousHeaderFingerprint,
                                                   previousMessageFingerprint: previousMessageFingerprint,
                                                   lockedContact: contact,
-                                                  messagePaneLeftX: messagePaneLeftX)
+                                                  paneGeometry: paneGeometry)
         let snapshot: WeChatSnapshot
         switch capture {
         case .success(let value): snapshot = value
@@ -1243,11 +1309,11 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func visibleTitleIdentity(for window: AXUIElement, forceFresh: Bool = false,
-                                      messagePaneLeftX: CGFloat? = nil) -> VisibleWeChatSnapshot? {
+                                      paneGeometry: ConversationPaneGeometry? = nil) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
         return WeChatScreenReader.shared.readTitleIdentity(
             pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh,
-            messagePaneLeftX: messagePaneLeftX
+            paneGeometry: paneGeometry
         )
     }
 

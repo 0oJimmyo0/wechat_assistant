@@ -1,10 +1,21 @@
 import Foundation
+import CoreGraphics
 
 enum WeChatParsing {
     static let chatTitleIdentifier = "big_title_line_h_view"
     static let messageListIdentifier = "chat_message_list"
     static let messageRowIdentifier = "chat_bubble_item_view"
     static let placeholderRowIdentifier = "virtual_cell"
+
+    static func messageSide(_ bounds: CGRect, in region: CGRect) -> MessageSender {
+        guard region.width > 0, bounds.minX >= region.minX, bounds.maxX <= region.maxX else { return .unknown }
+        let leftMargin = bounds.minX - region.minX
+        let rightMargin = region.maxX - bounds.maxX
+        let centerOffset = (bounds.midX - region.midX) / region.width
+        if rightMargin <= 0.07 && centerOffset >= 0.10 { return .me }
+        if leftMargin <= 0.07 && centerOffset <= -0.10 { return .other }
+        return .unknown
+    }
 
     static func normalizeChatTitle(_ text: String) -> String {
         var normalized = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")

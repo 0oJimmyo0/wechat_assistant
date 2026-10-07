@@ -52,7 +52,7 @@ struct SettingsView: View {
             Section("Developer diagnostics") {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Vision layout calibration").font(.subheadline)
-                    calibrationSlider("Message pane starts", value: $messagePaneLeftX, range: 0.15...0.60)
+                    calibrationSlider("Message pane starts", value: $messagePaneLeftX, range: 0.01...0.70)
                     calibrationSlider("Header bottom", value: $headerBottomY, range: 0.65...0.96)
                     calibrationSlider("Composer top", value: $composerTopY, range: 0.05...min(0.35, headerBottomY - 0.04))
                     Text("Ratios use normalized image coordinates from the bottom left. Adjust, then save an annotated preview to inspect the regions. Calibration stays on this Mac; screenshots are saved only when you choose a destination.")

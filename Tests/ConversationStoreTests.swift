@@ -23,6 +23,22 @@ enum ConversationStoreTests {
         expect(historical.prepended.map(\.text) == ["A", "B"], "historical rows are classified as prepended")
         expect(historical.appended.isEmpty, "historical rows are never incoming")
 
+        let visionStore = ConversationStore()
+        _ = visionStore.merge(visionRows("C", "D", "E", "F", "G"))
+        let olderVision = visionStore.merge(visionRows("A", "B", "C", "D"))
+        expect(texts(visionStore) == ["A", "B", "C", "D", "E", "F", "G"],
+               "a historical viewport ending at a tail overlap prepends its older prefix")
+        expect(olderVision.viewport == .historical && olderVision.appended.isEmpty,
+               "a tail overlap preceded by older rows is never treated as incoming")
+
+        let fuzzyStore = ConversationStore()
+        _ = fuzzyStore.merge(visionRows("今天去哪儿玩", "我六点下班"))
+        let fuzzyHistory = fuzzyStore.merge(visionRows("先去吃饭", "今天去哪玩", "我六点下班"))
+        expect(texts(fuzzyStore) == ["先去吃饭", "今天去哪儿玩", "我六点下班"],
+               "two adjacent Vision matches tolerate a small OCR variation and prepend history")
+        expect(fuzzyHistory.viewport == .historical && fuzzyHistory.appended.isEmpty,
+               "fuzzy historical overlap does not produce a live incoming trigger")
+
         let beforeEmpty = texts(historyStore)
         let empty = historyStore.merge([])
         expect(texts(historyStore) == beforeEmpty && empty.unchanged, "empty observations preserve stored context")
@@ -39,6 +55,9 @@ enum ConversationStoreTests {
     }
 
     private static func rows(_ values: String...) -> [ChatMessage] { values.map(row) }
+    private static func visionRows(_ values: String...) -> [ChatMessage] {
+        values.map { ChatMessage(text: $0, sender: .other, allowsAutomaticAnalysis: false, source: .vision) }
+    }
     private static func texts(_ store: ConversationStore) -> [String] { store.messages.map(\.text) }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ description: String) {

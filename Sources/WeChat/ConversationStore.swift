@@ -30,12 +30,9 @@ final class ConversationStore {
             return ConversationMergeResult(appended: messages, prepended: [], unchanged: false, viewport: .liveTail)
         }
 
-        let existingKeys = messages.map(ChatHistoryMerger.key(for:))
-        let snapshotKeys = snapshot.map(ChatHistoryMerger.key(for:))
-
         // A matching suffix of stored history anchors the visible sequence at
         // the known tail. Only rows after that anchor are new live messages.
-        if let overlap = Self.tailOverlap(existing: existingKeys, observed: snapshotKeys) {
+        if let overlap = Self.tailOverlap(existing: messages, observed: snapshot) {
             let appended = Array(snapshot.dropFirst(overlap.observedStart + overlap.length))
             let merged = messages + appended
             messages = Array(merged.suffix(maximumMessages))
@@ -46,7 +43,7 @@ final class ConversationStore {
         // A suffix of the observed rows matching an internal stored sequence
         // identifies a historical viewport. Only its unanchored older prefix
         // is inserted; rows after an internal match never count as live.
-        if let overlap = Self.historicalOverlap(existing: existingKeys, observed: snapshotKeys) {
+        if let overlap = Self.historicalOverlap(existing: messages, observed: snapshot) {
             let prefix = Array(snapshot.prefix(overlap.observedStart))
             let merged: [ChatMessage]
             if prefix.isEmpty {
@@ -67,13 +64,18 @@ final class ConversationStore {
         return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
     }
 
-    private static func tailOverlap(existing: [String], observed: [String]) -> (length: Int, observedStart: Int)? {
+    private static func tailOverlap(existing: [ChatMessage], observed: [ChatMessage]) -> (length: Int, observedStart: Int)? {
         let maxLength = min(existing.count, observed.count)
         guard maxLength > 0 else { return nil }
         for length in stride(from: maxLength, through: 1, by: -1) {
-            let suffix = Array(existing.suffix(length))
             for start in 0...(observed.count - length) {
-                if Array(observed[start..<(start + length)]) == suffix {
+                if ChatHistoryMerger.sequencesMatch(existing, lhsStart: existing.count - length,
+                                                    observed, rhsStart: start, length: length) {
+                    if length == 1 && ChatHistoryMerger.key(for: existing[existing.count - 1]) !=
+                        ChatHistoryMerger.key(for: observed[start]) { continue }
+                    // A match after an unanchored prefix and with no rows after
+                    // it describes a historical viewport, not the live tail.
+                    if start > 0 && start + length == observed.count { continue }
                     return (length, start)
                 }
             }
@@ -81,16 +83,17 @@ final class ConversationStore {
         return nil
     }
 
-    private static func historicalOverlap(existing: [String], observed: [String]) -> (length: Int, observedStart: Int, existingStart: Int)? {
+    private static func historicalOverlap(existing: [ChatMessage], observed: [ChatMessage]) -> (length: Int, observedStart: Int, existingStart: Int)? {
         let maxLength = min(existing.count, observed.count)
         guard maxLength > 0 else { return nil }
-        for length in stride(from: maxLength, through: 1, by: -1) {
+        let minimumLength = maxLength >= 2 ? 2 : 1
+        for length in stride(from: maxLength, through: minimumLength, by: -1) {
             // Requiring the match to end at the observed viewport's end makes
             // this a backward/history anchor rather than a live append.
             let observedStart = observed.count - length
-            let suffix = Array(observed.suffix(length))
             for historyStart in 0...(existing.count - length) {
-                if Array(existing[historyStart..<(historyStart + length)]) == suffix {
+                if ChatHistoryMerger.sequencesMatch(existing, lhsStart: historyStart,
+                                                    observed, rhsStart: observedStart, length: length) {
                     return (length, observedStart, historyStart)
                 }
             }

@@ -10,6 +10,7 @@ struct VisibleWeChatSnapshot: Sendable {
     let captureSucceeded: Bool
     let capturedSize: CGSize?
     let conversationCrop: CGRect
+    let paneGeometry: ConversationPaneGeometry
     let messagePaneLeftX: CGFloat
     let messageCrop: CGRect
     let targetPID: pid_t
@@ -62,7 +63,7 @@ struct VisionLayoutCalibration {
         let safeHeader = min(0.96, max(0.65, header))
         let safeComposer = min(safeHeader - 0.04, max(0.05, composer))
         return VisionLayoutCalibration(
-            messagePaneLeftX: min(0.60, max(0.15, left)),
+            messagePaneLeftX: min(0.70, max(0.01, left)),
             headerBottomY: safeHeader,
             composerTopY: safeComposer
         )
@@ -95,12 +96,8 @@ final class WeChatScreenReader {
         conversationCropRatio(leftX: VisionLayoutCalibration.current.messagePaneLeftX)
     }
     private func conversationCropRatio(leftX: CGFloat) -> CGRect {
-        let x = min(0.60, max(0.01, leftX))
+        let x = min(0.70, max(0.01, leftX))
         return CGRect(x: x, y: 0, width: 1 - x, height: 1)
-    }
-    private var headerSearchRegion: CGRect {
-        let bottom = VisionLayoutCalibration.current.headerBottomY
-        return VisionLayoutRegions.titleSearch(bottomY: bottom)
     }
     private var messageRegion: CGRect {
         let calibration = VisionLayoutCalibration.current
@@ -148,9 +145,10 @@ final class WeChatScreenReader {
     }
 
     func readTitleIdentity(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false,
-                           messagePaneLeftX: CGFloat? = nil) -> VisibleWeChatSnapshot {
+                           messagePaneLeftX: CGFloat? = nil,
+                           paneGeometry: ConversationPaneGeometry? = nil) -> VisibleWeChatSnapshot {
         read(pid: pid, windowFrame: windowFrame, mode: .titleOnly, forceFresh: forceFresh,
-             messagePaneLeftX: messagePaneLeftX)
+             messagePaneLeftX: messagePaneLeftX, paneGeometry: paneGeometry)
     }
 
     func readMessages(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false,
@@ -165,7 +163,7 @@ final class WeChatScreenReader {
                                      previousHeaderFingerprint: String? = nil,
                                      previousMessageFingerprint: String? = nil,
                                      messagePaneLeftX: CGFloat? = nil,
-                                     allowWideMessageCropFallback: Bool = false) -> VisibleWeChatSnapshot {
+                                     paneGeometry: ConversationPaneGeometry? = nil) -> VisibleWeChatSnapshot {
         let mode: VisionReadMode
         switch (includeTitle, includeMessages) {
         case (true, true): mode = accurateMessages ? .full : .fullFast
@@ -177,16 +175,19 @@ final class WeChatScreenReader {
                     previousHeaderFingerprint: previousHeaderFingerprint,
                     previousMessageFingerprint: previousMessageFingerprint,
                     messagePaneLeftX: messagePaneLeftX,
-                    allowWideMessageCropFallback: allowWideMessageCropFallback)
+                    paneGeometry: paneGeometry)
     }
 
     private func read(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
                       forceFresh: Bool, previousHeaderFingerprint: String? = nil,
                       previousMessageFingerprint: String? = nil,
                       messagePaneLeftX: CGFloat? = nil,
-                      allowWideMessageCropFallback: Bool = false) -> VisibleWeChatSnapshot {
-        let leftX = messagePaneLeftX ?? VisionLayoutCalibration.current.messagePaneLeftX
-        let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height)): \(leftX)"
+                      paneGeometry: ConversationPaneGeometry? = nil) -> VisibleWeChatSnapshot {
+        let leftX = paneGeometry?.leftX ?? messagePaneLeftX ?? VisionLayoutCalibration.current.messagePaneLeftX
+        let geometryKey = paneGeometry.map {
+            "\($0.source.rawValue):\($0.leftX):\($0.headerRegion):\($0.messageRegion)"
+        } ?? "configured:\(leftX):\(VisionLayoutCalibration.current.headerBottomY):\(VisionLayoutCalibration.current.composerTopY)"
+        let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height)): \(geometryKey)"
         cacheCondition.lock()
         while captureInProgress { cacheCondition.wait() }
         if mode == .full, !forceFresh, cachedKey == key, Date().timeIntervalSince(cachedAt) < cacheDuration,
@@ -205,7 +206,7 @@ final class WeChatScreenReader {
                              previousHeaderFingerprint: previousHeaderFingerprint,
                              previousMessageFingerprint: previousMessageFingerprint,
                              messagePaneLeftX: leftX,
-                             allowWideMessageCropFallback: allowWideMessageCropFallback)
+                             paneGeometry: paneGeometry)
         cacheCondition.lock()
         if mode == .full {
             cachedKey = key
@@ -223,8 +224,13 @@ final class WeChatScreenReader {
                          previousHeaderFingerprint: String? = nil,
                          previousMessageFingerprint: String? = nil,
                          messagePaneLeftX: CGFloat? = nil,
-                         allowWideMessageCropFallback: Bool = false) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
-        let configuredLeftX = messagePaneLeftX ?? VisionLayoutCalibration.current.messagePaneLeftX
+                         paneGeometry: ConversationPaneGeometry? = nil) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
+        let calibration = VisionLayoutCalibration.current
+        let configuredLeftX = paneGeometry?.leftX ?? messagePaneLeftX ?? calibration.messagePaneLeftX
+        var geometry = paneGeometry ?? VisionLayoutRegions.geometry(
+            leftX: configuredLeftX, headerBottomY: calibration.headerBottomY,
+            composerTopY: calibration.composerTopY, source: .configuredFallback, confidence: 0.40
+        )
         let configuredCrop = conversationCropRatio(leftX: configuredLeftX)
         guard CGPreflightScreenCaptureAccess() else {
             return (emptySnapshot(pid: pid, crop: configuredCrop, state: .screenRecordingPermissionRequired), nil)
@@ -249,10 +255,21 @@ final class WeChatScreenReader {
             return (emptySnapshot(pid: pid, crop: configuredCrop, state: state), nil)
         }
         // Keep the one captured WeChat window as the common coordinate space.
-        // Title detection always sees the full header; message OCR derives a
-        // separate pane crop from this same image.
+        // Title and message OCR use separate regions of this same image, both
+        // constrained by the resolved conversation pane.
         let capturedWindow = target.image
         let image = capturedWindow
+        if geometry.source == .configuredFallback,
+           let visualLeftX = visualConversationDivider(in: image) {
+            geometry = VisionLayoutRegions.geometry(
+                leftX: visualLeftX,
+                headerBottomY: calibration.headerBottomY,
+                composerTopY: calibration.composerTopY,
+                source: .visualDivider,
+                confidence: 0.74
+            )
+        }
+        let titleRegion = geometry.headerRegion
 
         var headerObservations: [VNRecognizedTextObservation] = []
         var messageObservations: [VNRecognizedTextObservation] = []
@@ -261,15 +278,15 @@ final class WeChatScreenReader {
                                                   timestampControlRejectedCount: 0)
         var messageFingerprint: String?
         var messageFrameUnchanged = false
-        var usedLeftX = configuredLeftX
+        let usedLeftX = geometry.leftX
         var fastOCRObservationCount = 0
         var accurateOCRObservationCount = 0
         var accurateFallbackAttempted = false
-        var wideCropFallbackAttempted = false
-        var wideCropObservationCount = 0
-        var wideCropFallbackSucceeded = false
+        let wideCropFallbackAttempted = false
+        let wideCropObservationCount = 0
+        let wideCropFallbackSucceeded = false
         var activeMessageRecognitionLevel = mode.messageRecognitionLevel
-        var effectiveMessageRegion = messageRegion(leftX: configuredLeftX)
+        let effectiveMessageRegion = geometry.messageRegion
         var headerFingerprint: String?
         var headerFrameUnchanged = false
         var headerOCRDurationMilliseconds = 0
@@ -279,7 +296,7 @@ final class WeChatScreenReader {
         var messageOCRSucceeded = true
 
         if mode.readsTitle {
-            if let headerImage = crop(image, to: headerSearchRegion) {
+            if let headerImage = crop(image, to: titleRegion) {
                 headerFingerprint = perceptualFingerprint(headerImage, width: 32, height: 24)
                 headerFrameUnchanged = previousHeaderFingerprint.map {
                     fingerprintDistance(headerFingerprint ?? "", $0) <= 0.003
@@ -335,41 +352,6 @@ final class WeChatScreenReader {
                         }
                     }
 
-                    // Some WeChat layouts have no 28%-wide chat-list pane.
-                    // On activation only, retry the message crop from the same
-                    // captured frame with the full conversation width.
-                    let configuredHasBothSenders = parsedMessages.messages.contains { $0.sender == .me } &&
-                        parsedMessages.messages.contains { $0.sender == .other }
-                    let shouldTryWideCrop = parsedMessages.messages.isEmpty || !configuredHasBothSenders
-                    let wideRegion = messageRegion(leftX: 0.01)
-                    if shouldTryWideCrop, allowWideMessageCropFallback,
-                       configuredLeftX > 0.03,
-                       let wideMessageImage = crop(capturedWindow, to: wideRegion) {
-                        wideCropFallbackAttempted = true
-                        let wide = recognizeMessageImage(wideMessageImage, level: .accurate)
-                        messageOCRSucceeded = messageOCRSucceeded || wide.succeeded
-                        wideCropObservationCount = wide.observations.count
-                        accurateOCRObservationCount += wide.observations.count
-                        messageOCRDurationMilliseconds += wide.durationMilliseconds
-                        if wide.succeeded {
-                            let wideParsed = parseMessageObservations(wide.observations, region: wideRegion)
-                            let wideHasBothSenders = wideParsed.messages.contains { $0.sender == .me } &&
-                                wideParsed.messages.contains { $0.sender == .other }
-                            if !wideParsed.messages.isEmpty &&
-                                (parsedMessages.messages.isEmpty ||
-                                 wideParsed.messages.count > parsedMessages.messages.count ||
-                                 (!configuredHasBothSenders && wideHasBothSenders)) {
-                                wideCropFallbackSucceeded = true
-                                parsedMessages = wideParsed
-                                messageObservations = wide.observations
-                                messageFingerprint = perceptualFingerprint(wideMessageImage)
-                                messageFrameUnchanged = false
-                                usedLeftX = 0.01
-                                effectiveMessageRegion = wideRegion
-                                activeMessageRecognitionLevel = .accurate
-                            }
-                        }
-                    }
                 }
             } else {
                 visionSucceeded = false
@@ -380,7 +362,8 @@ final class WeChatScreenReader {
         guard visionSucceeded else {
             return (makeSnapshot(
                 title: nil, messages: [], state: .visionFailed, pid: pid, image: capturedWindow,
-                target: target, headerObservations: 0, headerCandidates: [], acceptedTitleBounds: nil,
+                target: target, paneGeometry: geometry,
+                headerObservations: 0, headerCandidates: [], acceptedTitleBounds: nil,
                 acceptedTitleConfidence: nil, titleIdentity: nil,
                 titleRejectedAsMessageCount: 0, titleRejectedAsSentenceCount: 0,
                 messageObservations: 0, messageBounds: [], rejectedMessageBounds: [],
@@ -402,13 +385,13 @@ final class WeChatScreenReader {
             ), capturedWindow)
         }
 
-        let headerCandidates = rankHeaderCandidates(headerObservations, region: headerSearchRegion)
+        let headerCandidates = rankHeaderCandidates(headerObservations, region: titleRegion)
         let messages = parsedMessages.messages
         let messageBounds = parsedMessages.bounds
         let rejectedMessageBounds = parsedMessages.rejectedBounds
         let rawMessageTexts = messageObservations.compactMap { $0.topCandidates(1).first?.string }
         let titleSelection = mode.readsTitle
-            ? selectHeaderCandidate(headerCandidates, messageTexts: rawMessageTexts + messages.map(\.text))
+            ? selectHeaderCandidate(headerCandidates, messageTexts: rawMessageTexts + messages.map(\.text), region: titleRegion)
             : TitleSelection(candidates: headerCandidates, rejectedAsMessageCount: 0, rejectedAsSentenceCount: 0)
         let selectedCandidates = titleSelection.candidates
         let accepted = selectedCandidates.first(where: { $0.diagnostic.accepted })
@@ -432,6 +415,7 @@ final class WeChatScreenReader {
             target: target,
             conversationCrop: conversationCropRatio(leftX: usedLeftX),
             messageCrop: effectiveMessageRegion,
+            paneGeometry: geometry,
             headerObservations: headerObservations.count,
             headerCandidates: selectedCandidates.map(\.diagnostic),
             acceptedTitleBounds: accepted?.diagnostic.bounds,
@@ -587,10 +571,16 @@ final class WeChatScreenReader {
     }
 
     private func emptySnapshot(pid: pid_t, crop: CGRect, state: VisionCaptureState) -> VisibleWeChatSnapshot {
-        VisibleWeChatSnapshot(
+        return VisibleWeChatSnapshot(
             title: nil, messages: [], captureState: state, captureSucceeded: false,
-            capturedSize: nil, conversationCrop: crop, messagePaneLeftX: crop.minX,
-            messageCrop: messageRegion(leftX: VisionLayoutCalibration.current.messagePaneLeftX),
+            capturedSize: nil, conversationCrop: crop,
+            paneGeometry: VisionLayoutRegions.geometry(
+                leftX: crop.minX, headerBottomY: VisionLayoutCalibration.current.headerBottomY,
+                composerTopY: VisionLayoutCalibration.current.composerTopY,
+                source: .configuredFallback, confidence: 0.40
+            ),
+            messagePaneLeftX: crop.minX,
+            messageCrop: messageRegion(leftX: crop.minX),
             targetPID: pid, selectedWindowPID: nil,
             selectedWindowFrame: nil, selectedWindowOnScreen: false, windowFrameDistance: nil,
             windowDiscoveryDurationMilliseconds: 0, captureDurationMilliseconds: 0,
@@ -615,6 +605,7 @@ final class WeChatScreenReader {
         title: String?, messages: [ChatMessage], state: VisionCaptureState, pid: pid_t,
         image: CGImage, target: CapturedWindow, conversationCrop: CGRect? = nil,
         messageCrop: CGRect? = nil,
+        paneGeometry: ConversationPaneGeometry? = nil,
         headerObservations: Int,
         headerCandidates: [VisionHeaderCandidate], acceptedTitleBounds: CGRect?, acceptedTitleConfidence: Float?,
         titleIdentity: VisionConversationIdentity?, titleRejectedAsMessageCount: Int,
@@ -636,12 +627,19 @@ final class WeChatScreenReader {
         wideCropObservationCount: Int = 0,
         wideCropFallbackSucceeded: Bool = false
     ) -> VisibleWeChatSnapshot {
-        VisibleWeChatSnapshot(
+        let calibration = VisionLayoutCalibration.current
+        let resolvedGeometry = paneGeometry ?? VisionLayoutRegions.geometry(
+            leftX: messagePaneLeftX ?? calibration.messagePaneLeftX,
+            headerBottomY: calibration.headerBottomY, composerTopY: calibration.composerTopY,
+            source: .configuredFallback, confidence: 0.40
+        )
+        return VisibleWeChatSnapshot(
             title: title, messages: messages, captureState: state, captureSucceeded: true,
             capturedSize: CGSize(width: image.width, height: image.height),
-            conversationCrop: conversationCrop ?? self.conversationCropRatio(leftX: messagePaneLeftX ?? VisionLayoutCalibration.current.messagePaneLeftX),
-            messagePaneLeftX: messagePaneLeftX ?? VisionLayoutCalibration.current.messagePaneLeftX,
-            messageCrop: messageCrop ?? messageRegion(leftX: messagePaneLeftX ?? VisionLayoutCalibration.current.messagePaneLeftX),
+            conversationCrop: conversationCrop ?? self.conversationCropRatio(leftX: resolvedGeometry.leftX),
+            paneGeometry: resolvedGeometry,
+            messagePaneLeftX: resolvedGeometry.leftX,
+            messageCrop: messageCrop ?? resolvedGeometry.messageRegion,
             targetPID: pid, selectedWindowPID: target.pid, selectedWindowFrame: target.frame,
             selectedWindowOnScreen: target.onScreen, windowFrameDistance: target.distance,
             windowDiscoveryDurationMilliseconds: target.discoveryDurationMilliseconds,
@@ -706,18 +704,21 @@ final class WeChatScreenReader {
             guard let textCandidate = observation.topCandidates(1).first else { continue }
             let text = WeChatParsing.normalizeChatTitle(textCandidate.string)
             let bounds = mapBounds(observation.boundingBox, from: region)
-            // Vision has already limited this request to headerSearchRegion.
+            // Vision has already limited this request to the resolved title ROI.
             // Avoid a second strict box filter here: it discarded valid titles
             // when glyphs touched the edge of the header or pane.
             guard !text.isEmpty, text.count <= 36 else { continue }
-            let generic = isHeaderControl(text)
-            let expectedY = region.minY + region.height * 0.64
-            let compact = text.count <= 24 && bounds.width <= 0.48 && bounds.minX <= 0.48 &&
+        let generic = isHeaderControl(text, bounds: bounds, region: region)
+        let expectedY = region.minY + region.height * 0.64
+        let paneX = (bounds.minX - region.minX) / max(0.01, region.width)
+        let compact = text.count <= 24 && bounds.width <= min(0.48, region.width * 0.65) && paneX <= 0.65 &&
                 bounds.height >= 0.008 && bounds.height <= 0.075 &&
                 bounds.midY >= region.minY + region.height * 0.35
-            let plausible = textCandidate.confidence >= 0.35 && compact && !generic
-            let yScore = 1 - min(1, abs(bounds.midY - expectedY) / max(0.025, region.height * 0.58))
-            let xScore = 1 - min(1, abs(bounds.minX - 0.06) / 0.40)
+        let plausible = textCandidate.confidence >= 0.35 && compact && !generic
+        let yScore = 1 - min(1, abs(bounds.midY - expectedY) / max(0.025, region.height * 0.58))
+        // Rank relative to the resolved conversation pane, never the window's
+        // global left edge where the session list and search control live.
+        let xScore = 1 - min(1, abs(paneX - 0.08) / 0.55)
             let compactnessScore = 1 - min(1, bounds.width / 0.48)
             let sentenceLike = isLikelySentenceLikeTitle(text, bounds: bounds)
             let sentencePenalty = sentenceLike ? 3.5 : 0
@@ -743,7 +744,8 @@ final class WeChatScreenReader {
         return candidates
     }
 
-    private func selectHeaderCandidate(_ candidates: [RankedHeaderCandidate], messageTexts: [String]) -> TitleSelection {
+    private func selectHeaderCandidate(_ candidates: [RankedHeaderCandidate], messageTexts: [String],
+                                       region: CGRect) -> TitleSelection {
         var updated = candidates
         var rejectedAsMessage = 0
         var rejectedAsSentence = 0
@@ -754,7 +756,7 @@ final class WeChatScreenReader {
                 continue
             }
             let nearBottom = updated[index].diagnostic.bounds.midY <
-                headerSearchRegion.minY + headerSearchRegion.height * 0.38
+                region.minY + region.height * 0.38
             if updated[index].sentenceLike && nearBottom {
                 rejectedAsSentence += 1
                 updated[index].diagnostic = updated[index].diagnostic.rejected("sentence-like / low in header")
@@ -773,22 +775,27 @@ final class WeChatScreenReader {
         return (hasSentencePunctuation && text.count >= 5) || longAndWide
     }
 
-    private func isHeaderControl(_ text: String) -> Bool {
+    private func isHeaderControl(_ text: String, bounds: CGRect, region: CGRect) -> Bool {
         let normalized = text
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .filter { !$0.isWhitespace && !$0.isPunctuation }
         let controls = [
             "wechat", "wechat(chats)", "wechat(contacts)", "weixin", "微信", "微信聊天",
-            "search", "搜索", "chats", "聊天", "contacts", "通讯录", "discover", "发现",
+            "search", "qsearch", "搜索", "chats", "聊天", "contacts", "通讯录", "discover", "发现",
             "moments", "朋友圈", "settings", "设置", "more", "更多"
         ]
-        return controls.contains(normalized)
+        if controls.contains(normalized) { return true }
+        let paneX = (bounds.midX - region.minX) / max(0.01, region.width)
+        let looksLikeSearchControl = paneX >= 0.58 && normalized.contains("search")
+        return looksLikeSearchControl || (paneX >= 0.58 && normalized.contains("搜索"))
     }
 
     func diagnosticReport(pid: pid_t, windowFrame: CGRect) -> String {
         let snapshot = read(pid: pid, windowFrame: windowFrame, forceFresh: true)
         let size = snapshot.capturedSize.map { "\(Int($0.width))x\(Int($0.height))" } ?? "unavailable"
         let crop = snapshot.conversationCrop
+        let headerRegion = snapshot.paneGeometry.headerRegion
+        let messageRegion = snapshot.paneGeometry.messageRegion
         var lines = [
             "Screen Recording permission: \(Self.hasScreenCapturePermission ? "granted" : "not granted")",
             "Target WeChat PID: \(snapshot.targetPID)",
@@ -804,8 +811,10 @@ final class WeChatScreenReader {
             "Vision stage ms: \(snapshot.visionDurationMilliseconds)",
             "Captured size: \(size)",
             "Conversation crop ratio: x=\(ratio(crop.minX)) y=\(ratio(crop.minY)) width=\(ratio(crop.width)) height=\(ratio(crop.height))",
-            "Header search ratio: x=\(ratio(headerSearchRegion.minX)) y=\(ratio(headerSearchRegion.minY)) width=\(ratio(headerSearchRegion.width)) height=\(ratio(headerSearchRegion.height))",
-            "Message region ratio: x=\(ratio(snapshot.messageCrop.minX)) y=\(ratio(snapshot.messageCrop.minY)) width=\(ratio(snapshot.messageCrop.width)) height=\(ratio(snapshot.messageCrop.height))",
+            "Pane geometry: source=\(snapshot.paneGeometry.source.rawValue) confidence=\(String(format: "%.2f", snapshot.paneGeometry.confidence)) leftX=\(ratio(snapshot.paneGeometry.leftX))",
+            "Header search ratio: x=\(ratio(headerRegion.minX)) y=\(ratio(headerRegion.minY)) width=\(ratio(headerRegion.width)) height=\(ratio(headerRegion.height))",
+            "Message region ratio: x=\(ratio(messageRegion.minX)) y=\(ratio(messageRegion.minY)) width=\(ratio(messageRegion.width)) height=\(ratio(messageRegion.height))",
+            "Message OCR accepted inside pane: \(snapshot.messages.count)",
             "messagePaneLeftX: \(ratio(snapshot.messagePaneLeftX))",
             "Message OCR level: \(snapshot.messageRecognitionLevel)",
             "Fast OCR observations: \(snapshot.fastOCRObservationCount)",
@@ -830,7 +839,7 @@ final class WeChatScreenReader {
             "Grouped message blocks: \(snapshot.messages.count)",
             "Rejected message candidates: \(snapshot.rejectedMessageBounds.count)",
             "Grouped senders: me=\(snapshot.messages.filter { $0.sender == .me }.count) target=\(snapshot.messages.filter { $0.sender == .other }.count) unknown=\(snapshot.messages.filter { $0.sender == .unknown }.count)",
-            "Header/message ROI overlap: \(!headerSearchRegion.intersection(messageRegion).isNull && !headerSearchRegion.intersection(messageRegion).isEmpty)",
+            "Header/message ROI overlap: \(!headerRegion.intersection(messageRegion).isNull && !headerRegion.intersection(messageRegion).isEmpty)",
             "Accepted title confidence: \(snapshot.acceptedTitleConfidence.map { String(format: "%.3f", $0) } ?? "unavailable")"
         ]
         if let bounds = snapshot.acceptedTitleBounds {
@@ -870,9 +879,9 @@ final class WeChatScreenReader {
         paneBoundary.line(to: NSPoint(x: cropX, y: size.height))
         paneBoundary.stroke()
         NSColor.systemYellow.setStroke()
-        visionRect(headerSearchRegion, size: size).stroke()
+        visionRect(result.snapshot.paneGeometry.headerRegion, size: size).stroke()
         NSColor.systemGreen.setStroke()
-        visionRect(result.snapshot.messageCrop, size: size).stroke()
+        visionRect(result.snapshot.paneGeometry.messageRegion, size: size).stroke()
         NSColor.systemOrange.setStroke()
         visionRect(CGRect(x: 0, y: 0, width: 1, height: VisionLayoutCalibration.current.composerTopY),
                    size: size).stroke()
@@ -965,7 +974,7 @@ final class WeChatScreenReader {
             lines.append(RecognizedMessageLine(text: text, bounds: bounds,
                                                confidence: candidate.confidence))
         }
-        let (messages, bounds) = groupMessageLines(lines)
+        let (messages, bounds) = groupMessageLines(lines, region: region)
         return ParsedMessageCapture(messages: messages, bounds: bounds,
                                     rejectedBounds: rejectedBounds,
                                     plausibleTextCount: plausibleTextCount,
@@ -990,7 +999,53 @@ final class WeChatScreenReader {
         level == .fast ? "fast" : "accurate"
     }
 
-    private func groupMessageLines(_ lines: [RecognizedMessageLine]) -> ([ChatMessage], [CGRect]) {
+    /// Main WeChat draws a steady vertical split between its conversation list
+    /// and transcript. Use it only when AX did not provide pane geometry.
+    private func visualConversationDivider(in image: CGImage) -> CGFloat? {
+        guard let providerData = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(providerData) else { return nil }
+        let bytesPerPixel = image.bitsPerPixel / 8
+        guard image.bitsPerComponent == 8, bytesPerPixel >= 3,
+              image.bytesPerRow >= image.width * bytesPerPixel,
+              CFDataGetLength(providerData) >= image.bytesPerRow * image.height else { return nil }
+        let yStart = Int(CGFloat(image.height) * 0.20)
+        let yEnd = Int(CGFloat(image.height) * 0.84)
+        let yStep = max(5, (yEnd - yStart) / 72)
+        let minX = max(3, Int(CGFloat(image.width) * 0.18))
+        let maxX = min(image.width - 3, Int(CGFloat(image.width) * 0.55))
+        guard maxX > minX else { return nil }
+
+        func brightness(_ x: Int, _ y: Int) -> CGFloat {
+            let offset = y * image.bytesPerRow + x * bytesPerPixel
+            return (CGFloat(bytes[offset]) + CGFloat(bytes[offset + 1]) + CGFloat(bytes[offset + 2])) / 765
+        }
+
+        var bestX = 0
+        var bestScore: CGFloat = 0
+        var bestSupport: CGFloat = 0
+        for x in minX...maxX {
+            var total: CGFloat = 0
+            var supported = 0
+            var samples = 0
+            for y in stride(from: yStart, to: yEnd, by: yStep) {
+                let contrast = abs(brightness(x - 1, y) - brightness(x + 1, y))
+                total += contrast
+                if contrast >= 0.12 { supported += 1 }
+                samples += 1
+            }
+            let score = total / CGFloat(max(1, samples))
+            let support = CGFloat(supported) / CGFloat(max(1, samples))
+            if score > bestScore {
+                bestX = x
+                bestScore = score
+                bestSupport = support
+            }
+        }
+        guard bestScore >= 0.055, bestSupport >= 0.52 else { return nil }
+        return CGFloat(bestX) / CGFloat(image.width)
+    }
+
+    private func groupMessageLines(_ lines: [RecognizedMessageLine], region: CGRect) -> ([ChatMessage], [CGRect]) {
         var bubbles: [(text: String, bounds: CGRect, lines: [RecognizedMessageLine])] = []
         for line in lines.sorted(by: { $0.bounds.maxY > $1.bounds.maxY }) {
             if let previous = bubbles.last {
@@ -1003,8 +1058,8 @@ final class WeChatScreenReader {
                 let alignmentTolerance = max(0.025, referenceHeight * 1.8)
                 let leftAligned = abs(previous.bounds.minX - line.bounds.minX) <= alignmentTolerance
                 let rightAligned = abs(previous.bounds.maxX - line.bounds.maxX) <= alignmentTolerance
-                let previousSide = messageSide(previous.bounds)
-                let lineSide = messageSide(line.bounds)
+                let previousSide = WeChatParsing.messageSide(previous.bounds, in: region)
+                let lineSide = WeChatParsing.messageSide(line.bounds, in: region)
                 let compatibleSide = previousSide == .unknown || lineSide == .unknown || previousSide == lineSide
                 let sameBubble = verticalGap >= -referenceHeight * 0.4 &&
                     verticalGap <= verticalTolerance &&
@@ -1019,7 +1074,7 @@ final class WeChatScreenReader {
             bubbles.append((line.text, line.bounds, [line]))
         }
         let messages = bubbles.enumerated().map { index, bubble in
-            let sender = messageSide(bubble.bounds)
+            let sender = WeChatParsing.messageSide(bubble.bounds, in: region)
             let normalizedText = bubble.text
                 .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
                 .split(whereSeparator: \.isWhitespace).joined(separator: " ")
@@ -1032,16 +1087,6 @@ final class WeChatScreenReader {
                                id: snapshotKey, source: .vision, confidence: confidence)
         }
         return (messages, bubbles.map(\.bounds))
-    }
-
-    private func messageSide(_ bounds: CGRect) -> MessageSender {
-        let leftMargin = bounds.minX - messageRegion.minX
-        let rightMargin = messageRegion.maxX - bounds.maxX
-        let paneWidth = messageRegion.width
-        let centerOffset = (bounds.midX - messageRegion.midX) / paneWidth
-        if rightMargin <= 0.07 && centerOffset >= 0.10 { return .me }
-        if leftMargin <= 0.07 && centerOffset <= -0.10 { return .other }
-        return .unknown
     }
 
     private func senderKey(for sender: MessageSender) -> String {

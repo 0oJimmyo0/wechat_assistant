@@ -28,6 +28,14 @@ enum WeChatParsingTests {
         expect(WeChatParsing.sender(from: "敏感信息") == .unknown, "does not misclassify arbitrary English prefixes")
         expect(WeChatParsing.sender(from: "") == .unknown, "leaves absent sender metadata unknown")
 
+        let pane = CGRect(x: 0.42, y: 0.18, width: 0.57, height: 0.70)
+        expect(WeChatParsing.messageSide(CGRect(x: 0.44, y: 0.45, width: 0.20, height: 0.04), in: pane) == .other,
+               "sender classification uses full-window bounds and the resolved pane")
+        expect(WeChatParsing.messageSide(CGRect(x: 0.74, y: 0.45, width: 0.22, height: 0.04), in: pane) == .me,
+               "right-aligned full-window bubbles map to self inside the resolved pane")
+        expect(WeChatParsing.messageSide(CGRect(x: 0.10, y: 0.45, width: 0.20, height: 0.04), in: pane) == .unknown,
+               "sidebar text outside the resolved message pane cannot acquire a sender")
+
         expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "preferred", value: "fallback") == "preferred", "prefers AXTitle")
         expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "  ", value: "fallback") == "fallback", "uses AXValue when title is empty")
         expect(WeChatParsing.messageText(identifier: "virtual_cell", title: "placeholder", value: nil) == nil, "ignores recycled placeholder rows")
@@ -37,6 +45,15 @@ enum WeChatParsingTests {
         let unknown = ChatMessage(text: "hello", sender: .unknown)
         let incoming = ChatMessage(text: "hello", sender: .other)
         let outgoing = ChatMessage(text: "hello", sender: .me)
+        let visionUnknown = ChatMessage(text: "今天去哪儿玩", sender: .unknown, source: .vision)
+        let visionTarget = ChatMessage(text: "今天去哪玩", sender: .other, source: .vision)
+        let visionSelf = ChatMessage(text: "今天去哪玩", sender: .me, source: .vision)
+        let axTarget = ChatMessage(text: "今天去哪玩", sender: .other, source: .accessibility)
+        expect(ChatHistoryMerger.messagesCompatible(visionUnknown, visionTarget),
+               "Vision overlap permits unknown-versus-known sender and a small text variation")
+        expect(!ChatHistoryMerger.messagesCompatible(visionSelf, visionTarget) &&
+               !ChatHistoryMerger.messagesCompatible(visionUnknown, axTarget),
+               "Vision fuzzy matching never crosses me/other or AX/Vision source boundaries")
         let repeatedOne = ChatMessage(text: "嗯", sender: .other, allowsAutomaticAnalysis: false, id: "vision:other:嗯:order0")
         let repeatedTwo = ChatMessage(text: "嗯", sender: .other, allowsAutomaticAnalysis: false, id: "vision:other:嗯:order1")
         expect(repeatedOne.id != repeatedTwo.id, "keeps identical OCR messages distinct within a snapshot")
@@ -117,7 +134,8 @@ enum WeChatParsingTests {
     }
 
     private static func visionMessage(_ text: String, order: Int) -> ChatMessage {
-        ChatMessage(text: text, sender: .other, allowsAutomaticAnalysis: false, id: "vision:other:\(text):order\(order)")
+        ChatMessage(text: text, sender: .other, allowsAutomaticAnalysis: false,
+                    id: "vision:other:\(text):order\(order)", source: .vision)
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ description: String) {

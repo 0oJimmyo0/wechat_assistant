@@ -64,7 +64,7 @@ final class MessageMonitor: ObservableObject {
     private var lastObservedSnapshot: [String] = []
     private var lastHeaderFingerprint: String?
     private var visionMessageBaseline = VisionMessageBaseline()
-    private var activeMessagePaneLeftX: CGFloat?
+    private var activePaneGeometry: ConversationPaneGeometry?
     private var lastProcessedIncomingMessage: UUID?
     private var sessionCancellation: MonitorWorkCancellation?
     private var lastTitleValidationUptime: TimeInterval = 0
@@ -105,7 +105,7 @@ final class MessageMonitor: ObservableObject {
             "Candidate change observations: \(candidateContactPolls)",
             "Conversation captures: \(messageCaptureCount)",
             "Valid Vision message baseline: \(visionMessageBaseline.isValid ? "yes" : "no")",
-            "Active message crop left edge: \(activeMessagePaneLeftX.map { String(format: "%.3f", $0) } ?? "configured")",
+            "Active pane geometry: \(activePaneGeometry.map { "\($0.source.rawValue), confidence \(String(format: "%.2f", $0.confidence)), leftX \(String(format: "%.3f", $0.leftX)), scroll target x/y \(String(format: "%.3f", $0.messageRegion.midX))/\(String(format: "%.3f", 1 - $0.messageRegion.midY))" } ?? "unresolved")",
             "Latest observed rows: \(latestSnapshotBlockCount)",
             "Stored context size: \(conversationStore.messages.count)",
             "Tail overlap: \(latestTailOverlap)",
@@ -139,13 +139,13 @@ final class MessageMonitor: ObservableObject {
         let bridge = self.bridge
         let previousHeaderFingerprint = lastHeaderFingerprint
         let previousMessageFingerprint = visionMessageBaseline.fingerprint
-        let preferredMessagePaneLeftX = activeMessagePaneLeftX
+        let preferredPaneGeometry = activePaneGeometry
         accessibilityQueue.async { [weak self] in
             let captureResult = bridge.captureConversationSnapshot(
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
                 initialActivation: true,
-                messagePaneLeftX: preferredMessagePaneLeftX
+                paneGeometry: preferredPaneGeometry
             )
             guard cancellation.isCancelled == false else { return }
             Task { @MainActor [weak self] in
@@ -204,7 +204,7 @@ final class MessageMonitor: ObservableObject {
         lastObservedSnapshot = []
         lastHeaderFingerprint = nil
         visionMessageBaseline.reset()
-        activeMessagePaneLeftX = nil
+        activePaneGeometry = nil
         lastProcessedIncomingMessage = nil
         lockedContact = nil
         lockedVisionIdentity = nil
@@ -255,7 +255,7 @@ final class MessageMonitor: ObservableObject {
         lastObservedSnapshot = []
         lastHeaderFingerprint = nil
         visionMessageBaseline.reset()
-        activeMessagePaneLeftX = nil
+        activePaneGeometry = nil
         lastProcessedIncomingMessage = nil
         lockedContact = nil
         lockedVisionIdentity = nil
@@ -371,12 +371,12 @@ final class MessageMonitor: ObservableObject {
                   attempts < self.maxScrollAttempts, noProgress < self.maxNoProgressAttempts {
                 let before = self.messages.count
                 let identity = self.lockedVisionIdentity
-                let messagePaneLeftX = self.activeMessagePaneLeftX
+                let paneGeometry = self.activePaneGeometry
                 let workCancellation = self.sessionCancellation
                 let scroll = await self.performAccessibilityOperation {
                     self.bridge.scrollMessagePaneUpwardIfConversationMatches(
                         contact: contact, identity: identity, fraction: 0.5,
-                        messagePaneLeftX: messagePaneLeftX,
+                        paneGeometry: paneGeometry,
                         cancellation: workCancellation
                     )
                 }
@@ -448,21 +448,21 @@ final class MessageMonitor: ObservableObject {
         let identity = lockedVisionIdentity
         let previousHeaderFingerprint = lastHeaderFingerprint
         let previousMessageFingerprint = visionMessageBaseline.fingerprint
-        let preferredMessagePaneLeftX = activeMessagePaneLeftX
+        let preferredPaneGeometry = activePaneGeometry
         let captured: OlderContextReadResult? = await performAccessibilityOperation {
             if purpose == .historical {
                 return bridge.readMessagesIfConversationMatches(contact: contact, identity: identity,
                                                                accurate: false, forceFresh: true,
                                                                previousHeaderFingerprint: previousHeaderFingerprint,
                                                                previousMessageFingerprint: previousMessageFingerprint,
-                                                               messagePaneLeftX: preferredMessagePaneLeftX,
+                                                               paneGeometry: preferredPaneGeometry,
                                                                cancellation: cancellation)
             }
             let capture = bridge.captureConversationSnapshot(
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
                 lockedContact: contact,
-                messagePaneLeftX: preferredMessagePaneLeftX
+                paneGeometry: preferredPaneGeometry
             )
             guard case .success(let snapshot) = capture else { return nil }
             return .snapshot(snapshot)
@@ -545,6 +545,9 @@ final class MessageMonitor: ObservableObject {
         }
         if let identity = observation.visionIdentity { pendingVisionIdentity = identity }
         if let fingerprint = observation.headerFingerprint { pendingHeaderFingerprint = fingerprint }
+        if observation.paneGeometry.isValidated && activePaneGeometry == nil {
+            activePaneGeometry = observation.paneGeometry
+        }
         _ = pendingIdentityStore.merge(observation.messages)
         messages = pendingIdentityStore.messages
         latestSnapshotBlockCount = observation.messageRowCount
@@ -662,13 +665,13 @@ final class MessageMonitor: ObservableObject {
         let bridge = self.bridge
         let previousHeaderFingerprint = lastHeaderFingerprint
         let previousMessageFingerprint = visionMessageBaseline.fingerprint
-        let preferredMessagePaneLeftX = activeMessagePaneLeftX
+        let preferredPaneGeometry = activePaneGeometry
         accessibilityQueue.async { [weak self] in
             let capture = bridge.captureConversationSnapshot(
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
                 lockedContact: contact,
-                messagePaneLeftX: preferredMessagePaneLeftX
+                paneGeometry: preferredPaneGeometry
             )
             guard cancellation?.isCancelled != true else { return }
             Task { @MainActor [weak self] in
@@ -746,10 +749,9 @@ final class MessageMonitor: ObservableObject {
 
     private func recordCaptureFingerprints(_ snapshot: WeChatSnapshot) {
         if let fingerprint = snapshot.headerFingerprint { lastHeaderFingerprint = fingerprint }
-        if snapshot.messagePaneLeftX != nil { activeMessagePaneLeftX = snapshot.messagePaneLeftX }
+        if snapshot.paneGeometry.isValidated && activePaneGeometry == nil { activePaneGeometry = snapshot.paneGeometry }
         guard snapshot.messageSource == .vision else {
             visionMessageBaseline.reset()
-            activeMessagePaneLeftX = nil
             return
         }
         visionMessageBaseline.record(source: snapshot.messageSource,
@@ -762,6 +764,7 @@ final class MessageMonitor: ObservableObject {
         consecutiveCaptureFailures += 1
         guard consecutiveCaptureFailures >= 3 else { return }
         bridge.resetReaderBackend()
+        activePaneGeometry = nil
         consecutiveCaptureFailures = 0
         lastOlderContextDiagnostic = "AX capability cache refreshed after repeated capture failures"
     }
@@ -799,13 +802,13 @@ final class MessageMonitor: ObservableObject {
         var appended: [ChatMessage] = []
         let bridge = self.bridge
         let identity = lockedVisionIdentity
-        let messagePaneLeftX = activeMessagePaneLeftX
+        let paneGeometry = activePaneGeometry
         for _ in 0..<maxScrollAttempts {
             guard isRunning, generation == token, cancellation?.isCancelled != true else { return (false, appended) }
             let scroll = await performAccessibilityOperation {
                 bridge.scrollMessagePaneDownwardIfConversationMatches(
                     contact: contact, identity: identity,
-                    fraction: 0.5, messagePaneLeftX: messagePaneLeftX,
+                    fraction: 0.5, paneGeometry: paneGeometry,
                     cancellation: cancellation
                 )
             }

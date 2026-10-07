@@ -13,13 +13,25 @@ struct ChatViewportClassification: Sendable {
 }
 
 enum ChatHistoryMerger {
-    static func key(for message: ChatMessage) -> String {
-        let folded = message.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-        let scalars = folded.unicodeScalars.filter {
-            !CharacterSet.whitespacesAndNewlines.contains($0) &&
-                !CharacterSet.punctuationCharacters.contains($0)
+    static func messagesCompatible(_ lhs: ChatMessage, _ rhs: ChatMessage) -> Bool {
+        if key(for: lhs) == key(for: rhs) { return true }
+        guard lhs.source == .vision, rhs.source == .vision else { return false }
+        let senderCompatible: Bool
+        switch (lhs.sender, rhs.sender) {
+        case (.me, .other), (.other, .me): senderCompatible = false
+        case (.unknown, _), (_, .unknown): senderCompatible = true
+        default: senderCompatible = lhs.sender == rhs.sender
         }
-        let normalized = String(String.UnicodeScalarView(scalars))
+        guard senderCompatible else { return false }
+        let left = normalizedText(lhs.text)
+        let right = normalizedText(rhs.text)
+        if left == right { return true }
+        guard min(left.count, right.count) >= 5 else { return false }
+        return editDistanceAtMostOne(Array(left), Array(right))
+    }
+
+    static func key(for message: ChatMessage) -> String {
+        let normalized = normalizedText(message.text)
         let sender: String
         switch message.sender {
         case .me: sender = "me"
@@ -29,6 +41,42 @@ enum ChatHistoryMerger {
         // Identity is resolved by ordered overlap, never by this key alone.
         // Repeated messages remain distinct array entries at distinct positions.
         return "\(sender):\(normalized)"
+    }
+
+    private static func normalizedText(_ text: String) -> String {
+        let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let scalars = folded.unicodeScalars.filter {
+            !CharacterSet.whitespacesAndNewlines.contains($0) &&
+                !CharacterSet.punctuationCharacters.contains($0)
+        }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    private static func editDistanceAtMostOne(_ lhs: [Character], _ rhs: [Character]) -> Bool {
+        guard abs(lhs.count - rhs.count) <= 1 else { return false }
+        var left = 0
+        var right = 0
+        var edits = 0
+        while left < lhs.count && right < rhs.count {
+            if lhs[left] == rhs[right] { left += 1; right += 1; continue }
+            edits += 1
+            guard edits <= 1 else { return false }
+            if lhs.count > rhs.count { left += 1 }
+            else if rhs.count > lhs.count { right += 1 }
+            else { left += 1; right += 1 }
+        }
+        if left < lhs.count || right < rhs.count { edits += 1 }
+        return edits <= 1
+    }
+
+    static func sequencesMatch(_ lhs: [ChatMessage], lhsStart: Int,
+                               _ rhs: [ChatMessage], rhsStart: Int, length: Int) -> Bool {
+        guard length > 0, lhsStart >= 0, rhsStart >= 0,
+              lhsStart + length <= lhs.count, rhsStart + length <= rhs.count else { return false }
+        for offset in 0..<length where !messagesCompatible(lhs[lhsStart + offset], rhs[rhsStart + offset]) {
+            return false
+        }
+        return true
     }
 
     static func merge(existing: [ChatMessage], visible: [ChatMessage], limit: Int) -> [ChatMessage] {
