@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import ScreenCaptureKit
 import Vision
 
 struct VisibleWeChatSnapshot {
@@ -37,8 +38,8 @@ final class WeChatScreenReader {
 
     private func capture(pid: pid_t, windowFrame: CGRect) -> VisibleWeChatSnapshot? {
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess(),
-              let windowID = visibleWindowID(pid: pid, matching: windowFrame),
-              let capturedWindow = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, [.bestResolution]) else {
+              let capturedWindow = screenCaptureKitWindow(pid: pid, matching: windowFrame) ??
+                legacyWindowCapture(pid: pid, matching: windowFrame) else {
             return nil
         }
         let cropX = Int((CGFloat(capturedWindow.width) * 0.28).rounded(.down))
@@ -85,6 +86,45 @@ final class WeChatScreenReader {
         let messages = groupMessageLines(messageLines).suffix(50)
 
         return VisibleWeChatSnapshot(title: title, messages: Array(messages))
+    }
+
+    private func screenCaptureKitWindow(pid: pid_t, matching frame: CGRect) -> CGImage? {
+        let contentResult = CallbackResult<SCShareableContent>()
+        let contentSemaphore = DispatchSemaphore(value: 0)
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            contentResult.set(content)
+            contentSemaphore.signal()
+        }
+        guard contentSemaphore.wait(timeout: .now() + 3) == .success,
+              let content = contentResult.get(),
+              let window = content.windows
+                .filter({ $0.owningApplication?.processID == pid && $0.isOnScreen })
+                .min(by: { frameDistance($0.frame, frame) < frameDistance($1.frame, frame) }) else {
+            return nil
+        }
+
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int((window.frame.width * 2).rounded()))
+        configuration.height = max(1, Int((window.frame.height * 2).rounded()))
+        let imageResult = CallbackResult<CGImage>()
+        let imageSemaphore = DispatchSemaphore(value: 0)
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, _ in
+            imageResult.set(image)
+            imageSemaphore.signal()
+        }
+        guard imageSemaphore.wait(timeout: .now() + 3) == .success else { return nil }
+        return imageResult.get()
+    }
+
+    private func legacyWindowCapture(pid: pid_t, matching frame: CGRect) -> CGImage? {
+        guard let windowID = visibleWindowID(pid: pid, matching: frame) else { return nil }
+        return CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, [.bestResolution])
+    }
+
+    private func frameDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        abs(lhs.origin.x - rhs.origin.x) + abs(lhs.origin.y - rhs.origin.y) +
+            abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
     }
 
     private func visibleWindowID(pid: pid_t, matching frame: CGRect) -> CGWindowID? {
@@ -139,5 +179,22 @@ final class WeChatScreenReader {
         return bubbles.map {
             ChatMessage(text: $0.text, sender: $0.sender, allowsAutomaticAnalysis: false)
         }
+    }
+}
+
+private final class CallbackResult<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value?
+
+    func set(_ value: Value?) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }

@@ -51,6 +51,7 @@ swiftc \
     -framework Carbon \
     -framework ApplicationServices \
     -framework Vision \
+    -framework ScreenCaptureKit \
     -framework Combine \
     -framework Network \
     -framework Security \
