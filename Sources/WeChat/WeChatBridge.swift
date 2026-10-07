@@ -46,7 +46,7 @@ final class WeChatBridge: @unchecked Sendable {
         AXUIElementSetMessagingTimeout(element, 0.5)
         var values: CFArray?
         let attrs = ["AXRole", "AXIdentifier"] as CFArray
-        if AXUIElementCopyMultipleAttributeValues(element, attrs, 0, &values) == .success,
+        if AXUIElementCopyMultipleAttributeValues(element, attrs, AXCopyMultipleAttributeOptions(rawValue: 0), &values) == .success,
            let array = values, let entries = array as? [Any], entries.count == 2 {
             return (entries[0] as? String ?? "", entries[1] as? String ?? "")
         }
@@ -75,7 +75,7 @@ final class WeChatBridge: @unchecked Sendable {
     private func mainWindow() -> AXUIElement? {
         guard let app = applicationElement() else { return nil }
         if let focused = value(app, "AXFocusedWindow"), CFGetTypeID(focused) == AXUIElementGetTypeID() {
-            return focused as! AXUIElement
+            return focused as? AXUIElement
         }
         return (value(app, "AXWindows") as? [AXUIElement])?.first
     }
