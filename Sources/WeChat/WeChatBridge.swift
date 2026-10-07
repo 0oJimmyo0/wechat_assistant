@@ -47,7 +47,7 @@ final class WeChatBridge: @unchecked Sendable {
         var values: CFArray?
         let attrs = ["AXRole", "AXIdentifier"] as CFArray
         if AXUIElementCopyMultipleAttributeValues(element, attrs, 0, &values) == .success,
-           let entries = values as NSArray?, entries.count == 2 {
+           let array = values, let entries = array as? [Any], entries.count == 2 {
             return (entries[0] as? String ?? "", entries[1] as? String ?? "")
         }
         return (string(element, "AXRole") ?? "", string(element, "AXIdentifier") ?? "")
