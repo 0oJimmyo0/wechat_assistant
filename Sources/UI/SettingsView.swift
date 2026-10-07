@@ -8,15 +8,11 @@ struct SettingsView: View {
     @ObservedObject private var auth = ChatGPTAuthManager.shared
     @ObservedObject private var monitor = MessageMonitor.shared
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
-    @AppStorage("conversation_storage_enabled") private var storeConversationContext = true
     @AppStorage("vision_conversation_left_x") private var conversationLeftX = 0.28
     @AppStorage("vision_header_bottom_y") private var headerBottomY = 0.90
     @AppStorage("vision_composer_top_y") private var composerTopY = 0.18
     @State private var isInspectingWeChat = false
     @State private var diagnosticStatus: String?
-    @State private var privacyStatus: String?
-    @State private var confirmClearCurrent = false
-    @State private var confirmClearAll = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -96,14 +92,7 @@ struct SettingsView: View {
                 }
             }
             Section("Privacy") {
-                Toggle("Store conversation context locally", isOn: $storeConversationContext)
-                Text("When enabled, recognized message text is encrypted with AES-GCM and saved in Application Support. Its encryption key is stored in this Mac's Keychain. The archive retains up to 500 messages per conversation for 30 days. No screenshots are stored. A local identity hash is used to locate a conversation record; the record and display name are encrypted. Turning storage off stops future loads and writes but leaves existing encrypted records until you clear them.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Button("Clear current conversation history…") { confirmClearCurrent = true }
-                    .disabled(monitor.contactName == nil)
-                Button("Clear all stored conversation history…") { confirmClearAll = true }
-                if let privacyStatus { Text(privacyStatus).font(.caption).foregroundStyle(.secondary) }
-                Text("The active working context is limited to 100 messages and the sidebar shows up to 20. ChatGPT does not access this archive directly. When you choose Analyze, the app explicitly sends at most the latest 30 messages, your local relationship profile, and any special instruction; the contact name and other conversations are excluded. Automatic analysis, if enabled, is also limited to identified incoming Accessibility messages. Deactivation cannot recall a request OpenAI has already received. Your relationship profile remains in local app preferences without separate app-level encryption. store=false is not a zero-retention guarantee. Copying a reply leaves it on the system clipboard.")
+                Text("Conversation messages are held in memory only while monitoring is active. Deactivate or switch conversations to clear that context; the app does not save conversation history to disk. When you choose Analyze, the app sends at most the latest 20 observed messages, your local relationship profile, and any special instruction. The contact name and other conversations are excluded. Automatic analysis, if enabled, is limited to identified incoming Accessibility messages. Deactivation cannot recall a request OpenAI has already received. Your relationship profile remains in local app preferences. Copying a reply places it on the system clipboard.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Link("OpenAI data controls", destination: URL(string: "https://developers.openai.com/api/docs/guides/your-data")!)
                     .font(.caption)
@@ -111,26 +100,6 @@ struct SettingsView: View {
             }
             .formStyle(.grouped)
             .padding(8)
-        }
-        .confirmationDialog("Clear the stored history for the currently monitored conversation?", isPresented: $confirmClearCurrent, titleVisibility: .visible) {
-            Button("Clear current history", role: .destructive) {
-                do {
-                    try monitor.clearCurrentStoredHistory()
-                    privacyStatus = "Current conversation history cleared. Monitoring paused."
-                } catch {
-                    privacyStatus = "Could not clear the current conversation history."
-                }
-            }
-        }
-        .confirmationDialog("Clear all locally stored conversation history?", isPresented: $confirmClearAll, titleVisibility: .visible) {
-            Button("Clear all history", role: .destructive) {
-                do {
-                    try monitor.clearAllStoredHistory()
-                    privacyStatus = "All stored conversation history cleared. Monitoring paused."
-                } catch {
-                    privacyStatus = "Could not clear stored conversation history."
-                }
-            }
         }
     }
 

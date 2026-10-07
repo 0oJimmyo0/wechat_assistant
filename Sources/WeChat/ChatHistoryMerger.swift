@@ -14,7 +14,6 @@ struct ChatViewportClassification: Sendable {
 
 enum ChatHistoryMerger {
     static func key(for message: ChatMessage) -> String {
-        if !message.id.hasPrefix("vision:") { return message.id }
         let folded = message.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         let scalars = folded.unicodeScalars.filter {
             !CharacterSet.whitespacesAndNewlines.contains($0) &&
@@ -27,10 +26,9 @@ enum ChatHistoryMerger {
         case .other: sender = "other"
         case .unknown: sender = "unknown"
         }
-        // OCR order suffixes are local to one viewport, so they change while
-        // the same message moves between screenshots. Keep repeated messages
-        // as repeated array entries while matching by stable visible content.
-        return "vision:\(sender):\(normalized)"
+        // Identity is resolved by ordered overlap, never by this key alone.
+        // Repeated messages remain distinct array entries at distinct positions.
+        return "\(sender):\(normalized)"
     }
 
     static func merge(existing: [ChatMessage], visible: [ChatMessage], limit: Int) -> [ChatMessage] {

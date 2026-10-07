@@ -1,229 +1,101 @@
 import Foundation
-import CryptoKit
-import Security
 
-private struct ConversationArchive: Codable {
-    var conversations: [StoredConversation]
+struct ConversationMergeResult: Sendable {
+    let appended: [ChatMessage]
+    let prepended: [ChatMessage]
+    let unchanged: Bool
+    let viewport: ChatViewportState
 }
 
-private struct StoredConversation: Codable {
-    let id: UUID
-    let localIdentityKey: String
-    var displayName: String?
-    var messages: [StoredMessage]
-    var updatedAt: Date
-}
-
-private struct StoredMessage: Codable {
-    let id: String
-    let text: String
-    let sender: String
-    let capturedAt: Date
-    let source: MessageSource
-    let confidence: Float?
-
-    init(_ message: ChatMessage) {
-        id = message.id
-        text = message.text
-        switch message.sender {
-        case .me: sender = "me"
-        case .other: sender = "other"
-        case .unknown: sender = "unknown"
-        }
-        capturedAt = message.capturedAt
-        source = message.source
-        confidence = message.confidence
-    }
-
-    var chatMessage: ChatMessage {
-        let messageSender: MessageSender
-        switch sender {
-        case "me": messageSender = .me
-        case "other": messageSender = .other
-        default: messageSender = .unknown
-        }
-        return ChatMessage(text: text, sender: messageSender, allowsAutomaticAnalysis: source == .accessibility,
-                           id: id, capturedAt: capturedAt, source: source, confidence: confidence)
-    }
-}
-
-/// Encrypts one bounded archive with an AES-GCM key kept in this Mac's Keychain.
-/// No screenshots, plaintext sidecars, or contact names are used in filesystem paths.
+/// The in-memory conversation timeline. AX snapshots are observations; only this
+/// store owns the accumulated message list shown to the UI and supplied to analysis.
 final class ConversationStore {
-    static let shared = ConversationStore()
-    static let storageEnabledKey = "conversation_storage_enabled"
+    private(set) var messages: [ChatMessage] = []
+    private let maximumMessages: Int
 
-    private let lock = NSLock()
-    private let keychainService: String
-    private let keychainAccount: String
-    private let maxMessagesPerConversation = 500
-    private let retentionInterval: TimeInterval = 30 * 24 * 60 * 60
-
-    private let archiveURL: URL
-
-    private static var defaultArchiveURL: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("WeChatReplyCopilot", isDirectory: true)
-            .appendingPathComponent("conversations.enc", isDirectory: false)
+    init(maximumMessages: Int = 200) {
+        self.maximumMessages = max(20, maximumMessages)
     }
 
-    private convenience init() {
-        self.init(archiveURL: Self.defaultArchiveURL,
-                  keychainService: "com.wechatreplycopilot.conversation-storage",
-                  keychainAccount: "archive-aes-key-v1")
+    func clear() {
+        messages.removeAll(keepingCapacity: true)
     }
 
-    init(archiveURL: URL, keychainService: String, keychainAccount: String) {
-        self.archiveURL = archiveURL
-        self.keychainService = keychainService
-        self.keychainAccount = keychainAccount
-    }
-
-    var isEnabled: Bool {
-        let defaults = UserDefaults.standard
-        guard defaults.object(forKey: Self.storageEnabledKey) != nil else { return true }
-        return defaults.bool(forKey: Self.storageEnabledKey)
-    }
-
-    /// Hashes the confirmed display identity so contact names never appear in the archive index.
-    func identityKey(for displayName: String) -> String {
-        let normalized = WeChatParsing.conversationIdentityKey(displayName)
-        return SHA256.hash(data: Data(normalized.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
-    func load(identityKey: String) throws -> [ChatMessage] {
-        lock.lock(); defer { lock.unlock() }
-        var archive = try readArchive()
-        let cutoff = Date().addingTimeInterval(-retentionInterval)
-        var didPrune = false
-        for index in archive.conversations.indices {
-            let previousCount = archive.conversations[index].messages.count
-            archive.conversations[index].messages.removeAll { $0.capturedAt < cutoff }
-            didPrune = didPrune || previousCount != archive.conversations[index].messages.count
+    func merge(_ snapshot: [ChatMessage]) -> ConversationMergeResult {
+        guard !snapshot.isEmpty else {
+            return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
         }
-        let previousConversationCount = archive.conversations.count
-        archive.conversations.removeAll { $0.updatedAt < cutoff || $0.messages.isEmpty }
-        didPrune = didPrune || previousConversationCount != archive.conversations.count
-        if didPrune { try writeArchive(archive) }
-        guard let conversation = archive.conversations.first(where: { $0.localIdentityKey == identityKey }) else {
-            return []
+        guard !messages.isEmpty else {
+            messages = Array(snapshot.suffix(maximumMessages))
+            return ConversationMergeResult(appended: messages, prepended: [], unchanged: false, viewport: .liveTail)
         }
-        return conversation.messages.map(\.chatMessage)
+
+        let existingKeys = messages.map(ChatHistoryMerger.key(for:))
+        let snapshotKeys = snapshot.map(ChatHistoryMerger.key(for:))
+
+        // A matching suffix of stored history anchors the visible sequence at
+        // the known tail. Only rows after that anchor are new live messages.
+        if let overlap = Self.tailOverlap(existing: existingKeys, observed: snapshotKeys) {
+            let appended = Array(snapshot.dropFirst(overlap.observedStart + overlap.length))
+            let merged = messages + appended
+            messages = Array(merged.suffix(maximumMessages))
+            return ConversationMergeResult(appended: appended, prepended: [],
+                                           unchanged: appended.isEmpty, viewport: .liveTail)
+        }
+
+        // A suffix of the observed rows matching an internal stored sequence
+        // identifies a historical viewport. Only its unanchored older prefix
+        // is inserted; rows after an internal match never count as live.
+        if let overlap = Self.historicalOverlap(existing: existingKeys, observed: snapshotKeys) {
+            let prefix = Array(snapshot.prefix(overlap.observedStart))
+            let merged: [ChatMessage]
+            if prefix.isEmpty {
+                merged = messages
+            } else if overlap.existingStart == 0 {
+                merged = prefix + messages
+            } else {
+                let insertionIndex = overlap.existingStart
+                merged = Array(messages.prefix(insertionIndex)) + prefix + Array(messages.dropFirst(insertionIndex))
+            }
+            let prependedCount = max(0, merged.count - messages.count)
+            messages = Array(merged.suffix(maximumMessages))
+            let prepended = prependedCount > 0 ? Array(messages.prefix(prependedCount)) : []
+            return ConversationMergeResult(appended: [], prepended: prepended,
+                                           unchanged: prepended.isEmpty, viewport: .historical)
+        }
+
+        return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
     }
 
-    func save(messages: [ChatMessage], identityKey: String, displayName: String) throws {
-        guard isEnabled, !messages.isEmpty else { return }
-        lock.lock(); defer { lock.unlock() }
-        var archive = try readArchive()
-        let now = Date()
-        let cutoff = now.addingTimeInterval(-retentionInterval)
-        for index in archive.conversations.indices {
-            archive.conversations[index].messages.removeAll { $0.capturedAt < cutoff }
+    private static func tailOverlap(existing: [String], observed: [String]) -> (length: Int, observedStart: Int)? {
+        let maxLength = min(existing.count, observed.count)
+        guard maxLength > 0 else { return nil }
+        for length in stride(from: maxLength, through: 1, by: -1) {
+            let suffix = Array(existing.suffix(length))
+            for start in 0...(observed.count - length) {
+                if Array(observed[start..<(start + length)]) == suffix {
+                    return (length, start)
+                }
+            }
         }
-        archive.conversations.removeAll { $0.updatedAt < cutoff || $0.messages.isEmpty }
-        if let index = archive.conversations.firstIndex(where: { $0.localIdentityKey == identityKey }) {
-            var record = archive.conversations[index]
-            let oldMessages = record.messages.map(\.chatMessage)
-            let merged = ChatHistoryMerger.merge(existing: oldMessages, visible: messages,
-                                                 limit: maxMessagesPerConversation)
-            record.messages = merged
-                .filter { $0.capturedAt >= now.addingTimeInterval(-retentionInterval) }
-                .suffix(maxMessagesPerConversation)
-                .map(StoredMessage.init)
-            record.displayName = displayName
-            record.updatedAt = now
-            archive.conversations[index] = record
-        } else {
-            let retained = messages
-                .filter { $0.capturedAt >= now.addingTimeInterval(-retentionInterval) }
-                .suffix(maxMessagesPerConversation)
-                .map(StoredMessage.init)
-            archive.conversations.append(StoredConversation(
-                id: UUID(), localIdentityKey: identityKey, displayName: displayName,
-                messages: Array(retained), updatedAt: now
-            ))
-        }
-        try writeArchive(archive)
+        return nil
     }
 
-    func clear(identityKey: String) throws {
-        lock.lock(); defer { lock.unlock() }
-        guard FileManager.default.fileExists(atPath: archiveURL.path) else { return }
-        var archive = try readArchive()
-        archive.conversations.removeAll { $0.localIdentityKey == identityKey }
-        try writeArchive(archive)
+    private static func historicalOverlap(existing: [String], observed: [String]) -> (length: Int, observedStart: Int, existingStart: Int)? {
+        let maxLength = min(existing.count, observed.count)
+        guard maxLength > 0 else { return nil }
+        for length in stride(from: maxLength, through: 1, by: -1) {
+            // Requiring the match to end at the observed viewport's end makes
+            // this a backward/history anchor rather than a live append.
+            let observedStart = observed.count - length
+            let suffix = Array(observed.suffix(length))
+            for historyStart in 0...(existing.count - length) {
+                if Array(existing[historyStart..<(historyStart + length)]) == suffix {
+                    return (length, observedStart, historyStart)
+                }
+            }
+        }
+        return nil
     }
 
-    func clearAll() throws {
-        lock.lock(); defer { lock.unlock() }
-        if FileManager.default.fileExists(atPath: archiveURL.path) {
-            try FileManager.default.removeItem(at: archiveURL)
-        }
-    }
-
-    private func readArchive() throws -> ConversationArchive {
-        guard FileManager.default.fileExists(atPath: archiveURL.path) else {
-            return ConversationArchive(conversations: [])
-        }
-        let encrypted = try Data(contentsOf: archiveURL)
-        guard let box = try? AES.GCM.SealedBox(combined: encrypted) else {
-            throw StoreError.unreadable
-        }
-        let plaintext: Data
-        do {
-            plaintext = try AES.GCM.open(box, using: encryptionKey())
-        } catch {
-            throw StoreError.unreadable
-        }
-        do {
-            return try JSONDecoder().decode(ConversationArchive.self, from: plaintext)
-        } catch {
-            throw StoreError.unreadable
-        }
-    }
-
-    private func writeArchive(_ archive: ConversationArchive) throws {
-        let directory = archiveURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        let plaintext = try JSONEncoder().encode(archive)
-        let sealed: AES.GCM.SealedBox
-        do {
-            sealed = try AES.GCM.seal(plaintext, using: encryptionKey())
-        } catch {
-            throw StoreError.encryptionFailed
-        }
-        guard let combined = sealed.combined else { throw StoreError.encryptionFailed }
-        try combined.write(to: archiveURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: archiveURL.path)
-    }
-
-    private func encryptionKey() throws -> SymmetricKey {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess, let data = item as? Data, data.count == 32 {
-            return SymmetricKey(data: data)
-        }
-        guard status == errSecItemNotFound else { throw StoreError.keyUnavailable }
-        let key = SymmetricKey(size: .bits256)
-        let data = key.withUnsafeBytes { Data($0) }
-        var add = query
-        add.removeValue(forKey: kSecReturnData as String)
-        add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { throw StoreError.keyUnavailable }
-        return key
-    }
-
-    private enum StoreError: Error {
-        case unreadable
-        case encryptionFailed
-        case keyUnavailable
-    }
 }

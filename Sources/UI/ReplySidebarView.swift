@@ -14,7 +14,7 @@ struct ReplySidebarView: View {
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
     private let displayedMessageLimit = 20
-    private let manualAnalysisContextLimit = 30
+    private let manualAnalysisContextLimit = 20
 
     var body: some View {
         VStack(spacing: 0) {
@@ -131,12 +131,16 @@ struct ReplySidebarView: View {
     private var recentMessagesSection: some View {
         let visibleMessages = Array(monitor.messages.suffix(displayedMessageLimit))
         return VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("RECENT MESSAGES · LAST \(visibleMessages.count) OF \(monitor.messages.count)")
+            sectionLabel("RECENT MESSAGES · SHOWING \(visibleMessages.count) OF \(monitor.messages.count)")
+            Text(monitor.messages.count < 20
+                 ? "Context: \(monitor.messages.count) / 20 loaded · model receives up to 20"
+                 : "Context: 20 / 20 loaded · \(monitor.messages.count) stored; model receives latest 20")
+                .font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 Button {
-                    monitor.syncNow()
+                    monitor.syncLatest()
                 } label: {
-                    Label(monitor.isSyncing ? "Syncing…" : "Sync now",
+                    Label(monitor.isSyncing ? "Syncing…" : "Sync latest",
                           systemImage: monitor.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
@@ -160,7 +164,7 @@ struct ReplySidebarView: View {
                 Button {
                     monitor.loadOlderContext()
                 } label: {
-                    Label(monitor.isLoadingOlderContext ? "Loading…" : "Load older context",
+                    Label(monitor.isLoadingOlderContext ? "Loading…" : "Load older to 20",
                           systemImage: monitor.isLoadingOlderContext ? "hourglass" : "arrow.up.circle")
                 }
                 .buttonStyle(.bordered)
@@ -175,11 +179,6 @@ struct ReplySidebarView: View {
             } else if let olderContextStatus = monitor.olderContextStatus {
                 Text(olderContextStatus)
                     .font(.caption2).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let storageStatus = monitor.storageStatus {
-                Text(storageStatus)
-                    .font(.caption2).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if monitor.messages.isEmpty {

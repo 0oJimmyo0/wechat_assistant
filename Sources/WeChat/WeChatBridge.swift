@@ -7,6 +7,15 @@ enum MessageReadResult: Sendable {
     case messageListUnchanged(fingerprint: String)
 }
 
+typealias ObservedMessage = ChatMessage
+
+struct WeChatSnapshot: Sendable {
+    let contact: String
+    let messages: [ObservedMessage]
+    let capturedAt: Date
+    let messageRowCount: Int
+}
+
 enum OlderContextScrollResult: Sendable {
     case scrolled
     case conversationChanged
@@ -353,6 +362,89 @@ final class WeChatBridge: @unchecked Sendable {
         detectCurrentConversation().contact
     }
 
+    /// Captures the title and the message rows from the same selected WeChat
+    /// window and message-list AX element. A present snapshot with zero rows is
+    /// distinct from a failed/unavailable AX read (`nil`).
+    func captureSnapshot(limit: Int? = nil) -> WeChatSnapshot? {
+        guard let window = mainWindow(), let app = weChatApplication() else { return nil }
+        var windowPID: pid_t = 0
+        guard AXUIElementGetPid(window, &windowPID) == .success,
+              windowPID == app.processIdentifier,
+              let contact = accessibilityContact(in: window, app: app),
+              let list = messageListElement(in: window) else { return nil }
+        let allRows = children(list)
+        let messages = readAccessibilityMessages(from: allRows, limit: limit)
+        return WeChatSnapshot(contact: contact, messages: messages, capturedAt: Date(), messageRowCount: allRows.count)
+    }
+
+    func accessibilityObservationTargets() -> (pid: pid_t, elements: [AXUIElement])? {
+        guard let window = mainWindow(), let app = weChatApplication(),
+              let list = messageListElement(in: window) else { return nil }
+        var windowPID: pid_t = 0
+        guard AXUIElementGetPid(window, &windowPID) == .success, windowPID == app.processIdentifier else { return nil }
+        return (app.processIdentifier, [AXUIElementCreateApplication(app.processIdentifier), window, list])
+    }
+
+    private func accessibilityContact(in window: AXUIElement, app: NSRunningApplication) -> String? {
+        let info = backendState(for: app.processIdentifier, window: window)
+        guard info.backend == .accessibility else { return nil }
+        if let probe = info.initialProbe {
+            if let title = probe.title { return title }
+            if let selected = probe.selectedSession { return selected }
+        }
+        if let titleNode = firstMatch(window, where: {
+            string($0, "AXRole") == "AXStaticText" && identifier($0) == WeChatParsing.chatTitleIdentifier
+        }) {
+            let title = WeChatParsing.normalizeChatTitle(string(titleNode, "AXValue") ?? string(titleNode, "AXTitle") ?? "")
+            if !title.isEmpty && !WeChatParsing.isGenericWindowTitle(title) { return title }
+        }
+        if let selectedRow = firstMatch(window, where: {
+            identifier($0).hasPrefix("session_item_") && bool($0, "AXSelected")
+        }) {
+            return WeChatParsing.selectedSessionName(from: identifier(selectedRow), isSelected: true)
+        }
+        return nil
+    }
+
+    private func messageListElement(in window: AXUIElement) -> AXUIElement? {
+        if let list = firstMatch(window, where: {
+            string($0, "AXRole") == "AXList" && identifier($0) == WeChatParsing.messageListIdentifier
+        }) { return list }
+        if let list = firstMatch(window, where: {
+            string($0, "AXRole") == "AXList" && ["Messages", "消息"].contains(string($0, "AXTitle") ?? "")
+        }) { return list }
+        guard hasConversationComposer(in: window) else { return nil }
+        let windowFrame = frame(window)
+        let paneAreas = find(window) {
+            guard string($0, "AXRole") == "AXScrollArea" else { return false }
+            let bounds = frame($0)
+            return bounds.minX > windowFrame.minX + windowFrame.width * 0.25 &&
+                bounds.width > 220 && bounds.height > 300
+        }
+        for area in paneAreas {
+            if let list = firstMatch(area, depth: 8, where: { string($0, "AXRole") == "AXList" }) {
+                return list
+            }
+        }
+        return nil
+    }
+
+    private func readAccessibilityMessages(from rows: [AXUIElement], limit: Int?) -> [ChatMessage] {
+        var messages: [ChatMessage] = []
+        for row in rows {
+            let rowID = identifier(row)
+            guard rowID == WeChatParsing.messageRowIdentifier,
+                  let text = WeChatParsing.messageText(
+                    identifier: rowID,
+                    title: string(row, "AXTitle"),
+                    value: string(row, "AXValue")
+                  ) else { continue }
+            let sender = WeChatParsing.sender(from: string(row, "AXDescription") ?? "")
+            messages.append(ChatMessage(text: text, sender: sender, source: .accessibility))
+        }
+        return limit.map { Array(messages.suffix(max(0, $0))) } ?? messages
+    }
+
     func detectCurrentConversation(forceFreshVision: Bool = false,
                                   onStage: ((String) -> Void)? = nil) -> WeChatConversationDetection {
         onStage?("Finding WeChat window…")
@@ -509,6 +601,53 @@ final class WeChatBridge: @unchecked Sendable {
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
                                                cancellation: cancellation, direction: .older)
+    }
+
+    func scrollMessagePaneUpOnePageIfConversationMatches(contact: String) -> OlderContextScrollResult {
+        scrollAccessibilityMessagePane(contact: contact, direction: .older)
+    }
+
+    func scrollMessagePaneDownOnePageIfConversationMatches(contact: String) -> OlderContextScrollResult {
+        scrollAccessibilityMessagePane(contact: contact, direction: .newer)
+    }
+
+    private func scrollAccessibilityMessagePane(contact: String, direction: ChatScrollDirection) -> OlderContextScrollResult {
+        guard let app = weChatApplication(), let window = mainWindow() else { return .windowUnavailable }
+        guard accessibilityContact(in: window, app: app).map(WeChatParsing.conversationIdentityKey) ==
+                WeChatParsing.conversationIdentityKey(contact) else { return .identityUncertain }
+        guard let list = messageListElement(in: window) else { return .scrollUnavailable }
+
+        let areas = find(window) {
+            guard string($0, "AXRole") == "AXScrollArea" else { return false }
+            let bounds = frame($0)
+            let outer = frame(window)
+            return bounds.minX > outer.minX + outer.width * 0.25 && bounds.width > 220 && bounds.height > 300
+        }
+        let candidates = areas + [list]
+        let action = direction == .older ? "AXScrollUpByPage" : "AXScrollDownByPage"
+        for candidate in candidates {
+            var rawActions: CFArray?
+            guard AXUIElementCopyActionNames(candidate, &rawActions) == .success,
+                  let actions = rawActions as? [String], actions.contains(action) else { continue }
+            if AXUIElementPerformAction(candidate, action as CFString) == .success { return .scrolled }
+        }
+
+        // Fallback to a targeted scroll event after verifying the same AX chat.
+        let windowFrame = frame(window, timeout: 0.08)
+        let calibration = VisionLayoutCalibration.current
+        let yRatioFromTop = 1 - ((calibration.composerTopY + calibration.headerBottomY) * 0.5)
+        let location = CGPoint(
+            x: windowFrame.minX + windowFrame.width * (calibration.conversationLeftX + (1 - calibration.conversationLeftX) * 0.5),
+            y: windowFrame.minY + windowFrame.height * yRatioFromTop
+        )
+        guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
+        let amount = Int32(min(500, max(120, windowFrame.height * 0.45)))
+        let signedAmount = direction == .older ? amount : -amount
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                  wheel1: signedAmount, wheel2: 0, wheel3: 0) else { return .scrollUnavailable }
+        event.location = location
+        event.postToPid(app.processIdentifier)
+        return .scrolled
     }
 
     func scrollMessagePaneDownwardIfConversationMatches(

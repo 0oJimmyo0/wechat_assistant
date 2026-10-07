@@ -12,32 +12,29 @@ enum MessageSource: String, Codable, Sendable {
 }
 
 struct ChatMessage: Identifiable, Equatable, Sendable {
+    let localID: UUID
     let id: String
     let text: String
     let sender: MessageSender
     let allowsAutomaticAnalysis: Bool
-    let capturedAt: Date
+    let firstSeenAt: Date
     let source: MessageSource
-    let confidence: Float?
+    let confidence: Float
 
     var isFromMe: Bool { sender == .me }
     var senderIdentified: Bool { sender != .unknown }
 
     init(text: String, sender: MessageSender, allowsAutomaticAnalysis: Bool = true, id: String? = nil,
-         capturedAt: Date = Date(), source: MessageSource = .accessibility, confidence: Float? = nil) {
+         localID: UUID = UUID(), firstSeenAt: Date = Date(), source: MessageSource = .accessibility,
+         confidence: Float = 1) {
+        self.localID = localID
+        self.id = id ?? localID.uuidString
         self.text = text
         self.sender = sender
         self.allowsAutomaticAnalysis = allowsAutomaticAnalysis
-        self.capturedAt = capturedAt
+        self.firstSeenAt = firstSeenAt
         self.source = source
         self.confidence = confidence
-        let senderKey: String
-        switch sender {
-        case .me: senderKey = "me"
-        case .other: senderKey = "other"
-        case .unknown: senderKey = "unknown"
-        }
-        self.id = id ?? "\(senderKey):\(text)"
     }
 
     init(text: String, isFromMe: Bool, senderIdentified: Bool = true, allowsAutomaticAnalysis: Bool = true) {

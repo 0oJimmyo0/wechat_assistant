@@ -1,72 +1,45 @@
 import Foundation
-import Security
 
 @main
 enum ConversationStoreTests {
-    static func main() throws {
-        let defaults = UserDefaults.standard
-        let previousEnabled = defaults.object(forKey: ConversationStore.storageEnabledKey)
-        defaults.set(true, forKey: ConversationStore.storageEnabledKey)
-        defer {
-            if let previousEnabled { defaults.set(previousEnabled, forKey: ConversationStore.storageEnabledKey) }
-            else { defaults.removeObject(forKey: ConversationStore.storageEnabledKey) }
-        }
+    static func main() {
+        let store = ConversationStore(maximumMessages: 200)
 
-        let suiteID = UUID().uuidString
-        let service = "com.wechatreplycopilot.tests.\(suiteID)"
-        let account = "archive-key"
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suiteID, isDirectory: true)
-        let archiveURL = directory.appendingPathComponent("conversations.enc")
-        defer {
-            try? FileManager.default.removeItem(at: directory)
-            SecItemDelete([
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-                kSecAttrAccount as String: account
-            ] as CFDictionary)
-        }
+        _ = store.merge(rows("A", "B", "C", "D"))
+        let live = store.merge(rows("C", "D", "E", "F"))
+        expect(texts(store) == ["A", "B", "C", "D", "E", "F"], "ordered tail overlap appends unseen messages")
+        expect(live.appended.map(\.text) == ["E", "F"], "only appended rows are new")
 
-        let firstStore = ConversationStore(archiveURL: archiveURL, keychainService: service, keychainAccount: account)
-        let aliceKey = firstStore.identityKey(for: "Alice Example")
-        let otherKey = firstStore.identityKey(for: "Bob Example")
-        defaults.set(false, forKey: ConversationStore.storageEnabledKey)
-        try firstStore.save(messages: [ChatMessage(text: "do not persist", sender: .other)],
-                            identityKey: aliceKey, displayName: "Alice Example")
-        expect(!FileManager.default.fileExists(atPath: archiveURL.path), "disabled storage does not write an archive")
-        defaults.set(true, forKey: ConversationStore.storageEnabledKey)
-        let messages = (1...501).map { index in
-            ChatMessage(text: "private message \(index)", sender: .other, allowsAutomaticAnalysis: false,
-                        id: "test-\(index)", source: .vision, confidence: 0.91)
-        }
-        try firstStore.save(messages: messages, identityKey: aliceKey, displayName: "Alice Example")
+        let duplicateStore = ConversationStore()
+        _ = duplicateStore.merge(rows("A", "哈哈"))
+        let duplicate = duplicateStore.merge(rows("哈哈", "哈哈", "B"))
+        expect(texts(duplicateStore) == ["A", "哈哈", "哈哈", "B"], "repeated identical messages remain separate")
+        expect(duplicate.appended.map(\.text) == ["哈哈", "B"], "duplicate sequence overlap preserves the extra occurrence")
 
-        let encryptedBytes = try Data(contentsOf: archiveURL)
-        expect(!String(decoding: encryptedBytes, as: UTF8.self).contains("private message"), "archive does not contain plaintext message text")
-        expect(!String(decoding: encryptedBytes, as: UTF8.self).contains("Alice Example"), "archive does not contain plaintext contact name")
+        let historyStore = ConversationStore()
+        _ = historyStore.merge(rows("C", "D", "E", "F"))
+        let historical = historyStore.merge(rows("A", "B", "C", "D"))
+        expect(texts(historyStore) == ["A", "B", "C", "D", "E", "F"], "historical overlap prepends older messages")
+        expect(historical.prepended.map(\.text) == ["A", "B"], "historical rows are classified as prepended")
+        expect(historical.appended.isEmpty, "historical rows are never incoming")
 
-        // A second store object models a new app launch reading the same archive and Keychain key.
-        let relaunchedStore = ConversationStore(archiveURL: archiveURL, keychainService: service, keychainAccount: account)
-        let restored = try relaunchedStore.load(identityKey: aliceKey)
-        expect(restored.count == 500, "retains at most 500 messages per conversation")
-        expect(restored.last?.text == "private message 501", "restores the newest stored message")
-        expect(restored.last?.source == .vision && restored.last?.confidence == 0.91, "restores message source and OCR confidence")
-        let otherConversation = try relaunchedStore.load(identityKey: otherKey)
-        expect(otherConversation.isEmpty, "conversation identity keys isolate different contacts")
+        let beforeEmpty = texts(historyStore)
+        let empty = historyStore.merge([])
+        expect(texts(historyStore) == beforeEmpty && empty.unchanged, "empty observations preserve stored context")
 
-        let expired = ChatMessage(text: "expired", sender: .other, id: "expired",
-                                  capturedAt: Date().addingTimeInterval(-31 * 24 * 60 * 60))
-        let expiredKey = relaunchedStore.identityKey(for: "Expired Contact")
-        try relaunchedStore.save(messages: [expired], identityKey: expiredKey, displayName: "Expired Contact")
-        let expiredMessages = try relaunchedStore.load(identityKey: expiredKey)
-        expect(expiredMessages.isEmpty, "does not restore messages older than 30 days")
+        let bounded = ConversationStore(maximumMessages: 24)
+        _ = bounded.merge((0..<40).map { row("\($0)") })
+        expect(bounded.messages.count == 24 && bounded.messages.first?.text == "16", "store applies its in-memory history limit")
 
-        try relaunchedStore.clear(identityKey: aliceKey)
-        let clearedConversation = try relaunchedStore.load(identityKey: aliceKey)
-        expect(clearedConversation.isEmpty, "clears one conversation history")
-        try relaunchedStore.clearAll()
-        expect(!FileManager.default.fileExists(atPath: archiveURL.path), "clear all removes the encrypted archive")
-        print("All encrypted conversation-store checks passed.")
+        print("All in-memory conversation-store checks passed.")
     }
+
+    private static func row(_ text: String) -> ChatMessage {
+        ChatMessage(text: text, sender: .other)
+    }
+
+    private static func rows(_ values: String...) -> [ChatMessage] { values.map(row) }
+    private static func texts(_ store: ConversationStore) -> [String] { store.messages.map(\.text) }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ description: String) {
         guard condition() else {
