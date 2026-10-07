@@ -31,3 +31,29 @@ struct ConversationCapturePlan: Equatable, Sendable {
         return ConversationCapturePlan(identity: identity, messages: messages)
     }
 }
+
+struct VisionMessageBaseline: Equatable {
+    private(set) var fingerprint: String?
+
+    var isValid: Bool { fingerprint != nil }
+
+    func shouldSkipOCR(frameUnchanged: Bool) -> Bool {
+        isValid && frameUnchanged
+    }
+
+    mutating func record(source: ConversationCaptureSource, hasMessages: Bool,
+                         fingerprint: String?, frameUnchanged: Bool) {
+        guard source == .vision else {
+            reset()
+            return
+        }
+        if frameUnchanged && isValid { return }
+        guard hasMessages, let fingerprint else {
+            reset()
+            return
+        }
+        self.fingerprint = fingerprint
+    }
+
+    mutating func reset() { fingerprint = nil }
+}

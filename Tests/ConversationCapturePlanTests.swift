@@ -15,6 +15,20 @@ enum ConversationCapturePlanTests {
         let unavailable = ConversationCapturePlan.select(hasAXIdentity: false, hasAXMessages: false,
                                                           hasVisionIdentity: false, hasVisionMessages: true)
         expect(unavailable == nil, "capture requires an identity source")
+
+        var baseline = VisionMessageBaseline()
+        baseline.record(source: .vision, hasMessages: false, fingerprint: "empty-frame", frameUnchanged: false)
+        expect(!baseline.isValid && !baseline.shouldSkipOCR(frameUnchanged: true),
+               "empty initial OCR cannot establish an unchanged baseline")
+        baseline.record(source: .vision, hasMessages: true, fingerprint: "message-frame", frameUnchanged: false)
+        expect(baseline.isValid && baseline.shouldSkipOCR(frameUnchanged: true),
+               "a successful message capture enables unchanged-frame skipping")
+        baseline.record(source: .vision, hasMessages: false, fingerprint: "new-empty-frame", frameUnchanged: false)
+        expect(!baseline.isValid && !baseline.shouldSkipOCR(frameUnchanged: true),
+               "an empty changed OCR frame invalidates the previous baseline")
+        baseline.record(source: .vision, hasMessages: true, fingerprint: "message-frame", frameUnchanged: false)
+        baseline.record(source: .accessibility, hasMessages: true, fingerprint: nil, frameUnchanged: false)
+        expect(!baseline.isValid, "AX message capture does not reuse a Vision fingerprint")
         print("All conversation capture source-selection checks passed.")
     }
 

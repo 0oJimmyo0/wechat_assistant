@@ -19,6 +19,7 @@ struct WeChatSnapshot: Sendable {
     let visionIdentity: VisionConversationIdentity?
     let messageFingerprint: String?
     let headerFingerprint: String?
+    let conversationLeftX: CGFloat?
     let messagesUnchanged: Bool
     let headerUnchanged: Bool
     let captureTimingDiagnostic: String
@@ -430,7 +431,7 @@ final class WeChatBridge: @unchecked Sendable {
                 isMessageList = bounds.minX > outer.minX + outer.width * 0.25 &&
                     bounds.width > 220 && bounds.height > 300
             }
-            if isMessageList {
+            if isMessageList, hasMessageLikeRows(children(element, timeout: shortTimeout)) {
                 hasMessageList = true
                 messageList = element
             }
@@ -485,7 +486,8 @@ final class WeChatBridge: @unchecked Sendable {
                     (role == "AXList" && ["Messages", "消息"].contains(rowTitle))
                 let isRightPaneList = role == "AXList" && bounds.minX > outer.minX + outer.width * 0.25 &&
                     bounds.width > 220 && bounds.height > 300
-                if isKnownList || isRightPaneList {
+                if (isKnownList || isRightPaneList),
+                   hasMessageLikeRows(children(element, timeout: 0.02)) {
                     foundList = true
                     messageList = element
                 }
@@ -569,7 +571,8 @@ final class WeChatBridge: @unchecked Sendable {
                                     previousHeaderFingerprint: String? = nil,
                                     previousMessageFingerprint: String? = nil,
                                     lockedContact: String? = nil,
-                                    initialActivation: Bool = false) -> ConversationCaptureResult {
+                                    initialActivation: Bool = false,
+                                    conversationLeftX: CGFloat? = nil) -> ConversationCaptureResult {
         let totalStarted = Date()
         guard let window = mainWindow(), let app = weChatApplication() else {
             updateCaptureDiagnostic(plan: nil, hasAXIdentity: false, hasAXMessages: false,
@@ -630,10 +633,30 @@ final class WeChatBridge: @unchecked Sendable {
             return .failure(.axProbeUncertain)
         }
 
-        let usesVision = plan.identity == .vision || plan.messages == .vision
+        var capturePlan = plan
+        var capturedAXMessages: [ChatMessage]?
+        var capturedAXRowCount = 0
+        var axMessageReadMilliseconds = 0
+        if plan.messages == .accessibility, let list {
+            let readStarted = Date()
+            let rows = children(list)
+            let parsed = readAccessibilityMessages(from: rows, limit: max(0, limit ?? 50))
+            axMessageReadMilliseconds = Int(Date().timeIntervalSince(readStarted) * 1000)
+            if parsed.isEmpty {
+                // A large right-pane list can still be a false positive. If it
+                // has no parseable message rows, use Vision for messages.
+                capturePlan = ConversationCapturePlan(identity: plan.identity, messages: .vision)
+            } else {
+                capturedAXMessages = parsed
+                capturedAXRowCount = rows.count
+            }
+        }
+        let hasValidatedAXMessages = capturedAXMessages != nil
+
+        let usesVision = capturePlan.identity == .vision || capturePlan.messages == .vision
         if usesVision && !WeChatScreenReader.hasScreenCapturePermission {
             WeChatScreenReader.requestScreenCapturePermissionOnce()
-            updateCaptureDiagnostic(plan: plan, hasAXIdentity: axContact != nil, hasAXMessages: list != nil,
+            updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
                                     failure: "Screen Recording permission required", hasAXTitle: axIdentity.hasTitle,
                                     timing: axProbeDiagnostic(fastProbe, resolvedProbe: probe,
                                                               fallbackAttempted: fallbackAttempted,
@@ -651,15 +674,17 @@ final class WeChatBridge: @unchecked Sendable {
             let observation = WeChatScreenReader.shared.readConversationObservation(
                 pid: app.processIdentifier,
                 windowFrame: frame(window, timeout: 0.08),
-                includeTitle: plan.identity == .vision,
-                includeMessages: plan.messages == .vision,
+                includeTitle: capturePlan.identity == .vision,
+                includeMessages: capturePlan.messages == .vision,
                 forceFresh: forceFresh,
                 accurateMessages: accurateVision,
                 previousHeaderFingerprint: previousHeaderFingerprint,
-                previousMessageFingerprint: previousMessageFingerprint
+                previousMessageFingerprint: previousMessageFingerprint,
+                conversationLeftX: conversationLeftX,
+                allowWideMessageCropFallback: initialActivation
             )
             guard observation.captureSucceeded else {
-                updateCaptureDiagnostic(plan: plan, hasAXIdentity: axContact != nil, hasAXMessages: list != nil,
+                updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
                                         failure: "Vision capture unavailable", hasAXTitle: axIdentity.hasTitle,
                                         timing: axProbeDiagnostic(fastProbe, resolvedProbe: probe,
                                                                   fallbackAttempted: fallbackAttempted,
@@ -669,7 +694,7 @@ final class WeChatBridge: @unchecked Sendable {
                 return .failure(.visionCaptureFailed)
             }
             visionObservation = observation
-            if plan.identity == .vision {
+            if capturePlan.identity == .vision {
                 if observation.headerFrameUnchanged, let lockedContact {
                     contact = lockedContact
                 } else {
@@ -688,8 +713,8 @@ final class WeChatBridge: @unchecked Sendable {
             }
         }
         guard let contact, !contact.isEmpty else {
-            updateCaptureDiagnostic(plan: plan, hasAXIdentity: axContact != nil, hasAXMessages: list != nil,
-                                    failure: plan.identity == .vision
+            updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
+                                    failure: capturePlan.identity == .vision
                                         ? "Vision conversation title unavailable"
                                         : "AX conversation identity unavailable", hasAXTitle: axIdentity.hasTitle,
                                     timing: axProbeDiagnostic(fastProbe, resolvedProbe: probe,
@@ -705,14 +730,10 @@ final class WeChatBridge: @unchecked Sendable {
         let messages: [ChatMessage]
         let rowCount: Int
         let messagesUnchanged: Bool
-        let axMessageReadStarted = Date()
-        var axMessageReadMilliseconds = 0
-        if plan.messages == .accessibility, let list {
-            let rows = children(list)
-            messages = readAccessibilityMessages(from: rows, limit: messageLimit)
-            rowCount = rows.count
+        if capturePlan.messages == .accessibility, let capturedAXMessages {
+            messages = capturedAXMessages
+            rowCount = capturedAXRowCount
             messagesUnchanged = false
-            axMessageReadMilliseconds = Int(Date().timeIntervalSince(axMessageReadStarted) * 1000)
         } else {
             messages = Array((visionObservation?.messages ?? []).suffix(messageLimit))
             rowCount = visionObservation?.messageObservationCount ?? 0
@@ -727,20 +748,22 @@ final class WeChatBridge: @unchecked Sendable {
                               fallbackMilliseconds: fallbackMilliseconds),
             "AX identity/list resolution: \(axResolutionMilliseconds) ms",
             "AX message read: \(axMessageReadMilliseconds) ms",
-            "Capture plan: \(plan.identity.rawValue) / \(plan.messages.rawValue)",
+            "Capture plan: \(capturePlan.identity.rawValue) / \(capturePlan.messages.rawValue)",
             visionObservation.map {
                 visionTimingDiagnostic($0, titleFound: $0.title != nil || titleRetrySucceeded,
                                        retryMilliseconds: titleRetryMilliseconds)
             } ?? "Vision: not used"
         ].joined(separator: "\n")
-        updateCaptureDiagnostic(plan: plan, hasAXIdentity: axContact != nil, hasAXMessages: list != nil,
+        updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil,
+                                hasAXMessages: capturePlan.messages == .accessibility && list != nil,
                                 failure: "none", hasAXTitle: axIdentity.hasTitle, timing: timing)
-        cacheActivePlan(plan, pid: app.processIdentifier, window: window)
+        cacheActivePlan(capturePlan, pid: app.processIdentifier, window: window)
         return .success(WeChatSnapshot(contact: contact, messages: messages, capturedAt: Date(),
-                              messageRowCount: rowCount, identitySource: plan.identity,
-                              messageSource: plan.messages, visionIdentity: visionIdentity,
+                              messageRowCount: rowCount, identitySource: capturePlan.identity,
+                              messageSource: capturePlan.messages, visionIdentity: visionIdentity,
                               messageFingerprint: visionObservation?.messageFingerprint,
                               headerFingerprint: visionObservation?.headerFingerprint,
+                              conversationLeftX: visionObservation?.conversationLeftX,
                               messagesUnchanged: messagesUnchanged,
                               headerUnchanged: visionObservation?.headerFrameUnchanged ?? false,
                               captureTimingDiagnostic: timing))
@@ -776,7 +799,21 @@ final class WeChatBridge: @unchecked Sendable {
         "Vision: window capture \(observation.captureSucceeded ? "success" : "failed") " +
         "(discovery \(observation.windowDiscoveryDurationMilliseconds) ms, screenshot \(observation.captureDurationMilliseconds) ms), " +
         "title OCR \(observation.headerOCRDurationMilliseconds) ms, message OCR \(observation.messageOCRDurationMilliseconds) ms, " +
-        "title found \(titleFound ? "yes" : "no"), visible messages \(observation.messages.count), " +
+        "title found \(titleFound ? "yes" : "no"), visible messages \(observation.messages.count)\n" +
+        "Message crop: x=\(String(format: "%.3f", observation.conversationLeftX)), " +
+        "width=\(String(format: "%.3f", observation.conversationCrop.width)), " +
+        "region=\(String(format: "%.3f,%.3f,%.3f,%.3f", observation.messageCrop.minX, observation.messageCrop.minY, observation.messageCrop.width, observation.messageCrop.height))\n" +
+        "OCR level: \(observation.messageRecognitionLevel), fast observations: \(observation.fastOCRObservationCount), " +
+        "accurate fallback: \(observation.accurateFallbackAttempted ? "yes" : "no"), " +
+        "accurate observations: \(observation.accurateOCRObservationCount), " +
+        "plausible text: \(observation.plausibleTextObservationCount), " +
+        "geometry rejected: \(observation.geometryRejectedMessageCount), " +
+        "timestamp/control rejected: \(observation.timestampControlRejectedMessageCount), " +
+        "grouped: \(observation.messages.count)\n" +
+        "Wide crop fallback: attempted \(observation.wideCropFallbackAttempted ? "yes" : "no"), " +
+        "observations \(observation.wideCropObservationCount), " +
+        "succeeded \(observation.wideCropFallbackSucceeded ? "yes" : "no")\n" +
+        "Message fingerprint: \(observation.messageFingerprint == nil ? "unavailable" : (observation.messageFrameUnchanged ? "unchanged" : "changed")), " +
         "title-only retry \(retryMilliseconds) ms"
     }
 
@@ -845,6 +882,13 @@ final class WeChatBridge: @unchecked Sendable {
         return backendState(for: app.processIdentifier, window: window).initialProbe?.messageListElement
     }
 
+    private func hasMessageLikeRows(_ rows: [AXUIElement]) -> Bool {
+        rows.contains { row in
+            let id = identifier(row, timeout: 0.02)
+            return id == WeChatParsing.messageRowIdentifier || id == WeChatParsing.placeholderRowIdentifier
+        }
+    }
+
     private func readAccessibilityMessages(from rows: [AXUIElement], limit: Int?) -> [ChatMessage] {
         var messages: [ChatMessage] = []
         for row in rows {
@@ -862,6 +906,7 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     func detectCurrentConversation(forceFreshVision: Bool = false,
+                                  conversationLeftX: CGFloat? = nil,
                                   onStage: ((String) -> Void)? = nil) -> WeChatConversationDetection {
         onStage?("Finding WeChat window…")
         let windowStarted = Date()
@@ -892,7 +937,8 @@ final class WeChatBridge: @unchecked Sendable {
                                               mainWindowLookupMilliseconds: windowLookupMilliseconds,
                                               capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
         }
-        let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision)
+        let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision,
+                                            conversationLeftX: conversationLeftX)
         return WeChatConversationDetection(
             contact: snapshot?.title,
             windowFound: true,
@@ -957,9 +1003,11 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
+        conversationLeftX: CGFloat? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
+                                               conversationLeftX: conversationLeftX,
                                                cancellation: cancellation, direction: .older)
     }
 
@@ -1014,9 +1062,11 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
+        conversationLeftX: CGFloat? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
+                                               conversationLeftX: conversationLeftX,
                                                cancellation: cancellation, direction: .newer)
     }
 
@@ -1024,11 +1074,13 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
+        conversationLeftX: CGFloat?,
         cancellation: MonitorWorkCancellation?,
         direction: ChatScrollDirection
     ) -> OlderContextScrollResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
-        let detection = detectCurrentConversation(forceFreshVision: true)
+        let detection = detectCurrentConversation(forceFreshVision: true,
+                                                  conversationLeftX: conversationLeftX)
         switch olderContextIdentityCheck(detection, contact: contact, identity: identity) {
         case .changed: return .conversationChanged
         case .uncertain: return .identityUncertain
@@ -1067,15 +1119,16 @@ final class WeChatBridge: @unchecked Sendable {
         forceFresh: Bool = true,
         previousHeaderFingerprint: String? = nil,
         previousMessageFingerprint: String? = nil,
+        conversationLeftX: CGFloat? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextReadResult {
-        guard cancellation?.isCancelled != true else { return .cancelled }
         guard cancellation?.isCancelled != true else { return .cancelled }
         let capture = captureConversationSnapshot(limit: 50, forceFresh: forceFresh,
                                                   accurateVision: accurate,
                                                   previousHeaderFingerprint: previousHeaderFingerprint,
                                                   previousMessageFingerprint: previousMessageFingerprint,
-                                                  lockedContact: contact)
+                                                  lockedContact: contact,
+                                                  conversationLeftX: conversationLeftX)
         let snapshot: WeChatSnapshot
         switch capture {
         case .success(let value): snapshot = value
@@ -1137,10 +1190,12 @@ final class WeChatBridge: @unchecked Sendable {
         return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh)
     }
 
-    private func visibleTitleIdentity(for window: AXUIElement, forceFresh: Bool = false) -> VisibleWeChatSnapshot? {
+    private func visibleTitleIdentity(for window: AXUIElement, forceFresh: Bool = false,
+                                      conversationLeftX: CGFloat? = nil) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
         return WeChatScreenReader.shared.readTitleIdentity(
-            pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh
+            pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh,
+            conversationLeftX: conversationLeftX
         )
     }
 
