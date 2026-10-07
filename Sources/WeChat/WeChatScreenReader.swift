@@ -45,7 +45,10 @@ final class WeChatScreenReader {
     static let shared = WeChatScreenReader()
 
     private let conversationCropRatio = CGRect(x: 0.28, y: 0, width: 0.72, height: 1)
-    private let headerSearchRegion = CGRect(x: 0.01, y: 0.78, width: 0.94, height: 0.215)
+    // The title can sit close to the top edge on newer WeChat layouts. Keep a
+    // little extra room and let candidate scoring distinguish the title from
+    // toolbar text instead of cutting observations off at a hard Y boundary.
+    private let headerSearchRegion = CGRect(x: 0.0, y: 0.70, width: 1.0, height: 0.299)
     private let messageRegion = CGRect(x: 0.01, y: 0.14, width: 0.98, height: 0.66)
 
     private let lock = NSLock()
@@ -276,16 +279,18 @@ final class WeChatScreenReader {
             guard let textCandidate = observation.topCandidates(1).first else { continue }
             let text = WeChatParsing.normalizeChatTitle(textCandidate.string)
             let bounds = observation.boundingBox
-            guard !text.isEmpty, text.count <= 36,
-                  bounds.minX >= 0.01, bounds.maxX <= 0.96,
-                  bounds.minY >= 0.78, bounds.maxY <= 0.999 else { continue }
+            // Vision has already limited this request to headerSearchRegion.
+            // Avoid a second strict box filter here: it discarded valid titles
+            // when glyphs touched the edge of the header or pane.
+            guard !text.isEmpty, text.count <= 36 else { continue }
             let generic = isHeaderControl(text)
-            guard !generic else { continue }
             let plausible = textCandidate.confidence >= 0.18 && !generic
-            let yScore = 1 - min(1, abs(bounds.midY - 0.91) / 0.22)
-            let xScore = 1 - min(1, abs(bounds.minX - 0.10) / 0.80)
+            let yScore = 1 - min(1, abs(bounds.midY - 0.91) / 0.30)
+            let xScore = 1 - min(1, abs(bounds.minX - 0.10) / 0.90)
             let lengthPenalty = text.count > 24 ? 0.7 : 0
-            let score = Double(textCandidate.confidence) * 4 + Double(yScore) * 1.2 + Double(xScore) * 0.5 - lengthPenalty
+            let genericPenalty = generic ? 10.0 : 0
+            let score = Double(textCandidate.confidence) * 4 + Double(yScore) * 1.2 +
+                Double(xScore) * 0.5 - lengthPenalty - genericPenalty
             candidates.append(RankedHeaderCandidate(
                 text: text,
                 score: score,
