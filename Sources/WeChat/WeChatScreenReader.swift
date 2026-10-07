@@ -785,7 +785,9 @@ final class WeChatScreenReader {
             // Order within this transient OCR snapshot distinguishes repeated
             // identical bubbles while remaining stable as bubbles shift vertically.
             let snapshotKey = "vision:\(senderKey):\(normalizedText):order\(index)"
-            return ChatMessage(text: bubble.text, sender: sender, allowsAutomaticAnalysis: false, id: snapshotKey)
+            let confidence = bubble.lines.map(\.confidence).reduce(0, +) / Float(max(1, bubble.lines.count))
+            return ChatMessage(text: bubble.text, sender: sender, allowsAutomaticAnalysis: false,
+                               id: snapshotKey, source: .vision, confidence: confidence)
         }
         return (messages, bubbles.map(\.bounds))
     }

@@ -565,6 +565,7 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         accurate: Bool,
+        forceFresh: Bool = true,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextReadResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
@@ -574,7 +575,8 @@ final class WeChatBridge: @unchecked Sendable {
         case .uncertain: return .identityUncertain
         case .matches:
             guard cancellation?.isCancelled != true else { return .cancelled }
-            let result = readMessages(limit: 50, accurateVision: accurate)
+            let result = readMessages(limit: 50, accurateVision: accurate, forceFresh: forceFresh,
+                                      previousFingerprint: nil)
             guard cancellation?.isCancelled != true else { return .cancelled }
             let confirmation = detectCurrentConversation(forceFreshVision: true)
             switch olderContextIdentityCheck(confirmation, contact: contact, identity: identity) {

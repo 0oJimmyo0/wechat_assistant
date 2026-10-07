@@ -14,3 +14,16 @@ swiftc \
     "$PROJECT_DIR/Tests/WeChatParsingTests.swift"
 
 "$TEST_BINARY"
+
+STORE_TEST_BINARY="$PROJECT_DIR/.build/ConversationStoreTests"
+swiftc \
+    -framework Security \
+    -framework CryptoKit \
+    -o "$STORE_TEST_BINARY" \
+    "$PROJECT_DIR/Sources/WeChat/ChatMessage.swift" \
+    "$PROJECT_DIR/Sources/WeChat/ChatHistoryMerger.swift" \
+    "$PROJECT_DIR/Sources/WeChat/WeChatParsing.swift" \
+    "$PROJECT_DIR/Sources/WeChat/ConversationStore.swift" \
+    "$PROJECT_DIR/Tests/ConversationStoreTests.swift"
+
+"$STORE_TEST_BINARY"

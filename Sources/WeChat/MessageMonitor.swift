@@ -4,6 +4,7 @@ import Combine
 private enum SnapshotPurpose: Equatable {
     case livePolling
     case historicalBackfill
+    case manualSync
 }
 
 enum ConversationIdentityState: String, Sendable {
@@ -45,10 +46,13 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var isFollowingLatest = false
     @Published private(set) var hasUnverifiedMessageChanges = false
     @Published private(set) var isReturningToLatest = false
+    @Published private(set) var isSyncing = false
+    @Published private(set) var storageStatus: String?
     var onBurst: ((String, [ChatMessage], Bool) -> Void)?
     var onDeactivated: (() -> Void)?
 
     private let bridge = WeChatBridge.shared
+    private let conversationStore = ConversationStore.shared
     private let accessibilityQueue = DispatchQueue(label: "com.wechatreplycopilot.accessibility")
     private var timer: Timer?
     private var debounce: Task<Void, Never>?
@@ -57,6 +61,9 @@ final class MessageMonitor: ObservableObject {
     private var lastSemanticMessageKeys: [String] = []
     private var contextHistory: [ChatMessage] = []
     private var lockedContact: String?
+    private var activeConversationKey: String?
+    private var persistentHistoryBuffer: [ChatMessage] = []
+    private var persistenceTask: Task<Void, Never>?
     private var generation = 0
     private var isCheckingConversation = false
     private var isPolling = false
@@ -131,7 +138,11 @@ final class MessageMonitor: ObservableObject {
     }
 
     var canAnalyzeManually: Bool {
-        conversationIdentityState == .confirmed && !hasUnverifiedMessageChanges
+        conversationIdentityState == .confirmed && !hasUnverifiedMessageChanges && viewportState != .uncertain
+    }
+
+    var canSyncNow: Bool {
+        isRunning && lockedContact != nil && !isLoadingOlderContext && !isPolling && !isSyncing
     }
 
     func start() {
@@ -145,6 +156,10 @@ final class MessageMonitor: ObservableObject {
         isUsingVision = false
         messages = []
         contextHistory = []
+        activeConversationKey = nil
+        persistentHistoryBuffer = []
+        persistenceTask?.cancel()
+        persistenceTask = nil
         isLoadingOlderContext = false
         isFollowingLatest = false
         isReturningToLatest = false
@@ -165,6 +180,7 @@ final class MessageMonitor: ObservableObject {
         latestSnapshotBlockCount = 0
         latestTailOverlap = 0
         latestHistoricalOverlap = 0
+        storageStatus = nil
         stableVisionIdentity = nil
         candidateVisionIdentity = nil
         titleConsensusCount = 0
@@ -286,6 +302,16 @@ final class MessageMonitor: ObservableObject {
                 }
                 self.contactName = contact
                 self.lockedContact = contact
+                self.activeConversationKey = self.conversationStore.identityKey(for: contact)
+                if self.conversationStore.isEnabled, let key = self.activeConversationKey {
+                    do {
+                        self.persistentHistoryBuffer = try self.conversationStore.load(identityKey: key)
+                        self.contextHistory = Array(self.persistentHistoryBuffer.suffix(self.contextHistoryLimit))
+                        self.messages = self.contextHistory
+                    } catch {
+                        self.storageStatus = "Saved local context could not be unlocked; continuing with this session only"
+                    }
+                }
                 self.isUsingVision = detection.visionSnapshot != nil
                 self.stableVisionIdentity = detection.visionSnapshot?.titleIdentity
                 self.conversationIdentityState = .confirmed
@@ -325,6 +351,7 @@ final class MessageMonitor: ObservableObject {
         isCheckingConversation = false
         isPolling = false
         isLoadingOlderContext = false
+        isSyncing = false
         isFollowingLatest = false
         isReturningToLatest = false
         olderContextProgress = nil
@@ -342,9 +369,11 @@ final class MessageMonitor: ObservableObject {
         sessionCancellation = nil
         timer?.invalidate(); timer = nil
         debounce?.cancel(); debounce = nil
+        flushConversationSave()
         generation += 1
         messages = []
         contextHistory = []
+        persistentHistoryBuffer = []
         lastIDs = []
         lastMessageFingerprint = nil
         lastSemanticMessageKeys = []
@@ -354,6 +383,7 @@ final class MessageMonitor: ObservableObject {
         pendingAutomaticBurst = false
         contactName = nil
         lockedContact = nil
+        activeConversationKey = nil
         isUsingVision = false
         status = "Paused"
         onDeactivated?()
@@ -361,8 +391,114 @@ final class MessageMonitor: ObservableObject {
 
     func pollNow() { poll() }
 
+    func syncNow() {
+        guard canSyncNow, let contact = lockedContact else { return }
+        isSyncing = true
+        status = "Syncing latest messages…"
+        generation += 1
+        let token = generation
+        debounce?.cancel(); debounce = nil
+        pendingAutomaticBurst = false
+        let bridge = self.bridge
+        let identity = stableVisionIdentity
+        let cancellation = sessionCancellation
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if self.viewportState == .historical {
+                self.isReturningToLatest = true
+                let restore = await self.restoreToLatest(bridge: bridge, contact: contact, identity: identity,
+                                                         cancellation: cancellation, generation: token)
+                self.isReturningToLatest = false
+                guard self.isRunning, self.generation == token else { return }
+                guard restore == .reached else {
+                    self.isSyncing = false
+                    if restore == .conversationChanged {
+                        self.stop()
+                        self.status = "Conversation changed. Activate again in the chat you want to monitor."
+                    } else {
+                        self.status = restore == .identityUncertain
+                            ? "Could not verify the current conversation"
+                            : "Could not return to the latest messages · live tracking remains paused"
+                    }
+                    return
+                }
+            }
+
+            let result = await self.performAccessibilityOperation {
+                bridge.readMessagesIfConversationMatches(
+                    contact: contact, identity: identity, accurate: true, forceFresh: true, cancellation: cancellation
+                )
+            }
+            guard self.isRunning, self.generation == token else { return }
+            switch result {
+            case .conversationChanged:
+                self.stop()
+                self.status = "Conversation changed. Activate again in the chat you want to monitor."
+            case .identityUncertain:
+                self.conversationIdentityState = .temporarilyUncertain
+                self.isSyncing = false
+                self.status = "Could not verify the current conversation"
+            case .captureUnavailable:
+                self.isSyncing = false
+                self.status = "Could not capture the current WeChat conversation"
+            case .cancelled:
+                self.isSyncing = false
+            case .messages(let readResult):
+                self.conversationIdentityState = .confirmed
+                self.hasUnverifiedMessageChanges = false
+                switch readResult {
+                case .messageListUnavailable(_, let visionState):
+                    self.isSyncing = false
+                    self.status = visionState.map(self.visionCaptureFailureStatus) ?? "Could not read visible messages"
+                case .messageListUnchanged:
+                    self.isSyncing = false
+                    self.status = "Sync complete · no visible changes"
+                case .messageListFound(let snapshot, _, _, _, let isVision, let fingerprint):
+                    let previousCount = self.contextHistory.count
+                    let previousHistory = self.contextHistory
+                    self.isUsingVision = self.isUsingVision || isVision
+                    self.messageCaptureCount += 1
+                    self.messageOCRRunCount += isVision ? 1 : 0
+                    self.latestSnapshotBlockCount = snapshot.count
+                    self.lastMessageFingerprint = fingerprint
+                    self.lastSemanticMessageKeys = snapshot.map(self.contextKey)
+                    self.processSnapshot(snapshot, contact: contact, purpose: .manualSync)
+                    let currentKeys = self.contextHistory.map(self.contextKey)
+                    let newCount = ChatHistoryMerger.appended(previous: previousHistory, merged: self.contextHistory).count
+                    let totalAdded = max(0, self.contextHistory.count - previousCount)
+                    if self.viewportState == .uncertain {
+                        self.status = "Sync complete · visible context could not be matched safely"
+                    } else if newCount > 0 {
+                        self.status = "Synced · \(newCount) new messages"
+                    } else if totalAdded > 0 {
+                        self.status = "Synced · \(self.contextHistory.count) messages captured"
+                    } else if currentKeys == previousHistory.map(self.contextKey) {
+                        self.status = "Sync complete · no visible changes"
+                    } else {
+                        self.status = "Synced · \(self.contextHistory.count) messages captured"
+                    }
+                    self.isSyncing = false
+                }
+            }
+        }
+    }
+
+    func clearCurrentStoredHistory() throws {
+        guard let key = activeConversationKey else { return }
+        stop()
+        try conversationStore.clear(identityKey: key)
+        status = "Current conversation history cleared"
+    }
+
+    func clearAllStoredHistory() throws {
+        stop()
+        try conversationStore.clearAll()
+        status = "All stored conversation history cleared"
+    }
+
+
     func loadOlderContext() {
-        guard isRunning, !isLoadingOlderContext, !isPolling, canLoadOlderContext,
+        guard isRunning, !isLoadingOlderContext, !isPolling, !isSyncing, canLoadOlderContext,
               viewportState == .liveTail,
               contextHistory.count < targetContextCount,
               let contact = lockedContact else { return }
@@ -553,7 +689,7 @@ final class MessageMonitor: ObservableObject {
     }
 
     func followLatest() {
-        guard isRunning, !isLoadingOlderContext, !isPolling, viewportState != .liveTail,
+        guard isRunning, !isLoadingOlderContext, !isPolling, !isSyncing, viewportState != .liveTail,
               let contact = lockedContact else { return }
         timer?.invalidate()
         timer = nil
@@ -645,9 +781,7 @@ final class MessageMonitor: ObservableObject {
                     latestSnapshotBlockCount = snapshot.count
                     lastMessageFingerprint = fingerprint
                     lastSemanticMessageKeys = snapshot.map(contextKey)
-                    let classification = contextHistory.isEmpty
-                        ? ChatViewportClassification(state: .liveTail, tailOverlap: snapshot.count, historicalOverlap: 0)
-                        : ChatHistoryMerger.classify(existing: contextHistory, visible: snapshot)
+                    let classification = classifyVisibleSnapshot(snapshot)
                     viewportState = classification.state
                     latestTailOverlap = classification.tailOverlap
                     latestHistoricalOverlap = classification.historicalOverlap
@@ -679,7 +813,7 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func poll() {
-        guard isRunning, !isPolling, !isLoadingOlderContext else { return }
+        guard isRunning, !isPolling, !isLoadingOlderContext, !isSyncing else { return }
         isPolling = true
         let token = generation
         let bridge = self.bridge
@@ -866,13 +1000,28 @@ final class MessageMonitor: ObservableObject {
             status = "Monitoring this conversation"
         case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _, let isVision, let fingerprint):
             isUsingVision = isUsingVision || isVision
-            contextHistory = Array(snapshot.suffix(contextHistoryLimit))
+            let classification = classifyVisibleSnapshot(snapshot)
+            viewportState = classification.state
+            latestTailOverlap = classification.tailOverlap
+            latestHistoricalOverlap = classification.historicalOverlap
+            if classification.state != .uncertain {
+                contextHistory = ChatHistoryMerger.merge(existing: contextHistory, visible: snapshot,
+                                                         limit: contextHistoryLimit)
+                mergeIntoPersistentHistory(snapshot)
+                scheduleConversationSave()
+            } else if contextHistory.isEmpty {
+                contextHistory = Array(snapshot.suffix(contextHistoryLimit))
+            }
             messages = contextHistory
             lastIDs = snapshot.map(contextKey)
             lastSemanticMessageKeys = lastIDs
             lastMessageFingerprint = fingerprint
             latestSnapshotBlockCount = snapshot.count
-            viewportState = .liveTail
+            if classification.state == .uncertain {
+                status = "Stored context restored · visible messages could not be reconciled safely"
+                hasUnverifiedMessageChanges = true
+                return
+            }
             if snapshot.isEmpty {
                 status = isVision
                     ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision found \(renderedRows) text observations; 0 passed chat-message filtering")
@@ -966,9 +1115,7 @@ final class MessageMonitor: ObservableObject {
                 : "Keeping captured context · no new visible messages"
             return
         }
-        let classification = contextHistory.isEmpty
-            ? ChatViewportClassification(state: .liveTail, tailOverlap: snapshot.count, historicalOverlap: 0)
-            : ChatHistoryMerger.classify(existing: contextHistory, visible: snapshot)
+        let classification = classifyVisibleSnapshot(snapshot)
         viewportState = classification.state
         latestTailOverlap = classification.tailOverlap
         latestHistoricalOverlap = classification.historicalOverlap
@@ -979,15 +1126,23 @@ final class MessageMonitor: ObservableObject {
         contactName = contact
         let ids = snapshot.map(contextKey)
         let previousHistory = contextHistory
+        let previousPersistentKeys = persistentHistoryBuffer.map(contextKey)
         let mergedHistory = mergeContextHistory(snapshot)
         let historyChanged = mergedHistory.map(\.id) != contextHistory.map(\.id)
         let added = appendedMessages(previous: previousHistory, merged: mergedHistory)
         contextHistory = mergedHistory
         messages = contextHistory
-        if purpose == .historicalBackfill || classification.state == .historical {
+        mergeIntoPersistentHistory(snapshot)
+        let persistentChanged = persistentHistoryBuffer.map(contextKey) != previousPersistentKeys
+        if historyChanged || persistentChanged {
+            scheduleConversationSave()
+        }
+        if purpose == .historicalBackfill || purpose == .manualSync || classification.state == .historical {
             lastIDs = ids
             pendingAutomaticBurst = false
-            if isLoadingOlderContext {
+            if purpose == .manualSync {
+                status = "Syncing latest messages…"
+            } else if isLoadingOlderContext {
                 status = "Older chat context updated · \(contextHistory.count) messages"
             } else {
                 status = "Viewing older messages · live incoming tracking paused"
@@ -1033,6 +1188,62 @@ final class MessageMonitor: ObservableObject {
 
     private func mergeContextHistory(_ visibleSnapshot: [ChatMessage]) -> [ChatMessage] {
         ChatHistoryMerger.merge(existing: contextHistory, visible: visibleSnapshot, limit: contextHistoryLimit)
+    }
+
+    private func classifyVisibleSnapshot(_ snapshot: [ChatMessage]) -> ChatViewportClassification {
+        let timeline = conversationStore.isEnabled && !persistentHistoryBuffer.isEmpty
+            ? persistentHistoryBuffer
+            : contextHistory
+        guard !timeline.isEmpty else {
+            return ChatViewportClassification(state: .liveTail, tailOverlap: snapshot.count, historicalOverlap: 0)
+        }
+        return ChatHistoryMerger.classify(existing: timeline, visible: snapshot)
+    }
+
+    private func mergeIntoPersistentHistory(_ visibleSnapshot: [ChatMessage]) {
+        guard conversationStore.isEnabled else { return }
+        if persistentHistoryBuffer.isEmpty, !contextHistory.isEmpty {
+            persistentHistoryBuffer = contextHistory
+        }
+        persistentHistoryBuffer = ChatHistoryMerger.merge(
+            existing: persistentHistoryBuffer,
+            visible: visibleSnapshot,
+            limit: 500
+        )
+    }
+
+    private func scheduleConversationSave() {
+        guard conversationStore.isEnabled,
+              let key = activeConversationKey,
+              let name = lockedContact,
+              !persistentHistoryBuffer.isEmpty else { return }
+        persistenceTask?.cancel()
+        let messagesToSave = persistentHistoryBuffer
+        persistenceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            do {
+                try self.conversationStore.save(messages: messagesToSave, identityKey: key, displayName: name)
+                self.persistenceTask = nil
+            } catch {
+                self.storageStatus = "Encrypted local history could not be saved"
+                self.persistenceTask = nil
+            }
+        }
+    }
+
+    private func flushConversationSave() {
+        persistenceTask?.cancel()
+        persistenceTask = nil
+        guard conversationStore.isEnabled,
+              let key = activeConversationKey,
+              let name = lockedContact,
+              !persistentHistoryBuffer.isEmpty else { return }
+        do {
+            try conversationStore.save(messages: persistentHistoryBuffer, identityKey: key, displayName: name)
+        } catch {
+            storageStatus = "Encrypted local history could not be saved"
+        }
     }
 
     private func contextKey(_ message: ChatMessage) -> String {
