@@ -65,6 +65,23 @@ enum WeChatParsingTests {
         expect(consensus(titleA, titleB, titleC) == nil, "A/B/C fails safely")
         let displacedTitleA = identity("Alice", x: 0.70)
         expect(consensus(titleA, nil, displacedTitleA) == nil, "all-pairs recovery retains spatial constraints")
+
+        let existing = (14...20).map { visionMessage("M\($0)", order: $0 - 14) }
+        let olderViewport = (8...14).map { visionMessage("M\($0)", order: $0 - 8) }
+        let loadedHistory = ChatHistoryMerger.merge(existing: existing, visible: olderViewport, limit: 100)
+        expect(loadedHistory.map(\.text) == (8...20).map { "M\($0)" },
+               "overlapping older OCR snapshot prepends older rows without duplicating overlap")
+        expect(ChatHistoryMerger.appended(previous: existing, merged: loadedHistory).isEmpty,
+               "historical prepend is not treated as appended live messages")
+        expect(ChatHistoryMerger.merge(existing: existing, visible: olderViewport, limit: 10).count == 10,
+               "history merge respects local context limit")
+        let secondOlderViewport = (2...8).map { visionMessage("M\($0)", order: $0 - 2) }
+        let thirdOlderViewport = (1...2).map { visionMessage("M\($0)", order: $0 - 1) }
+        let thirteen = ChatHistoryMerger.merge(existing: existing, visible: olderViewport, limit: 100)
+        let nineteen = ChatHistoryMerger.merge(existing: thirteen, visible: secondOlderViewport, limit: 100)
+        let twenty = ChatHistoryMerger.merge(existing: nineteen, visible: thirdOlderViewport, limit: 100)
+        expect(existing.count == 7 && twenty.count == 20 && twenty.first?.text == "M1" && twenty.last?.text == "M20",
+               "simulated bounded overlap expands a 7-message viewport to 20 unique rows")
         print("All WeChat parsing checks passed.")
     }
 
@@ -75,6 +92,10 @@ enum WeChatParsingTests {
 
     private static func consensus(_ identities: VisionConversationIdentity?...) -> VisionTitlePair? {
         VisionTitleConsensus.evaluate(identities).bestPair
+    }
+
+    private static func visionMessage(_ text: String, order: Int) -> ChatMessage {
+        ChatMessage(text: text, sender: .other, allowsAutomaticAnalysis: false, id: "vision:other:\(text):order\(order)")
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ description: String) {

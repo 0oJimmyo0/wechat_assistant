@@ -6,6 +6,29 @@ enum MessageReadResult: Sendable {
     case messageListFound(messages: [ChatMessage], renderedRows: Int, bubbleRows: Int, placeholders: Int, isVision: Bool)
 }
 
+enum OlderContextScrollResult: Sendable {
+    case scrolled
+    case conversationChanged
+    case identityUncertain
+    case windowUnavailable
+    case scrollUnavailable
+    case cancelled
+}
+
+enum OlderContextReadResult: Sendable {
+    case messages(MessageReadResult)
+    case conversationChanged
+    case identityUncertain
+    case captureUnavailable
+    case cancelled
+}
+
+private enum OlderContextIdentityCheck {
+    case matches
+    case changed
+    case uncertain
+}
+
 struct WeChatConversationDetection: Sendable {
     let contact: String?
     let windowFound: Bool
@@ -466,6 +489,82 @@ final class WeChatBridge: @unchecked Sendable {
         }
         if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false) { return result }
         return .messageListUnavailable(treeCollapsed: false, visionState: nil)
+    }
+
+    func scrollMessagePaneUpwardIfConversationMatches(
+        contact: String,
+        identity: VisionConversationIdentity?,
+        fraction: CGFloat,
+        cancellation: MonitorWorkCancellation?
+    ) -> OlderContextScrollResult {
+        guard cancellation?.isCancelled != true else { return .cancelled }
+        let detection = detectCurrentConversation(forceFreshVision: true)
+        switch olderContextIdentityCheck(detection, contact: contact, identity: identity) {
+        case .changed: return .conversationChanged
+        case .uncertain: return .identityUncertain
+        case .matches: break
+        }
+        guard let app = weChatApplication(), let window = mainWindow() else { return .windowUnavailable }
+        guard cancellation?.isCancelled != true else { return .cancelled }
+        let windowFrame = frame(window, timeout: 0.08)
+        guard windowFrame.width >= 400, windowFrame.height >= 300 else { return .windowUnavailable }
+        let calibration = VisionLayoutCalibration.current
+        let canvasHeight = calibration.headerBottomY - calibration.composerTopY
+        guard canvasHeight > 0.1 else { return .scrollUnavailable }
+        let xRatio = calibration.conversationLeftX + (1 - calibration.conversationLeftX) * 0.5
+        let yRatioFromTop = 1 - ((calibration.composerTopY + calibration.headerBottomY) * 0.5)
+        let location = CGPoint(
+            x: windowFrame.minX + windowFrame.width * xRatio,
+            y: windowFrame.minY + windowFrame.height * yRatioFromTop
+        )
+        guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
+        let amount = Int32(min(500, max(120, windowFrame.height * canvasHeight * min(0.60, max(0.40, fraction)))))
+        // Quartz scroll-wheel deltaY > 0 means wheel-up (older messages in a
+        // conventional chat transcript). Posting to the WeChat PID targets its
+        // window without clicking or changing the selected conversation.
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                  wheel1: amount, wheel2: 0, wheel3: 0) else { return .scrollUnavailable }
+        event.location = location
+        event.postToPid(app.processIdentifier)
+        return .scrolled
+    }
+
+    func readMessagesIfConversationMatches(
+        contact: String,
+        identity: VisionConversationIdentity?,
+        accurate: Bool,
+        cancellation: MonitorWorkCancellation?
+    ) -> OlderContextReadResult {
+        guard cancellation?.isCancelled != true else { return .cancelled }
+        let detection = detectCurrentConversation(forceFreshVision: true)
+        switch olderContextIdentityCheck(detection, contact: contact, identity: identity) {
+        case .changed: return .conversationChanged
+        case .uncertain: return .identityUncertain
+        case .matches:
+            guard cancellation?.isCancelled != true else { return .cancelled }
+            let result = readMessages(limit: 50, accurateVision: accurate)
+            guard cancellation?.isCancelled != true else { return .cancelled }
+            let confirmation = detectCurrentConversation(forceFreshVision: true)
+            switch olderContextIdentityCheck(confirmation, contact: contact, identity: identity) {
+            case .changed: return .conversationChanged
+            case .uncertain: return .identityUncertain
+            case .matches: return .messages(result)
+            }
+        }
+    }
+
+    private func olderContextIdentityCheck(
+        _ detection: WeChatConversationDetection,
+        contact: String,
+        identity: VisionConversationIdentity?
+    ) -> OlderContextIdentityCheck {
+        guard let detectedContact = detection.contact, !detectedContact.isEmpty else { return .uncertain }
+        guard WeChatParsing.conversationIdentityKey(detectedContact) == WeChatParsing.conversationIdentityKey(contact) else {
+            return .changed
+        }
+        guard let identity else { return .matches }
+        guard let detectedIdentity = detection.visionSnapshot?.titleIdentity else { return .uncertain }
+        return identity.isSpatiallyConsistent(with: detectedIdentity) ? .matches : .uncertain
     }
 
     private func readVisibleMessages(in window: AXUIElement, limit: Int, accurate: Bool,

@@ -54,10 +54,10 @@ struct ReplySidebarView: View {
                     Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.everydayModel) } label: {
                         Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
+                    }.buttonStyle(.borderedProminent).disabled(isGenerating || monitor.isLoadingOlderContext || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
                     Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.carefulModel) } label: {
                         Label("Regenerate carefully", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
-                    }.buttonStyle(.bordered).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
+                    }.buttonStyle(.bordered).disabled(isGenerating || monitor.isLoadingOlderContext || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
                 }
                 .padding(16)
             }
@@ -132,6 +132,25 @@ struct ReplySidebarView: View {
         let visibleMessages = Array(monitor.messages.suffix(displayedMessageLimit))
         return VStack(alignment: .leading, spacing: 8) {
             sectionLabel("RECENT MESSAGES · LAST \(visibleMessages.count) OF \(monitor.messages.count)")
+            if monitor.isRunning && visibleMessages.count < displayedMessageLimit && monitor.canLoadOlderContext {
+                Button {
+                    monitor.loadOlderContext()
+                } label: {
+                    Label(monitor.isLoadingOlderContext ? "Loading…" : "Load older context",
+                          systemImage: monitor.isLoadingOlderContext ? "hourglass" : "arrow.up.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(monitor.isLoadingOlderContext)
+            }
+            if monitor.isLoadingOlderContext {
+                Text("Loading older context… \(monitor.olderContextProgress ?? "0 / 20")")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if let olderContextStatus = monitor.olderContextStatus {
+                Text(olderContextStatus)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if monitor.messages.isEmpty {
                 Text("No chat message text is available from this WeChat view yet.")
                     .font(.callout)
@@ -214,7 +233,7 @@ struct ReplySidebarView: View {
     }
 
     private func generate(context: [ChatMessage], model: String) {
-        guard auth.isSignedIn, !isGenerating else { return }
+        guard auth.isSignedIn, !isGenerating, !monitor.isLoadingOlderContext else { return }
         guard !model.isEmpty else { errorMessage = "Choose an available model in settings."; return }
         let requestID = UUID()
         generationID = requestID

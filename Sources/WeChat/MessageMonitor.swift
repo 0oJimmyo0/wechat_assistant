@@ -1,7 +1,12 @@
 import Foundation
 import Combine
 
-private final class MonitorWorkCancellation: @unchecked Sendable {
+private enum SnapshotPurpose: Equatable {
+    case livePolling
+    case historicalBackfill
+}
+
+final class MonitorWorkCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
@@ -15,6 +20,10 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var contactName: String?
     @Published private(set) var messages: [ChatMessage] = []
     @Published private(set) var status = "Paused"
+    @Published private(set) var isLoadingOlderContext = false
+    @Published private(set) var olderContextProgress: String?
+    @Published private(set) var olderContextStatus: String?
+    @Published private(set) var canLoadOlderContext = true
     var onBurst: ((String, [ChatMessage], Bool) -> Void)?
     var onDeactivated: (() -> Void)?
 
@@ -44,7 +53,14 @@ final class MessageMonitor: ObservableObject {
     private let minimumVisionSwitchTitleConfidence: Float = 0.35
     private let contextHistoryLimit = 100
     private let automaticAnalysisContextLimit = 30
+    private let targetContextCount = 20
+    private let maxScrollAttempts = 5
+    private let maxNoProgressAttempts = 2
+    private let olderContextTimeout: TimeInterval = 9
+    private let olderContextScrollFraction: CGFloat = 0.5
+    private let olderContextRenderDelay: UInt64 = 300_000_000
     private var lastTitleConsensusDiagnostic = "Title consensus: not run"
+    private var lastOlderContextDiagnostic = "Older-context load: not run"
     private let pollingInterval: TimeInterval = 1
 
     var visionIdentityDiagnostic: String {
@@ -55,6 +71,7 @@ final class MessageMonitor: ObservableObject {
             "Vision title consensus count: \(titleConsensusCount)",
             "Consecutive title misses: \(unidentifiedPolls)",
             lastTitleConsensusDiagnostic,
+            lastOlderContextDiagnostic,
             lastActivationDiagnostic
         ].joined(separator: "\n")
     }
@@ -70,6 +87,10 @@ final class MessageMonitor: ObservableObject {
         isUsingVision = false
         messages = []
         contextHistory = []
+        isLoadingOlderContext = false
+        olderContextProgress = nil
+        olderContextStatus = nil
+        canLoadOlderContext = true
         lastIDs = []
         stableVisionIdentity = nil
         candidateVisionIdentity = nil
@@ -228,6 +249,10 @@ final class MessageMonitor: ObservableObject {
         isRunning = false
         isCheckingConversation = false
         isPolling = false
+        isLoadingOlderContext = false
+        olderContextProgress = nil
+        olderContextStatus = nil
+        canLoadOlderContext = true
         unidentifiedPolls = 0
         candidateContact = nil
         candidateContactPolls = 0
@@ -253,8 +278,179 @@ final class MessageMonitor: ObservableObject {
 
     func pollNow() { poll() }
 
+    func loadOlderContext() {
+        guard isRunning, !isLoadingOlderContext, !isPolling, canLoadOlderContext,
+              contextHistory.count < targetContextCount,
+              let contact = lockedContact else { return }
+        let originalIdentity = stableVisionIdentity
+
+        timer?.invalidate()
+        timer = nil
+        debounce?.cancel()
+        debounce = nil
+        generation += 1
+        isLoadingOlderContext = true
+        olderContextProgress = "\(contextHistory.count) / \(targetContextCount)"
+        olderContextStatus = nil
+        let token = generation
+        let bridge = self.bridge
+        let cancellation = sessionCancellation
+        let startingCount = contextHistory.count
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runOlderContextLoad(
+                bridge: bridge,
+                contact: contact,
+                identity: originalIdentity,
+                cancellation: cancellation,
+                startingCount: startingCount,
+                generation: token
+            )
+        }
+    }
+
+    private func runOlderContextLoad(
+        bridge: WeChatBridge,
+        contact: String,
+        identity: VisionConversationIdentity?,
+        cancellation: MonitorWorkCancellation?,
+        startingCount: Int,
+        generation token: Int
+    ) async {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let deadline = startedAt + olderContextTimeout
+        let scrollFraction = olderContextScrollFraction
+        var attempts = 0
+        var noProgressAttempts = 0
+        var identityFailure = false
+        var captureFailure = false
+        var timedOut = false
+        var reachedEnd = false
+
+        while isRunning, generation == token, contextHistory.count < targetContextCount,
+              attempts < maxScrollAttempts, ProcessInfo.processInfo.systemUptime < deadline {
+            let scrollResult = await performAccessibilityOperation {
+                bridge.scrollMessagePaneUpwardIfConversationMatches(
+                    contact: contact,
+                    identity: identity,
+                    fraction: scrollFraction,
+                    cancellation: cancellation
+                )
+            }
+            guard isRunning, generation == token else { return }
+            switch scrollResult {
+            case .scrolled:
+                attempts += 1
+            case .conversationChanged, .identityUncertain:
+                identityFailure = true
+                break
+            case .cancelled:
+                return
+            case .windowUnavailable, .scrollUnavailable:
+                captureFailure = true
+                break
+            }
+            if identityFailure || captureFailure { break }
+
+            do { try await Task.sleep(nanoseconds: olderContextRenderDelay) }
+            catch { return }
+            guard isRunning, generation == token else { return }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                timedOut = true
+                break
+            }
+
+            let readResult = await performAccessibilityOperation {
+                bridge.readMessagesIfConversationMatches(
+                    contact: contact, identity: identity, accurate: true, cancellation: cancellation
+                )
+            }
+            guard isRunning, generation == token else { return }
+            switch readResult {
+            case .conversationChanged, .identityUncertain:
+                identityFailure = true
+            case .cancelled:
+                return
+            case .captureUnavailable:
+                captureFailure = true
+            case .messages(let result):
+                switch result {
+                case .messageListUnavailable:
+                    captureFailure = true
+                case .messageListFound(let snapshot, _, _, _, _):
+                    let beforeCount = contextHistory.count
+                    processSnapshot(snapshot, contact: contact, purpose: .historicalBackfill)
+                    let afterCount = contextHistory.count
+                    olderContextProgress = "\(afterCount) / \(targetContextCount)"
+                    if afterCount > beforeCount {
+                        noProgressAttempts = 0
+                    } else {
+                        noProgressAttempts += 1
+                    }
+                    if snapshot.isEmpty { reachedEnd = noProgressAttempts >= maxNoProgressAttempts }
+                }
+            }
+            if identityFailure || captureFailure || contextHistory.count >= targetContextCount { break }
+            if noProgressAttempts >= maxNoProgressAttempts {
+                reachedEnd = true
+                break
+            }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                timedOut = true
+                break
+            }
+        }
+
+        guard isRunning, generation == token else { return }
+        let endingCount = contextHistory.count
+        let elapsedMilliseconds = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+        let newCount = max(0, endingCount - startingCount)
+        if identityFailure {
+            olderContextStatus = "Stopped loading older context because the conversation could not be verified."
+            canLoadOlderContext = false
+        } else if captureFailure {
+            olderContextStatus = "Could not read older messages from the WeChat window."
+        } else if endingCount >= targetContextCount {
+            olderContextStatus = "Loaded \(endingCount) messages. WeChat is scrolled to older messages."
+        } else if reachedEnd || noProgressAttempts >= maxNoProgressAttempts {
+            olderContextStatus = "Loaded \(endingCount) messages. No additional older messages could be matched. WeChat is scrolled to older messages."
+        } else if timedOut || attempts >= maxScrollAttempts || ProcessInfo.processInfo.systemUptime >= deadline {
+            olderContextStatus = "Loaded \(endingCount) messages. Stopped after the bounded loading limit. WeChat is scrolled to older messages."
+        } else {
+            olderContextStatus = "Loaded \(endingCount) messages. WeChat is scrolled to older messages."
+        }
+        lastOlderContextDiagnostic = [
+            "Older-context load:",
+            "attempts: \(attempts)",
+            "starting count: \(startingCount)",
+            "ending count: \(endingCount)",
+            "new messages merged: \(newCount)",
+            "no-progress attempts: \(noProgressAttempts)",
+            "identity checks failed: \(identityFailure ? 1 : 0)",
+            "elapsed ms: \(elapsedMilliseconds)"
+        ].joined(separator: "\n")
+        isLoadingOlderContext = false
+        olderContextProgress = nil
+        if isRunning {
+            timer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.poll() }
+            }
+        }
+    }
+
+    private func performAccessibilityOperation<T: Sendable>(
+        _ operation: @escaping @Sendable () -> T
+    ) async -> T {
+        let queue = accessibilityQueue
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: operation())
+            }
+        }
+    }
+
     private func poll() {
-        guard isRunning, !isPolling else { return }
+        guard isRunning, !isPolling, !isLoadingOlderContext else { return }
         isPolling = true
         let token = generation
         let bridge = self.bridge
@@ -371,7 +567,7 @@ final class MessageMonitor: ObservableObject {
                             : "Message rows found, but message text is unavailable")
                         return
                     }
-                    self.processSnapshot(snapshot, contact: contact)
+                    self.processSnapshot(snapshot, contact: contact, purpose: .livePolling)
                 }
             }
         }
@@ -475,7 +671,7 @@ final class MessageMonitor: ObservableObject {
         WeChatScreenReader.requestScreenCapturePermissionOnce()
     }
 
-    private func processSnapshot(_ snapshot: [ChatMessage], contact: String) {
+    private func processSnapshot(_ snapshot: [ChatMessage], contact: String, purpose: SnapshotPurpose) {
         contactName = contact
         if snapshot.isEmpty {
             messages = contextHistory
@@ -491,6 +687,11 @@ final class MessageMonitor: ObservableObject {
         let added = appendedMessages(previous: previousHistory, merged: mergedHistory)
         contextHistory = mergedHistory
         messages = contextHistory
+        if purpose == .historicalBackfill {
+            lastIDs = ids
+            status = "Older chat context updated · \(contextHistory.count) messages"
+            return
+        }
         guard ids != lastIDs else {
             status = snapshot.allSatisfy { !$0.senderIdentified }
                 ? "Monitoring · OCR senders are tentative"
@@ -512,80 +713,15 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func appendedMessages(previous: [ChatMessage], merged: [ChatMessage]) -> [ChatMessage] {
-        guard !previous.isEmpty else { return [] }
-        let previousKeys = previous.map(contextKey)
-        let mergedKeys = merged.map(contextKey)
-        for length in stride(from: min(previousKeys.count, mergedKeys.count), through: 1, by: -1) {
-            let previousSuffix = Array(previousKeys.suffix(length))
-            if Array(mergedKeys.prefix(length)) == previousSuffix {
-                return Array(merged.dropFirst(length))
-            }
-        }
-        return []
+        ChatHistoryMerger.appended(previous: previous, merged: merged)
     }
 
     private func mergeContextHistory(_ visibleSnapshot: [ChatMessage]) -> [ChatMessage] {
-        guard !contextHistory.isEmpty else {
-            return Array(visibleSnapshot.suffix(contextHistoryLimit))
-        }
-
-        let historyIDs = contextHistory.map(contextKey)
-        let visibleIDs = visibleSnapshot.map(contextKey)
-        var refreshedHistory = contextHistory
-
-        // New live messages appear after an overlap with the accumulated tail.
-        for length in stride(from: min(historyIDs.count, visibleIDs.count), through: 1, by: -1) {
-            let historySuffix = Array(historyIDs.suffix(length))
-            for start in (0...(visibleIDs.count - length)).reversed() {
-                guard Array(visibleIDs[start..<(start + length)]) == historySuffix else { continue }
-                let historyStart = contextHistory.count - length
-                for offset in 0..<length {
-                    refreshedHistory[historyStart + offset] = visibleSnapshot[start + offset]
-                }
-                let tail = Array(visibleSnapshot.dropFirst(start + length))
-                if !tail.isEmpty {
-                    return Array((refreshedHistory + tail).suffix(contextHistoryLimit))
-                }
-                break
-            }
-        }
-
-        // If the user scrolls to older rows, prepend unseen rows before any
-        // matching portion of the captured timeline.
-        for length in stride(from: min(historyIDs.count, visibleIDs.count), through: 1, by: -1) {
-            for historyStart in 0...(historyIDs.count - length) {
-                let historySegment = Array(historyIDs[historyStart..<(historyStart + length)])
-                for visibleStart in 0...(visibleIDs.count - length) {
-                    guard Array(visibleIDs[visibleStart..<(visibleStart + length)]) == historySegment else { continue }
-                    for offset in 0..<length {
-                        refreshedHistory[historyStart + offset] = visibleSnapshot[visibleStart + offset]
-                    }
-                    if visibleStart > 0 {
-                        let older = Array(visibleSnapshot.prefix(visibleStart))
-                        return Array((older + refreshedHistory).suffix(contextHistoryLimit))
-                    }
-                    return refreshedHistory
-                }
-            }
-        }
-        return refreshedHistory
+        ChatHistoryMerger.merge(existing: contextHistory, visible: visibleSnapshot, limit: contextHistoryLimit)
     }
 
     private func contextKey(_ message: ChatMessage) -> String {
-        if message.id.hasPrefix("vision:") { return message.id }
-        let normalized = message.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-        let scalars = normalized.unicodeScalars.filter {
-            !CharacterSet.whitespacesAndNewlines.contains($0) &&
-                !CharacterSet.punctuationCharacters.contains($0)
-        }
-        let key = String(String.UnicodeScalarView(scalars))
-        let sender: String
-        switch message.sender {
-        case .me: sender = "me"
-        case .other: sender = "other"
-        case .unknown: sender = "unknown"
-        }
-        return "\(sender):\(key.isEmpty ? message.text : key)"
+        ChatHistoryMerger.key(for: message)
     }
 
     private func conversationKey(_ contact: String) -> String {
