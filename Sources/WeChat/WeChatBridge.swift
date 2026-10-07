@@ -80,7 +80,22 @@ final class WeChatBridge: @unchecked Sendable {
 
     func currentContact() -> String? {
         guard let window = mainWindow() else { return nil }
-        if let title = string(window, "AXTitle"), !title.isEmpty, !isGenericWindowTitle(title) { return title }
+        if let title = string(window, "AXTitle"), !title.isEmpty, !isGenericWindowTitle(title) {
+            return normalizeChatTitle(title)
+        }
+
+        // WeChat 4.x exposes the open conversation title as a stable
+        // AXStaticText identifier. Prefer this over sidebar-selection state:
+        // recent clients do not consistently expose AXSelected on session rows.
+        let titleElements = find(window, depth: 24) {
+            self.string($0, "AXRole") == "AXStaticText" &&
+            self.identifier($0) == "big_title_line_h_view"
+        }
+        for element in titleElements {
+            let raw = self.string(element, "AXValue") ?? self.string(element, "AXTitle") ?? ""
+            let name = normalizeChatTitle(raw)
+            if !name.isEmpty, !isGenericWindowTitle(name) { return name }
+        }
 
         // Some WeChat builds keep the window title at "WeChat (Chats)" even
         // while a conversation is open. Prefer the selected chat row's stable
@@ -91,9 +106,9 @@ final class WeChatBridge: @unchecked Sendable {
         for row in selectedChatRows {
             let prefix = "session_item_"
             let idName = String(identifier(row).dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !idName.isEmpty { return idName }
+            if !idName.isEmpty { return normalizeChatTitle(idName) }
             if let rowTitle = string(row, "AXTitle"), let firstLine = firstLine(of: rowTitle), !isGenericWindowTitle(firstLine) {
-                return firstLine
+                return normalizeChatTitle(firstLine)
             }
         }
 
@@ -109,7 +124,7 @@ final class WeChatBridge: @unchecked Sendable {
         }
         for row in selectedRows {
             let rowText = string(row, "AXTitle") ?? string(row, "AXValue") ?? ""
-            if let name = firstLine(of: rowText), !isGenericWindowTitle(name) { return name }
+            if let name = firstLine(of: rowText), !isGenericWindowTitle(name) { return normalizeChatTitle(name) }
         }
 
         let headerLabels = find(window, depth: 16) { element in
@@ -123,7 +138,7 @@ final class WeChatBridge: @unchecked Sendable {
         }.sorted { frame($0).minY < frame($1).minY }
         for label in headerLabels {
             let text = string(label, "AXValue") ?? string(label, "AXTitle") ?? ""
-            if let name = firstLine(of: text), !isGenericWindowTitle(name) { return name }
+            if let name = firstLine(of: text), !isGenericWindowTitle(name) { return normalizeChatTitle(name) }
         }
         return nil
     }
@@ -137,6 +152,17 @@ final class WeChatBridge: @unchecked Sendable {
 
     private func firstLine(of text: String) -> String? {
         text.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizeChatTitle(_ text: String) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Group chats can be rendered as "Group Name(23)" where the suffix is
+        // the member count. Strip only a trailing numeric parenthesized suffix.
+        if let range = value.range(of: #"\(\d+\)$"#, options: .regularExpression) {
+            value.removeSubrange(range)
+            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value
     }
 
     private func hasRecognizedMessageList(in root: AXUIElement) -> Bool {
