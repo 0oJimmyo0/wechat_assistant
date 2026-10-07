@@ -18,12 +18,17 @@ final class MessageMonitor: ObservableObject {
     private var lastIDs: [String] = []
     private var lockedContact: String?
     private var generation = 0
+    private var burstGeneration = 0
     private var isCheckingConversation = false
     private var isPolling = false
 
     func start() {
         guard !isRunning, !isCheckingConversation else { return }
-        guard bridge.hasAccessibilityPermission else { status = "Accessibility permission required"; bridge.requestAccessibilityPermission(); return }
+        guard bridge.hasAccessibilityPermission else {
+            status = "Accessibility permission required"
+            bridge.requestAccessibilityPermission()
+            return
+        }
         guard bridge.isWeChatRunning else { status = "Open WeChat to start monitoring"; return }
         isCheckingConversation = true
         status = "Checking the open WeChat conversation…"
@@ -31,23 +36,21 @@ final class MessageMonitor: ObservableObject {
         let token = generation
         let bridge = self.bridge
         accessibilityQueue.async { [weak self] in
-            let contact = bridge.currentContact()
-            let snapshot = contact == nil ? [] : bridge.recentMessages()
+            // A single capture replaces two expensive full-window AX traversals.
+            let snapshot = bridge.capture(limit: 20)
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
-                guard let contact, !contact.isEmpty else {
+                guard let contact = snapshot.contact, !contact.isEmpty else {
                     self.status = "Open a conversation before activating"
                     return
                 }
                 self.contactName = contact
-                self.messages = snapshot
+                self.messages = snapshot.messages
                 self.lockedContact = contact
-                self.lastIDs = snapshot.map(\.id)
+                self.lastIDs = snapshot.messages.map(\.id)
                 self.isRunning = true
-                self.status = snapshot.isEmpty
-                    ? "Chat opened · WeChat exposed no message text"
-                    : (snapshot.contains(where: { !$0.senderIdentified }) ? "Manual analysis only · sender unclear" : "Monitoring this conversation")
+                self.status = self.captureStatus(snapshot)
                 self.timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.poll() }
                 }
@@ -59,9 +62,12 @@ final class MessageMonitor: ObservableObject {
         isRunning = false
         isCheckingConversation = false
         isPolling = false
-        timer?.invalidate(); timer = nil
-        debounce?.cancel(); debounce = nil
+        timer?.invalidate()
+        timer = nil
+        debounce?.cancel()
+        debounce = nil
         generation += 1
+        burstGeneration += 1
         messages = []
         lastIDs = []
         contactName = nil
@@ -78,13 +84,12 @@ final class MessageMonitor: ObservableObject {
         let token = generation
         let bridge = self.bridge
         accessibilityQueue.async { [weak self] in
-            let contact = bridge.currentContact()
-            let snapshot = contact == nil ? [] : bridge.recentMessages(limit: 20)
+            let snapshot = bridge.capture(limit: 20)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
-                guard let contact, contact == self.lockedContact else {
+                guard let contact = snapshot.contact, contact == self.lockedContact else {
                     self.stop()
                     self.status = "Conversation changed or WeChat did not respond — activate again when the chat is open."
                     return
@@ -94,44 +99,69 @@ final class MessageMonitor: ObservableObject {
         }
     }
 
-    private func processSnapshot(_ snapshot: [ChatMessage], contact: String) {
+    private func captureStatus(_ snapshot: WeChatSnapshot) -> String {
+        if !snapshot.messageListFound { return "Chat detected · message list not exposed" }
+        if snapshot.messages.isEmpty {
+            return snapshot.bubbleRowsFound > 0
+                ? "Message list detected · bubble text unavailable"
+                : "Message list detected · no visible chat bubbles"
+        }
+        return snapshot.messages.contains(where: { !$0.senderIdentified })
+            ? "Messages ready · sender unclear (manual analysis)"
+            : "Monitoring this conversation"
+    }
+
+    private func processSnapshot(_ snapshot: WeChatSnapshot, contact: String) {
         contactName = contact
-        messages = snapshot
-        if snapshot.isEmpty {
-            lastIDs = []
-            status = "Chat opened · WeChat exposed no message text"
+        guard !snapshot.messages.isEmpty else {
+            // Temporary AX failures must not erase the last good snapshot or make
+            // recovered old messages look like a newly received burst.
+            status = captureStatus(snapshot)
             return
         }
-        let ids = snapshot.map(\.id)
+        messages = snapshot.messages
+        let ids = snapshot.messages.map(\.id)
         guard ids != lastIDs else { return }
-        let added = newMessages(snapshot, old: lastIDs)
+        let added = newMessages(snapshot.messages, old: lastIDs)
         lastIDs = ids
-        guard !added.isEmpty else { status = "Monitoring this conversation"; return }
+
+        // An unanchored view change (including scrolling to earlier history)
+        // is not evidence of a newly received message.
+        guard !added.isEmpty else {
+            status = "Context updated · use Analyze for this view"
+            return
+        }
         let hasIncoming = added.contains(where: { $0.senderIdentified && !$0.isFromMe })
         let hasUnknown = added.contains(where: { !$0.senderIdentified })
-        guard hasIncoming || hasUnknown else { status = "Monitoring this conversation"; return }
-        scheduleBurst(contact: contact, canAutoAnalyze: hasIncoming && snapshot.allSatisfy(\.senderIdentified))
+        guard hasIncoming || hasUnknown else {
+            status = captureStatus(snapshot)
+            return
+        }
+        scheduleBurst(contact: contact, canAutoAnalyze: hasIncoming && snapshot.messages.allSatisfy(\.senderIdentified))
     }
 
     private func newMessages(_ current: [ChatMessage], old: [String]) -> [ChatMessage] {
-        if old.isEmpty { return current }
+        guard !old.isEmpty else { return [] }
         let ids = current.map(\.id)
         for length in stride(from: min(ids.count, old.count), through: 1, by: -1) {
-            if Array(old.suffix(length)) == Array(ids.prefix(length)) { return Array(current.dropFirst(length)) }
+            if Array(old.suffix(length)) == Array(ids.prefix(length)) {
+                return Array(current.dropFirst(length))
+            }
         }
-        return Array(current.suffix(1))
+        // No overlap is ambiguous: scroll/recycling/failed reads vs truly new.
+        return []
     }
 
     private func scheduleBurst(contact: String, canAutoAnalyze: Bool) {
-        generation += 1
-        let token = generation
+        burstGeneration += 1
+        let token = burstGeneration
         debounce?.cancel()
         status = "Waiting for the message burst to finish…"
         debounce = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard !Task.isCancelled, let self, self.isRunning, self.generation == token else { return }
+            guard !Task.isCancelled, let self, self.isRunning, self.burstGeneration == token else { return }
             self.status = canAutoAnalyze ? "Message ready · analyzing" : "Message ready · Analyze manually"
-            self.onBurst?(contact, self.messages.suffix(20).map { $0 }, canAutoAnalyze)
+            self.onBurst?(contact, Array(self.messages.suffix(20)), canAutoAnalyze)
         }
     }
 }
