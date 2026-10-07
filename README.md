@@ -65,12 +65,16 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor reads the currently selected WeChat window's recognized message list. It does not read WeChat's local database, infer chat content from arbitrary visible text, access chat history outside the visible/retrievable Accessibility tree, or automatically scroll older messages.
+The monitor locates the selected sidebar session and `chat_message_list` in a single bounded Accessibility walk, then reads only `chat_bubble_item_view` rows. It prefers each bubble's `AXTitle` (with a scoped descendant-text fallback), skips virtual placeholders and system/timestamp rows, and reads visible children where available. The **Refresh** button rereads the current view without navigating or scrolling WeChat. It does not read WeChat's database, infer chat content from arbitrary window text, access chat history outside the currently retrievable Accessibility tree, or automatically scroll older messages. If WeChat does not expose the bubble text, the app shows an explanatory status rather than guessing.
 
 ## Manual acceptance checklist
 
 - [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission.
-- [ ] With WeChat open to a direct conversation, verify the contact and latest visible messages appear.
+- [ ] With WeChat open to a direct conversation, verify the contact and actual bubble text appear (not sidebar previews, dates, system notices or contact details).
+- [ ] Press Refresh, scroll older messages manually, press Refresh again, and verify the displayed visible messages change without automatic analysis of older history.
+- [ ] Receive an identical repeat of a previous message; verify the displayed conversation and note any deduplication limitations.
+- [ ] Confirm an AX-unavailable view shows `message list not exposed` or `bubble text unavailable` rather than unrelated screen text.
+- [ ] Measure activation and Refresh latency on your installed WeChat version; exact timings depend on Accessibility response speed.
 - [ ] Activate in one conversation, switch to another, and verify monitoring stops and the local session clears.
 - [ ] Verify manual mode does not make requests until Analyze is clicked; opt into automatic analysis and verify only identified incoming messages trigger it.
 - [ ] Sign in with ChatGPT, select a model shown for that account, and confirm three distinct labeled candidates appear.
@@ -83,7 +87,7 @@ The monitor reads the currently selected WeChat window's recognized message list
 
 ## Known limitations
 
-- Accessibility structure varies by WeChat release. If message rows or sender identities are not exposed, visible text is marked uncertain and can only be sent through a manual Analyze action.
+- Accessibility structure varies by WeChat release. This patch specifically recognizes the `chat_message_list` and `chat_bubble_item_view` identifiers used by WeChat 4.x; a different UI hierarchy requires a privacy-safe AX structural diagnostic. Sender identities may not be provided at all, in which case the app labels speakers as uncertain and requires manual Analyze. A macOS/WeChat runtime test is required to validate extraction.
 - Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.
