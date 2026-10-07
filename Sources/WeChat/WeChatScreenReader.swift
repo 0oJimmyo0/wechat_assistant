@@ -29,6 +29,8 @@ struct VisibleWeChatSnapshot: Sendable {
     let messageObservationCount: Int
     let messageBounds: [CGRect]
     let rejectedMessageBounds: [CGRect]
+    let messageFingerprint: String?
+    let messageFrameUnchanged: Bool
 }
 
 struct VisionLayoutCalibration {
@@ -125,13 +127,13 @@ final class WeChatScreenReader {
     }
 
     func readMessages(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false,
-                      accurate: Bool = false) -> VisibleWeChatSnapshot {
+                      accurate: Bool = false, previousFingerprint: String? = nil) -> VisibleWeChatSnapshot {
         read(pid: pid, windowFrame: windowFrame, mode: accurate ? .messagesAccurate : .messagesFast,
-             forceFresh: forceFresh)
+             forceFresh: forceFresh, previousMessageFingerprint: previousFingerprint)
     }
 
     private func read(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
-                      forceFresh: Bool) -> VisibleWeChatSnapshot {
+                      forceFresh: Bool, previousMessageFingerprint: String? = nil) -> VisibleWeChatSnapshot {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
         cacheCondition.lock()
         while captureInProgress { cacheCondition.wait() }
@@ -147,7 +149,8 @@ final class WeChatScreenReader {
         // holding the cache lock. Other readers wait on the condition and can
         // never start a duplicate capture while these mutable window caches
         // are in use.
-        let result = capture(pid: pid, windowFrame: windowFrame, mode: mode, forceFresh: forceFresh)
+        let result = capture(pid: pid, windowFrame: windowFrame, mode: mode, forceFresh: forceFresh,
+                             previousMessageFingerprint: previousMessageFingerprint)
         cacheCondition.lock()
         if mode == .full {
             cachedKey = key
@@ -161,7 +164,8 @@ final class WeChatScreenReader {
     }
 
     private func capture(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
-                         forceFresh: Bool = true) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
+                         forceFresh: Bool = true,
+                         previousMessageFingerprint: String? = nil) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
         guard CGPreflightScreenCaptureAccess() else {
             return (emptySnapshot(pid: pid, crop: conversationCropRatio, state: .screenRecordingPermissionRequired), nil)
         }
@@ -198,6 +202,8 @@ final class WeChatScreenReader {
 
         var headerObservations: [VNRecognizedTextObservation] = []
         var messageObservations: [VNRecognizedTextObservation] = []
+        var messageFingerprint: String?
+        var messageFrameUnchanged = false
         let visionStarted = Date()
         var visionSucceeded = true
 
@@ -216,15 +222,22 @@ final class WeChatScreenReader {
         }
 
         if mode.readsMessages {
-            if let messageImage = crop(image, to: messageRegion) {
-                let request = VNRecognizeTextRequest()
-                request.recognitionLevel = mode.messageRecognitionLevel
-                request.usesLanguageCorrection = mode.messageRecognitionLevel == .accurate
-                request.recognitionLanguages = ["zh-Hans", "en-US"]
-                request.minimumTextHeight = 0.008
-                let messageSucceeded = (try? VNImageRequestHandler(cgImage: messageImage).perform([request])) != nil
-                visionSucceeded = visionSucceeded && messageSucceeded
-                messageObservations = request.results ?? []
+            if let messageImage = crop(image, to: messageRegion),
+               let fingerprint = perceptualFingerprint(messageImage) {
+                messageFingerprint = fingerprint
+                messageFrameUnchanged = previousMessageFingerprint.map {
+                    fingerprintDistance(fingerprint, $0) <= 0.015
+                } ?? false
+                if !messageFrameUnchanged {
+                    let request = VNRecognizeTextRequest()
+                    request.recognitionLevel = mode.messageRecognitionLevel
+                    request.usesLanguageCorrection = mode.messageRecognitionLevel == .accurate
+                    request.recognitionLanguages = ["zh-Hans", "en-US"]
+                    request.minimumTextHeight = 0.008
+                    let messageSucceeded = (try? VNImageRequestHandler(cgImage: messageImage).perform([request])) != nil
+                    visionSucceeded = visionSucceeded && messageSucceeded
+                    messageObservations = request.results ?? []
+                }
             } else {
                 visionSucceeded = false
             }
@@ -303,6 +316,8 @@ final class WeChatScreenReader {
             messageObservations: messageObservations.count,
             messageBounds: Array(messageBounds.suffix(50)),
             rejectedMessageBounds: rejectedMessageBounds,
+            messageFingerprint: messageFingerprint,
+            messageFrameUnchanged: messageFrameUnchanged,
             visionDurationMilliseconds: Int(Date().timeIntervalSince(visionStarted) * 1000)
         ), capturedWindow)
     }
@@ -445,7 +460,8 @@ final class WeChatScreenReader {
             ocrObservationCount: 0, headerObservationCount: 0, headerCandidates: [],
             acceptedTitleBounds: nil, acceptedTitleConfidence: nil,
             titleIdentity: nil, titleRejectedAsMessageCount: 0, titleRejectedAsSentenceCount: 0,
-            messageObservationCount: 0, messageBounds: [], rejectedMessageBounds: []
+            messageObservationCount: 0, messageBounds: [], rejectedMessageBounds: [],
+            messageFingerprint: nil, messageFrameUnchanged: false
         )
     }
 
@@ -456,6 +472,7 @@ final class WeChatScreenReader {
         titleIdentity: VisionConversationIdentity?, titleRejectedAsMessageCount: Int,
         titleRejectedAsSentenceCount: Int,
         messageObservations: Int, messageBounds: [CGRect], rejectedMessageBounds: [CGRect],
+        messageFingerprint: String? = nil, messageFrameUnchanged: Bool = false,
         visionDurationMilliseconds: Int = 0
     ) -> VisibleWeChatSnapshot {
         VisibleWeChatSnapshot(
@@ -473,8 +490,40 @@ final class WeChatScreenReader {
             titleIdentity: titleIdentity, titleRejectedAsMessageCount: titleRejectedAsMessageCount,
             titleRejectedAsSentenceCount: titleRejectedAsSentenceCount,
             messageObservationCount: messageObservations,
-            messageBounds: messageBounds, rejectedMessageBounds: rejectedMessageBounds
+            messageBounds: messageBounds, rejectedMessageBounds: rejectedMessageBounds,
+            messageFingerprint: messageFingerprint, messageFrameUnchanged: messageFrameUnchanged
         )
+    }
+
+    private func perceptualFingerprint(_ image: CGImage) -> String? {
+        let width = 16
+        let height = 16
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        let rendered = pixels.withUnsafeMutableBytes { storage -> Bool in
+            guard let context = CGContext(
+                data: storage.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return false }
+            context.interpolationQuality = .low
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { return nil }
+        return Data(pixels).base64EncodedString()
+    }
+
+    private func fingerprintDistance(_ lhs: String, _ rhs: String) -> Double {
+        guard let left = Data(base64Encoded: lhs), let right = Data(base64Encoded: rhs),
+              left.count == right.count, !left.isEmpty else { return .infinity }
+        let totalDifference = zip(left, right).reduce(0) { partial, pair in
+            partial + abs(Int(pair.0) - Int(pair.1))
+        }
+        return Double(totalDifference) / (Double(left.count) * 255)
     }
 
     private func rankHeaderCandidates(_ observations: [VNRecognizedTextObservation], region: CGRect) -> [RankedHeaderCandidate] {

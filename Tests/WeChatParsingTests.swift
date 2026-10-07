@@ -82,6 +82,16 @@ enum WeChatParsingTests {
         let twenty = ChatHistoryMerger.merge(existing: nineteen, visible: thirdOlderViewport, limit: 100)
         expect(existing.count == 7 && twenty.count == 20 && twenty.first?.text == "M1" && twenty.last?.text == "M20",
                "simulated bounded overlap expands a 7-message viewport to 20 unique rows")
+        let fullHistory = (1...20).map { visionMessage("M\($0)", order: $0) }
+        expect(ChatHistoryMerger.classify(existing: fullHistory,
+                                          visible: (15...20).map { visionMessage("M\($0)", order: $0 - 15) }).state == .liveTail,
+               "a viewport overlapping the history tail is live")
+        expect(ChatHistoryMerger.classify(existing: fullHistory,
+                                          visible: (4...8).map { visionMessage("M\($0)", order: $0 - 4) }).state == .historical,
+               "a viewport overlapping only an interior history segment is historical")
+        expect(ChatHistoryMerger.classify(existing: fullHistory,
+                                          visible: [visionMessage("Unrelated", order: 0)]).state == .uncertain,
+               "a viewport with no reliable overlap is uncertain")
         print("All WeChat parsing checks passed.")
     }
 

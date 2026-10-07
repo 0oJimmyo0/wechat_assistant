@@ -3,7 +3,8 @@ import ApplicationServices
 
 enum MessageReadResult: Sendable {
     case messageListUnavailable(treeCollapsed: Bool, visionState: VisionCaptureState?)
-    case messageListFound(messages: [ChatMessage], renderedRows: Int, bubbleRows: Int, placeholders: Int, isVision: Bool)
+    case messageListFound(messages: [ChatMessage], renderedRows: Int, bubbleRows: Int, placeholders: Int, isVision: Bool, fingerprint: String?)
+    case messageListUnchanged(fingerprint: String)
 }
 
 enum OlderContextScrollResult: Sendable {
@@ -27,6 +28,11 @@ private enum OlderContextIdentityCheck {
     case matches
     case changed
     case uncertain
+}
+
+private enum ChatScrollDirection: Equatable {
+    case older
+    case newer
 }
 
 struct WeChatConversationDetection: Sendable {
@@ -446,12 +452,14 @@ final class WeChatBridge: @unchecked Sendable {
         )
     }
 
-    func readMessages(limit: Int = 50, accurateVision: Bool = false) -> MessageReadResult {
+    func readMessages(limit: Int = 50, accurateVision: Bool = false, forceFresh: Bool = true,
+                      previousFingerprint: String? = nil) -> MessageReadResult {
         guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
         guard let app = weChatApplication() else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
         let backend = backendState(for: app.processIdentifier, window: window).backend
         if backend == .vision {
-            return readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: true) ??
+            return readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: true,
+                                       forceFresh: forceFresh, previousFingerprint: previousFingerprint) ??
                 .messageListUnavailable(treeCollapsed: true, visionState: nil)
         }
 
@@ -472,7 +480,8 @@ final class WeChatBridge: @unchecked Sendable {
         // 3. Conservative older-client fallback: only inspect AXLists under a
         // large right-side scroll area when the chat composer is also present.
         guard hasConversationComposer(in: window) else {
-            if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false) { return result }
+            if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false,
+                                                forceFresh: forceFresh, previousFingerprint: previousFingerprint) { return result }
             return .messageListUnavailable(treeCollapsed: false, visionState: nil)
         }
         let windowFrame = frame(window)
@@ -487,7 +496,8 @@ final class WeChatBridge: @unchecked Sendable {
                 return readRows(in: list, limit: limit)
             }
         }
-        if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false) { return result }
+        if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false,
+                                            forceFresh: forceFresh, previousFingerprint: previousFingerprint) { return result }
         return .messageListUnavailable(treeCollapsed: false, visionState: nil)
     }
 
@@ -496,6 +506,27 @@ final class WeChatBridge: @unchecked Sendable {
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
         cancellation: MonitorWorkCancellation?
+    ) -> OlderContextScrollResult {
+        scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
+                                               cancellation: cancellation, direction: .older)
+    }
+
+    func scrollMessagePaneDownwardIfConversationMatches(
+        contact: String,
+        identity: VisionConversationIdentity?,
+        fraction: CGFloat,
+        cancellation: MonitorWorkCancellation?
+    ) -> OlderContextScrollResult {
+        scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
+                                               cancellation: cancellation, direction: .newer)
+    }
+
+    private func scrollMessagePaneIfConversationMatches(
+        contact: String,
+        identity: VisionConversationIdentity?,
+        fraction: CGFloat,
+        cancellation: MonitorWorkCancellation?,
+        direction: ChatScrollDirection
     ) -> OlderContextScrollResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
         let detection = detectCurrentConversation(forceFreshVision: true)
@@ -519,11 +550,12 @@ final class WeChatBridge: @unchecked Sendable {
         )
         guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
         let amount = Int32(min(500, max(120, windowFrame.height * canvasHeight * min(0.60, max(0.40, fraction)))))
-        // Quartz scroll-wheel deltaY > 0 means wheel-up (older messages in a
-        // conventional chat transcript). Posting to the WeChat PID targets its
-        // window without clicking or changing the selected conversation.
+        // Positive vertical wheel delta scrolls toward older transcript rows;
+        // negative delta returns toward the newest rows. Posting to the WeChat
+        // PID targets its window without clicking or changing the selection.
+        let signedAmount = direction == .older ? amount : -amount
         guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-                                  wheel1: amount, wheel2: 0, wheel3: 0) else { return .scrollUnavailable }
+                                  wheel1: signedAmount, wheel2: 0, wheel3: 0) else { return .scrollUnavailable }
         event.location = location
         event.postToPid(app.processIdentifier)
         return .scrolled
@@ -568,10 +600,12 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func readVisibleMessages(in window: AXUIElement, limit: Int, accurate: Bool,
-                                     treeCollapsed: Bool) -> MessageReadResult? {
+                                     treeCollapsed: Bool, forceFresh: Bool = true,
+                                     previousFingerprint: String? = nil) -> MessageReadResult? {
         guard let app = weChatApplication() else { return nil }
         let snapshot = WeChatScreenReader.shared.readMessages(
-            pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), accurate: accurate
+            pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08),
+            forceFresh: forceFresh, accurate: accurate, previousFingerprint: previousFingerprint
         )
         guard snapshot.captureSucceeded else {
             return .messageListUnavailable(
@@ -579,13 +613,17 @@ final class WeChatBridge: @unchecked Sendable {
                 visionState: snapshot.captureState
             )
         }
+        if snapshot.messageFrameUnchanged, let fingerprint = snapshot.messageFingerprint {
+            return .messageListUnchanged(fingerprint: fingerprint)
+        }
         let messages = Array(snapshot.messages.suffix(limit))
         return .messageListFound(
             messages: messages,
             renderedRows: snapshot.ocrObservationCount,
             bubbleRows: messages.count,
             placeholders: 0,
-            isVision: true
+            isVision: true,
+            fingerprint: snapshot.messageFingerprint
         )
     }
 
@@ -646,7 +684,8 @@ final class WeChatBridge: @unchecked Sendable {
             renderedRows: rows.count,
             bubbleRows: bubbleRows,
             placeholders: placeholders,
-            isVision: false
+            isVision: false,
+            fingerprint: nil
         )
     }
 

@@ -54,10 +54,10 @@ struct ReplySidebarView: View {
                     Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.everydayModel) } label: {
                         Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent).disabled(isGenerating || monitor.isLoadingOlderContext || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
+                    }.buttonStyle(.borderedProminent).disabled(isGenerating || monitor.isLoadingOlderContext || !monitor.canAnalyzeManually || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
                     Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.carefulModel) } label: {
                         Label("Regenerate carefully", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
-                    }.buttonStyle(.bordered).disabled(isGenerating || monitor.isLoadingOlderContext || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
+                    }.buttonStyle(.bordered).disabled(isGenerating || monitor.isLoadingOlderContext || !monitor.canAnalyzeManually || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
                 }
                 .padding(16)
             }
@@ -132,7 +132,7 @@ struct ReplySidebarView: View {
         let visibleMessages = Array(monitor.messages.suffix(displayedMessageLimit))
         return VStack(alignment: .leading, spacing: 8) {
             sectionLabel("RECENT MESSAGES · LAST \(visibleMessages.count) OF \(monitor.messages.count)")
-            if monitor.isRunning && visibleMessages.count < displayedMessageLimit && monitor.canLoadOlderContext {
+            if monitor.isRunning && visibleMessages.count < displayedMessageLimit && monitor.canLoadOlderContext && monitor.viewportState == .liveTail {
                 Button {
                     monitor.loadOlderContext()
                 } label: {
@@ -143,8 +143,21 @@ struct ReplySidebarView: View {
                 .controlSize(.small)
                 .disabled(monitor.isLoadingOlderContext)
             }
+            if monitor.isRunning && monitor.viewportState != .liveTail {
+                Button {
+                    monitor.followLatest()
+                } label: {
+                    Label(monitor.isReturningToLatest ? "Returning to latest…" : "Follow latest",
+                          systemImage: "arrow.down.to.line")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(monitor.isLoadingOlderContext || monitor.isFollowingLatest)
+            }
             if monitor.isLoadingOlderContext {
-                Text("Loading older context… \(monitor.olderContextProgress ?? "0 / 20")")
+                Text(monitor.isReturningToLatest
+                     ? "Returning to latest messages…"
+                     : "Loading older context… \(monitor.olderContextProgress ?? "0 / 20")")
                     .font(.caption2).foregroundStyle(.secondary)
             } else if let olderContextStatus = monitor.olderContextStatus {
                 Text(olderContextStatus)
@@ -233,7 +246,7 @@ struct ReplySidebarView: View {
     }
 
     private func generate(context: [ChatMessage], model: String) {
-        guard auth.isSignedIn, !isGenerating, !monitor.isLoadingOlderContext else { return }
+        guard auth.isSignedIn, !isGenerating, !monitor.isLoadingOlderContext, monitor.canAnalyzeManually else { return }
         guard !model.isEmpty else { errorMessage = "Choose an available model in settings."; return }
         let requestID = UUID()
         generationID = requestID

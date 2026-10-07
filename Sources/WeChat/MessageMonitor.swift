@@ -6,6 +6,22 @@ private enum SnapshotPurpose: Equatable {
     case historicalBackfill
 }
 
+enum ConversationIdentityState: String, Sendable {
+    case confirmed
+    case temporarilyUncertain
+    case candidateChange
+    case changed
+}
+
+private enum LiveTailRestoreResult: Equatable {
+    case reached
+    case notReached
+    case conversationChanged
+    case identityUncertain
+    case captureFailed
+    case cancelled
+}
+
 final class MonitorWorkCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -24,6 +40,11 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var olderContextProgress: String?
     @Published private(set) var olderContextStatus: String?
     @Published private(set) var canLoadOlderContext = true
+    @Published private(set) var viewportState: ChatViewportState = .uncertain
+    @Published private(set) var conversationIdentityState: ConversationIdentityState = .temporarilyUncertain
+    @Published private(set) var isFollowingLatest = false
+    @Published private(set) var hasUnverifiedMessageChanges = false
+    @Published private(set) var isReturningToLatest = false
     var onBurst: ((String, [ChatMessage], Bool) -> Void)?
     var onDeactivated: (() -> Void)?
 
@@ -32,6 +53,8 @@ final class MessageMonitor: ObservableObject {
     private var timer: Timer?
     private var debounce: Task<Void, Never>?
     private var lastIDs: [String] = []
+    private var lastMessageFingerprint: String?
+    private var lastSemanticMessageKeys: [String] = []
     private var contextHistory: [ChatMessage] = []
     private var lockedContact: String?
     private var generation = 0
@@ -47,6 +70,14 @@ final class MessageMonitor: ObservableObject {
     private var stableVisionIdentity: VisionConversationIdentity?
     private var candidateVisionIdentity: VisionConversationIdentity?
     private var titleConsensusCount = 0
+    private var lastTitleValidationUptime: TimeInterval = 0
+    private var pendingAutomaticBurst = false
+    private var messageCaptureCount = 0
+    private var messageOCRRunCount = 0
+    private var unchangedFrameCount = 0
+    private var latestSnapshotBlockCount = 0
+    private var latestTailOverlap = 0
+    private var latestHistoricalOverlap = 0
     private let unidentifiedPollLimit = 5
     private let accessibilitySwitchConfirmationCount = 2
     private let visionSwitchConfirmationCount = 3
@@ -57,11 +88,14 @@ final class MessageMonitor: ObservableObject {
     private let maxScrollAttempts = 5
     private let maxNoProgressAttempts = 2
     private let olderContextTimeout: TimeInterval = 9
+    private let latestRestoreTimeout: TimeInterval = 4
     private let olderContextScrollFraction: CGFloat = 0.5
     private let olderContextRenderDelay: UInt64 = 300_000_000
+    private let titleValidationInterval: TimeInterval = 4
+    private let identityMissStopLimit = 5
     private var lastTitleConsensusDiagnostic = "Title consensus: not run"
     private var lastOlderContextDiagnostic = "Older-context load: not run"
-    private let pollingInterval: TimeInterval = 1
+    private let pollingInterval: TimeInterval = 0.8
 
     var visionIdentityDiagnostic: String {
         [
@@ -72,8 +106,32 @@ final class MessageMonitor: ObservableObject {
             "Consecutive title misses: \(unidentifiedPolls)",
             lastTitleConsensusDiagnostic,
             lastOlderContextDiagnostic,
+            realtimeDiagnostic,
             lastActivationDiagnostic
         ].joined(separator: "\n")
+    }
+
+    private var realtimeDiagnostic: String {
+        let age = lastTitleValidationUptime > 0
+            ? String(format: "%.1f sec", ProcessInfo.processInfo.systemUptime - lastTitleValidationUptime)
+            : "unavailable"
+        return [
+            "Realtime monitor:",
+            "viewport: \(viewportState.rawValue)",
+            "message captures: \(messageCaptureCount)",
+            "message OCR runs: \(messageOCRRunCount)",
+            "unchanged frames skipped: \(unchangedFrameCount)",
+            "latest snapshot blocks: \(latestSnapshotBlockCount)",
+            "history size: \(contextHistory.count)",
+            "tail overlap: \(latestTailOverlap)",
+            "historical overlap: \(latestHistoricalOverlap)",
+            "title validation age: \(age)",
+            "conversation identity: \(conversationIdentityState.rawValue)"
+        ].joined(separator: "\n")
+    }
+
+    var canAnalyzeManually: Bool {
+        conversationIdentityState == .confirmed && !hasUnverifiedMessageChanges
     }
 
     func start() {
@@ -88,10 +146,25 @@ final class MessageMonitor: ObservableObject {
         messages = []
         contextHistory = []
         isLoadingOlderContext = false
+        isFollowingLatest = false
+        isReturningToLatest = false
         olderContextProgress = nil
         olderContextStatus = nil
         canLoadOlderContext = true
         lastIDs = []
+        lastMessageFingerprint = nil
+        lastSemanticMessageKeys = []
+        viewportState = .uncertain
+        conversationIdentityState = .temporarilyUncertain
+        lastTitleValidationUptime = 0
+        hasUnverifiedMessageChanges = false
+        pendingAutomaticBurst = false
+        messageCaptureCount = 0
+        messageOCRRunCount = 0
+        unchangedFrameCount = 0
+        latestSnapshotBlockCount = 0
+        latestTailOverlap = 0
+        latestHistoricalOverlap = 0
         stableVisionIdentity = nil
         candidateVisionIdentity = nil
         titleConsensusCount = 0
@@ -215,6 +288,8 @@ final class MessageMonitor: ObservableObject {
                 self.lockedContact = contact
                 self.isUsingVision = detection.visionSnapshot != nil
                 self.stableVisionIdentity = detection.visionSnapshot?.titleIdentity
+                self.conversationIdentityState = .confirmed
+                self.lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
                 self.candidateVisionIdentity = nil
                 self.titleConsensusCount = consensusCount
                 self.isRunning = true
@@ -250,6 +325,8 @@ final class MessageMonitor: ObservableObject {
         isCheckingConversation = false
         isPolling = false
         isLoadingOlderContext = false
+        isFollowingLatest = false
+        isReturningToLatest = false
         olderContextProgress = nil
         olderContextStatus = nil
         canLoadOlderContext = true
@@ -269,6 +346,12 @@ final class MessageMonitor: ObservableObject {
         messages = []
         contextHistory = []
         lastIDs = []
+        lastMessageFingerprint = nil
+        lastSemanticMessageKeys = []
+        viewportState = .uncertain
+        conversationIdentityState = .temporarilyUncertain
+        hasUnverifiedMessageChanges = false
+        pendingAutomaticBurst = false
         contactName = nil
         lockedContact = nil
         isUsingVision = false
@@ -280,6 +363,7 @@ final class MessageMonitor: ObservableObject {
 
     func loadOlderContext() {
         guard isRunning, !isLoadingOlderContext, !isPolling, canLoadOlderContext,
+              viewportState == .liveTail,
               contextHistory.count < targetContextCount,
               let contact = lockedContact else { return }
         let originalIdentity = stableVisionIdentity
@@ -326,6 +410,7 @@ final class MessageMonitor: ObservableObject {
         var captureFailure = false
         var timedOut = false
         var reachedEnd = false
+        var restoredToTail = false
 
         while isRunning, generation == token, contextHistory.count < targetContextCount,
               attempts < maxScrollAttempts, ProcessInfo.processInfo.systemUptime < deadline {
@@ -377,7 +462,14 @@ final class MessageMonitor: ObservableObject {
                 switch result {
                 case .messageListUnavailable:
                     captureFailure = true
-                case .messageListFound(let snapshot, _, _, _, _):
+                case .messageListUnchanged(let fingerprint):
+                    lastMessageFingerprint = fingerprint
+                    noProgressAttempts += 1
+                case .messageListFound(let snapshot, _, _, _, _, let fingerprint):
+                    lastMessageFingerprint = fingerprint
+                    conversationIdentityState = .confirmed
+                    lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
+                    hasUnverifiedMessageChanges = false
                     let beforeCount = contextHistory.count
                     processSnapshot(snapshot, contact: contact, purpose: .historicalBackfill)
                     let afterCount = contextHistory.count
@@ -402,6 +494,28 @@ final class MessageMonitor: ObservableObject {
         }
 
         guard isRunning, generation == token else { return }
+        if !identityFailure, attempts > 0 {
+            isReturningToLatest = true
+            olderContextStatus = "Returning to latest messages…"
+            let restoreResult = await restoreToLatest(bridge: bridge, contact: contact, identity: identity,
+                                                      cancellation: cancellation, generation: token)
+            guard isRunning, generation == token else { return }
+            switch restoreResult {
+            case .reached:
+                restoredToTail = true
+            case .conversationChanged, .identityUncertain:
+                identityFailure = true
+            case .captureFailed:
+                captureFailure = true
+            case .notReached:
+                break
+            case .cancelled:
+                return
+            }
+        } else if viewportState == .liveTail {
+            restoredToTail = true
+        }
+        isReturningToLatest = false
         let endingCount = contextHistory.count
         let elapsedMilliseconds = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
         let newCount = max(0, endingCount - startingCount)
@@ -410,14 +524,14 @@ final class MessageMonitor: ObservableObject {
             canLoadOlderContext = false
         } else if captureFailure {
             olderContextStatus = "Could not read older messages from the WeChat window."
-        } else if endingCount >= targetContextCount {
-            olderContextStatus = "Loaded \(endingCount) messages. WeChat is scrolled to older messages."
+        } else if restoredToTail {
+            olderContextStatus = "\(endingCount) captured · live monitoring resumed"
         } else if reachedEnd || noProgressAttempts >= maxNoProgressAttempts {
-            olderContextStatus = "Loaded \(endingCount) messages. No additional older messages could be matched. WeChat is scrolled to older messages."
+            olderContextStatus = "\(endingCount) captured · viewing older history; live message tracking paused"
         } else if timedOut || attempts >= maxScrollAttempts || ProcessInfo.processInfo.systemUptime >= deadline {
-            olderContextStatus = "Loaded \(endingCount) messages. Stopped after the bounded loading limit. WeChat is scrolled to older messages."
+            olderContextStatus = "\(endingCount) captured · viewing older history; live message tracking paused"
         } else {
-            olderContextStatus = "Loaded \(endingCount) messages. WeChat is scrolled to older messages."
+            olderContextStatus = "\(endingCount) captured · viewing older history; live message tracking paused"
         }
         lastOlderContextDiagnostic = [
             "Older-context load:",
@@ -438,6 +552,121 @@ final class MessageMonitor: ObservableObject {
         }
     }
 
+    func followLatest() {
+        guard isRunning, !isLoadingOlderContext, !isPolling, viewportState != .liveTail,
+              let contact = lockedContact else { return }
+        timer?.invalidate()
+        timer = nil
+        debounce?.cancel()
+        debounce = nil
+        generation += 1
+        isLoadingOlderContext = true
+        isFollowingLatest = true
+        isReturningToLatest = true
+        olderContextStatus = nil
+        let token = generation
+        let bridge = self.bridge
+        let identity = stableVisionIdentity
+        let cancellation = sessionCancellation
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.restoreToLatest(bridge: bridge, contact: contact, identity: identity,
+                                                    cancellation: cancellation, generation: token)
+            guard self.isRunning, self.generation == token else { return }
+            self.isReturningToLatest = false
+            self.isFollowingLatest = false
+            self.isLoadingOlderContext = false
+            if result == .reached {
+                self.olderContextStatus = "\(self.contextHistory.count) captured · live monitoring resumed"
+                self.status = "Live monitoring resumed"
+            } else {
+                if result == .conversationChanged || result == .identityUncertain {
+                    self.conversationIdentityState = .temporarilyUncertain
+                }
+                self.viewportState = .historical
+                self.olderContextStatus = "\(self.contextHistory.count) captured · viewing older history; live message tracking paused"
+                self.status = "Viewing older messages · live incoming tracking paused"
+            }
+            self.timer = Timer.scheduledTimer(withTimeInterval: self.pollingInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.poll() }
+            }
+        }
+    }
+
+    private func restoreToLatest(
+        bridge: WeChatBridge,
+        contact: String,
+        identity: VisionConversationIdentity?,
+        cancellation: MonitorWorkCancellation?,
+        generation token: Int
+    ) async -> LiveTailRestoreResult {
+        isReturningToLatest = true
+        let deadline = ProcessInfo.processInfo.systemUptime + latestRestoreTimeout
+        for _ in 0..<maxScrollAttempts {
+            guard isRunning, generation == token else { return .cancelled }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { return .notReached }
+            let scrollResult = await performAccessibilityOperation {
+                bridge.scrollMessagePaneDownwardIfConversationMatches(
+                    contact: contact, identity: identity, fraction: self.olderContextScrollFraction,
+                    cancellation: cancellation
+                )
+            }
+            guard isRunning, generation == token else { return .cancelled }
+            switch scrollResult {
+            case .scrolled: break
+            case .conversationChanged: return .conversationChanged
+            case .identityUncertain: return .identityUncertain
+            case .windowUnavailable, .scrollUnavailable: return .captureFailed
+            case .cancelled: return .cancelled
+            }
+            do { try await Task.sleep(nanoseconds: olderContextRenderDelay) }
+            catch { return .cancelled }
+            guard isRunning, generation == token else { return .cancelled }
+            let readResult = await performAccessibilityOperation {
+                bridge.readMessagesIfConversationMatches(
+                    contact: contact, identity: identity, accurate: false, cancellation: cancellation
+                )
+            }
+            guard isRunning, generation == token else { return .cancelled }
+            switch readResult {
+            case .conversationChanged: return .conversationChanged
+            case .identityUncertain: return .identityUncertain
+            case .captureUnavailable: return .captureFailed
+            case .cancelled: return .cancelled
+            case .messages(let result):
+                switch result {
+                case .messageListUnavailable: return .captureFailed
+                case .messageListUnchanged(let fingerprint):
+                    lastMessageFingerprint = fingerprint
+                    unchangedFrameCount += 1
+                case .messageListFound(let snapshot, _, _, _, _, let fingerprint):
+                    messageCaptureCount += 1
+                    messageOCRRunCount += 1
+                    latestSnapshotBlockCount = snapshot.count
+                    lastMessageFingerprint = fingerprint
+                    lastSemanticMessageKeys = snapshot.map(contextKey)
+                    let classification = contextHistory.isEmpty
+                        ? ChatViewportClassification(state: .liveTail, tailOverlap: snapshot.count, historicalOverlap: 0)
+                        : ChatHistoryMerger.classify(existing: contextHistory, visible: snapshot)
+                    viewportState = classification.state
+                    latestTailOverlap = classification.tailOverlap
+                    latestHistoricalOverlap = classification.historicalOverlap
+                    if classification.state == .liveTail {
+                        conversationIdentityState = .confirmed
+                        lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
+                        hasUnverifiedMessageChanges = false
+                        processSnapshot(snapshot, contact: contact, purpose: .historicalBackfill)
+                        return .reached
+                    }
+                    if classification.state == .historical {
+                        processSnapshot(snapshot, contact: contact, purpose: .historicalBackfill)
+                    }
+                }
+            }
+        }
+        return .notReached
+    }
+
     private func performAccessibilityOperation<T: Sendable>(
         _ operation: @escaping @Sendable () -> T
     ) async -> T {
@@ -454,123 +683,173 @@ final class MessageMonitor: ObservableObject {
         isPolling = true
         let token = generation
         let bridge = self.bridge
-        let lockedContact = self.lockedContact
-        let lockedVisionIdentity = self.stableVisionIdentity
-        let cancellation = self.sessionCancellation
-        let minimumTitleConfidence = self.minimumVisionSwitchTitleConfidence
+        let cancellation = sessionCancellation
+        let shouldValidateTitle = lastTitleValidationUptime == 0 ||
+            ProcessInfo.processInfo.systemUptime - lastTitleValidationUptime >= titleValidationInterval
+        let previousFingerprint = lastMessageFingerprint
+        let useVision = isUsingVision
         accessibilityQueue.async { [weak self] in
-            let detection = bridge.detectCurrentConversation()
+            let detection = shouldValidateTitle ? bridge.detectCurrentConversation(forceFreshVision: true) : nil
             guard cancellation?.isCancelled != true else { return }
-            let contact: String?
-            if let vision = detection.visionSnapshot {
-                contact = (vision.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence
-                    ? detection.contact
-                    : nil
-            } else {
-                contact = lockedVisionIdentity == nil ? detection.contact : nil
-            }
-            let contactsMatch = contact.map { detected in
-                guard let lockedContact else { return false }
-                guard WeChatParsing.conversationIdentityKey(detected) == WeChatParsing.conversationIdentityKey(lockedContact) else { return false }
-                if let lockedVisionIdentity {
-                    guard let newIdentity = detection.visionSnapshot?.titleIdentity else { return false }
-                    return lockedVisionIdentity.isSpatiallyConsistent(with: newIdentity)
-                }
-                return true
-            } ?? false
+            // Message capture is independent of title OCR. Vision always captures a fresh
+            // frame; its perceptual fingerprint can skip text recognition on unchanged pixels.
+            let result = bridge.readMessages(
+                limit: 50,
+                accurateVision: false,
+                forceFresh: true,
+                previousFingerprint: useVision ? previousFingerprint : nil
+            )
             guard cancellation?.isCancelled != true else { return }
-            let result = contactsMatch ? bridge.readMessages(limit: 50, accurateVision: false) : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
-                guard let contact, !contact.isEmpty else {
-                    self.unidentifiedPolls += 1
-                    self.candidateContact = nil
-                    self.candidateContactPolls = 0
-                    self.candidateVisionIdentity = nil
-                    self.titleConsensusCount = 0
-                    if self.unidentifiedPolls >= self.unidentifiedPollLimit {
-                        let failureStatus = self.detectionFailureStatus(detection)
-                        self.stop()
-                        self.status = failureStatus
-                    } else {
-                        self.status = "Verifying conversation… (\(self.unidentifiedPolls)/\(self.unidentifiedPollLimit))"
-                    }
-                    return
+                self.messageCaptureCount += 1
+                let identityConfirmedThisPoll: Bool
+                if let detection {
+                    identityConfirmedThisPoll = self.applyConversationIdentityObservation(detection)
+                    guard self.isRunning, self.generation == token else { return }
+                } else {
+                    identityConfirmedThisPoll = false
                 }
 
-                let matchesLockedTitle = self.lockedContact.map {
-                    self.conversationKey(contact) == self.conversationKey($0)
-                } ?? false
-                let matchesLockedPosition: Bool
-                if let stableIdentity = self.stableVisionIdentity, detection.visionSnapshot != nil {
-                    matchesLockedPosition = detection.visionSnapshot?.titleIdentity.map {
-                        stableIdentity.isSpatiallyConsistent(with: $0)
-                    } ?? false
-                } else {
-                    matchesLockedPosition = self.stableVisionIdentity == nil
-                }
-                guard matchesLockedTitle && matchesLockedPosition else {
-                    let incomingKey = self.conversationKey(contact)
-                    let incomingIdentity = detection.visionSnapshot?.titleIdentity
-                    let sameCandidateText = self.candidateContact.map {
-                        self.conversationKey($0) == incomingKey
-                    } ?? false
-                    let sameCandidatePosition: Bool
-                    if let current = self.candidateVisionIdentity, let incomingIdentity {
-                        sameCandidatePosition = current.isSpatiallyConsistent(with: incomingIdentity)
-                    } else {
-                        sameCandidatePosition = self.candidateVisionIdentity == nil && incomingIdentity == nil
-                    }
-                    if sameCandidateText && sameCandidatePosition {
-                        self.candidateContactPolls += 1
-                    } else {
-                        self.candidateContact = contact
-                        self.candidateContactPolls = 1
-                        self.candidateVisionIdentity = incomingIdentity
-                    }
-                    self.titleConsensusCount = self.candidateContactPolls
-                    let requiredCount = detection.visionSnapshot == nil
-                        ? self.accessibilitySwitchConfirmationCount
-                        : self.visionSwitchConfirmationCount
-                    if self.candidateContactPolls >= requiredCount {
-                        self.stop()
-                        self.status = "Conversation changed. Activate again in the chat you want to monitor."
-                    } else {
-                        self.status = "Checking a possible conversation change… (\(self.candidateContactPolls)/\(requiredCount))"
-                    }
-                    return
-                }
-                self.unidentifiedPolls = 0
-                self.candidateContact = nil
-                self.candidateContactPolls = 0
-                self.candidateVisionIdentity = nil
-                self.titleConsensusCount = self.stableVisionIdentity == nil ? 0 : 3
-                self.isUsingVision = self.isUsingVision || detection.visionSnapshot != nil
-                guard let result else { return }
                 switch result {
                 case .messageListUnavailable(let collapsed, let visionState):
                     self.requestScreenCaptureAccessIfNeeded(visionState)
-                    self.messages = self.contextHistory
                     self.status = visionState.map(self.visionCaptureFailureStatus) ?? (collapsed
                         ? self.collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                         : "Conversation detected, but message list is unavailable")
-                case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _, let isVision):
+                    return
+                case .messageListUnchanged(let fingerprint):
+                    self.lastMessageFingerprint = fingerprint
+                    self.unchangedFrameCount += 1
+                    self.finishPendingAutomaticBurstIfSafe(identityConfirmedThisPoll: identityConfirmedThisPoll)
+                    return
+                case .messageListFound(let snapshot, _, _, _, let isVision, let fingerprint):
                     self.isUsingVision = self.isUsingVision || isVision
-                    guard !snapshot.isEmpty else {
-                        self.messages = self.contextHistory
-                        self.status = isVision
-                            ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision found \(renderedRows) text observations; 0 passed chat-message filtering")
-                            : (renderedRows == 0 || bubbleRows == 0
-                            ? "Message list found, but no rendered message rows are available"
-                            : "Message rows found, but message text is unavailable")
+                    self.messageOCRRunCount += 1
+                    self.latestSnapshotBlockCount = snapshot.count
+                    if isVision {
+                        self.lastMessageFingerprint = fingerprint
+                    } else {
+                        let keys = snapshot.map(self.contextKey)
+                        guard keys != self.lastSemanticMessageKeys else {
+                            self.unchangedFrameCount += 1
+                            self.finishPendingAutomaticBurstIfSafe(identityConfirmedThisPoll: identityConfirmedThisPoll)
+                            return
+                        }
+                        self.lastSemanticMessageKeys = keys
+                    }
+                    if !identityConfirmedThisPoll {
+                        self.hasUnverifiedMessageChanges = true
+                    }
+                    if self.conversationIdentityState == .candidateChange {
                         return
                     }
-                    self.processSnapshot(snapshot, contact: contact, purpose: .livePolling)
+                    self.processSnapshot(snapshot, contact: self.lockedContact ?? "", purpose: .livePolling)
+                    self.finishPendingAutomaticBurstIfSafe(identityConfirmedThisPoll: identityConfirmedThisPoll)
                 }
             }
         }
+    }
+
+    @discardableResult
+    private func applyConversationIdentityObservation(_ detection: WeChatConversationDetection) -> Bool {
+        lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
+        let acceptedConfidence = detection.visionSnapshot?.acceptedTitleConfidence ??
+            (detection.visionSnapshot == nil ? 1 : 0)
+        guard detection.windowFound,
+              let detectedContact = detection.contact,
+              !detectedContact.isEmpty,
+              acceptedConfidence >= minimumVisionSwitchTitleConfidence else {
+            conversationIdentityState = .temporarilyUncertain
+            unidentifiedPolls += 1
+            candidateContact = nil
+            candidateContactPolls = 0
+            candidateVisionIdentity = nil
+            titleConsensusCount = 0
+            if unidentifiedPolls >= identityMissStopLimit {
+                let failureStatus = detectionFailureStatus(detection)
+                stop()
+                status = failureStatus
+            } else {
+                status = "Conversation identity temporarily uncertain · local capture continues"
+            }
+            return false
+        }
+
+        let matchesName = lockedContact.map {
+            conversationKey(detectedContact) == conversationKey($0)
+        } ?? false
+        let matchesGeometry: Bool
+        if let stableIdentity = stableVisionIdentity {
+            matchesGeometry = detection.visionSnapshot?.titleIdentity.map {
+                stableIdentity.isSpatiallyConsistent(with: $0)
+            } ?? false
+        } else {
+            matchesGeometry = true
+        }
+        if matchesName && matchesGeometry {
+            conversationIdentityState = .confirmed
+            unidentifiedPolls = 0
+            candidateContact = nil
+            candidateContactPolls = 0
+            candidateVisionIdentity = nil
+            titleConsensusCount = stableVisionIdentity == nil ? 0 : 3
+            hasUnverifiedMessageChanges = false
+            return true
+        }
+
+        guard !matchesName else {
+            conversationIdentityState = .temporarilyUncertain
+            unidentifiedPolls += 1
+            candidateContact = nil
+            candidateContactPolls = 0
+            candidateVisionIdentity = nil
+            titleConsensusCount = 0
+            status = "Conversation title geometry uncertain · local capture continues"
+            return false
+        }
+
+        let incomingIdentity = detection.visionSnapshot?.titleIdentity
+        let sameCandidateText = candidateContact.map {
+            conversationKey($0) == conversationKey(detectedContact)
+        } ?? false
+        let sameCandidatePosition: Bool
+        if let current = candidateVisionIdentity, let incomingIdentity {
+            sameCandidatePosition = current.isSpatiallyConsistent(with: incomingIdentity)
+        } else {
+            sameCandidatePosition = candidateVisionIdentity == nil && incomingIdentity == nil
+        }
+        if sameCandidateText && sameCandidatePosition {
+            candidateContactPolls += 1
+        } else {
+            candidateContact = detectedContact
+            candidateContactPolls = 1
+            candidateVisionIdentity = incomingIdentity
+        }
+        conversationIdentityState = .candidateChange
+        titleConsensusCount = candidateContactPolls
+        let requiredCount = detection.visionSnapshot == nil
+            ? accessibilitySwitchConfirmationCount
+            : visionSwitchConfirmationCount
+        if candidateContactPolls >= requiredCount {
+            stop()
+            conversationIdentityState = .changed
+            status = "Conversation changed. Activate again in the chat you want to monitor."
+        } else {
+            status = "Checking a possible conversation change… (\(candidateContactPolls)/\(requiredCount))"
+        }
+        return false
+    }
+
+    private func finishPendingAutomaticBurstIfSafe(identityConfirmedThisPoll: Bool) {
+        guard identityConfirmedThisPoll, pendingAutomaticBurst,
+              conversationIdentityState == .confirmed,
+              !hasUnverifiedMessageChanges,
+              viewportState == .liveTail else { return }
+        pendingAutomaticBurst = false
+        scheduleBurst(contact: lockedContact ?? "", canAutoAnalyze: WeChatParsing.canAutomaticallyAnalyze(contextHistory))
     }
 
     private func applyInitialReadResult(_ result: MessageReadResult, contact: String) {
@@ -581,11 +860,19 @@ final class MessageMonitor: ObservableObject {
             status = visionState.map(visionCaptureFailureStatus) ?? (collapsed
                 ? collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                 : "Conversation detected: \(contact) · message list is unavailable")
-        case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _, let isVision):
+        case .messageListUnchanged(let fingerprint):
+            lastMessageFingerprint = fingerprint
+            viewportState = .liveTail
+            status = "Monitoring this conversation"
+        case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _, let isVision, let fingerprint):
             isUsingVision = isUsingVision || isVision
             contextHistory = Array(snapshot.suffix(contextHistoryLimit))
             messages = contextHistory
             lastIDs = snapshot.map(contextKey)
+            lastSemanticMessageKeys = lastIDs
+            lastMessageFingerprint = fingerprint
+            latestSnapshotBlockCount = snapshot.count
+            viewportState = .liveTail
             if snapshot.isEmpty {
                 status = isVision
                     ? (renderedRows == 0 ? "Vision OCR found no text" : "Vision found \(renderedRows) text observations; 0 passed chat-message filtering")
@@ -672,7 +959,6 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func processSnapshot(_ snapshot: [ChatMessage], contact: String, purpose: SnapshotPurpose) {
-        contactName = contact
         if snapshot.isEmpty {
             messages = contextHistory
             status = contextHistory.isEmpty
@@ -680,6 +966,17 @@ final class MessageMonitor: ObservableObject {
                 : "Keeping captured context · no new visible messages"
             return
         }
+        let classification = contextHistory.isEmpty
+            ? ChatViewportClassification(state: .liveTail, tailOverlap: snapshot.count, historicalOverlap: 0)
+            : ChatHistoryMerger.classify(existing: contextHistory, visible: snapshot)
+        viewportState = classification.state
+        latestTailOverlap = classification.tailOverlap
+        latestHistoricalOverlap = classification.historicalOverlap
+        guard classification.state != .uncertain else {
+            status = "Visible messages could not be matched safely · keeping captured context"
+            return
+        }
+        contactName = contact
         let ids = snapshot.map(contextKey)
         let previousHistory = contextHistory
         let mergedHistory = mergeContextHistory(snapshot)
@@ -687,9 +984,14 @@ final class MessageMonitor: ObservableObject {
         let added = appendedMessages(previous: previousHistory, merged: mergedHistory)
         contextHistory = mergedHistory
         messages = contextHistory
-        if purpose == .historicalBackfill {
+        if purpose == .historicalBackfill || classification.state == .historical {
             lastIDs = ids
-            status = "Older chat context updated · \(contextHistory.count) messages"
+            pendingAutomaticBurst = false
+            if isLoadingOlderContext {
+                status = "Older chat context updated · \(contextHistory.count) messages"
+            } else {
+                status = "Viewing older messages · live incoming tracking paused"
+            }
             return
         }
         guard ids != lastIDs else {
@@ -709,7 +1011,20 @@ final class MessageMonitor: ObservableObject {
             status = hasUnknown ? "Message rows found, sender identity unavailable" : "Monitoring this conversation"
             return
         }
-        scheduleBurst(contact: contact, canAutoAnalyze: WeChatParsing.canAutomaticallyAnalyze(contextHistory))
+        let canAutomaticallyAnalyze = WeChatParsing.canAutomaticallyAnalyze(contextHistory)
+        guard canAutomaticallyAnalyze else {
+            status = hasUnknown ? "Message rows found, sender identity unavailable" : "Monitoring this conversation"
+            return
+        }
+        guard conversationIdentityState == .confirmed,
+              !hasUnverifiedMessageChanges,
+              viewportState == .liveTail else {
+            pendingAutomaticBurst = true
+            status = "Incoming message captured · waiting to verify conversation"
+            return
+        }
+        pendingAutomaticBurst = false
+        scheduleBurst(contact: contact, canAutoAnalyze: true)
     }
 
     private func appendedMessages(previous: [ChatMessage], merged: [ChatMessage]) -> [ChatMessage] {
@@ -732,10 +1047,28 @@ final class MessageMonitor: ObservableObject {
         generation += 1
         let token = generation
         debounce?.cancel()
+        guard canAutoAnalyze,
+              conversationIdentityState == .confirmed,
+              !hasUnverifiedMessageChanges,
+              viewportState == .liveTail else {
+            pendingAutomaticBurst = canAutoAnalyze
+            status = canAutoAnalyze
+                ? "Incoming message captured · waiting to verify conversation"
+                : "Message ready · Analyze manually"
+            return
+        }
+        pendingAutomaticBurst = false
         status = "Waiting for the message burst to finish…"
         debounce = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled, let self, self.isRunning, self.generation == token else { return }
+            guard self.conversationIdentityState == .confirmed,
+                  !self.hasUnverifiedMessageChanges,
+                  self.viewportState == .liveTail else {
+                self.pendingAutomaticBurst = true
+                self.status = "Incoming message captured · waiting to verify conversation"
+                return
+            }
             self.status = canAutoAnalyze ? "Message ready · analyzing" : "Message ready · Analyze manually"
             if canAutoAnalyze {
                 self.onBurst?(contact, self.messages.suffix(self.automaticAnalysisContextLimit).map { $0 }, true)

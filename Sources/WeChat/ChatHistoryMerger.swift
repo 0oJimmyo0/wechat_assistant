@@ -1,5 +1,17 @@
 import Foundation
 
+enum ChatViewportState: String, Equatable, Sendable {
+    case liveTail
+    case historical
+    case uncertain
+}
+
+struct ChatViewportClassification: Sendable {
+    let state: ChatViewportState
+    let tailOverlap: Int
+    let historicalOverlap: Int
+}
+
 enum ChatHistoryMerger {
     static func key(for message: ChatMessage) -> String {
         if !message.id.hasPrefix("vision:") { return message.id }
@@ -63,6 +75,41 @@ enum ChatHistoryMerger {
             }
         }
         return refreshedHistory
+    }
+
+    static func classify(existing: [ChatMessage], visible: [ChatMessage]) -> ChatViewportClassification {
+        guard !existing.isEmpty, !visible.isEmpty else {
+            return ChatViewportClassification(state: .uncertain, tailOverlap: 0, historicalOverlap: 0)
+        }
+        let historyKeys = existing.map(key(for:))
+        let visibleKeys = visible.map(key(for:))
+        let maxOverlap = min(historyKeys.count, visibleKeys.count)
+        for length in stride(from: maxOverlap, through: 1, by: -1) {
+            let historyTail = Array(historyKeys.suffix(length))
+            for visibleStart in 0...(visibleKeys.count - length) {
+                if Array(visibleKeys[visibleStart..<(visibleStart + length)]) == historyTail {
+                    return ChatViewportClassification(state: .liveTail, tailOverlap: length, historicalOverlap: 0)
+                }
+            }
+        }
+        var bestHistoricalOverlap = 0
+        for length in stride(from: maxOverlap, through: 1, by: -1) {
+            for historyStart in 0...(historyKeys.count - length) {
+                guard historyStart + length < historyKeys.count else { continue }
+                let segment = Array(historyKeys[historyStart..<(historyStart + length)])
+                for visibleStart in 0...(visibleKeys.count - length) {
+                    if Array(visibleKeys[visibleStart..<(visibleStart + length)]) == segment {
+                        bestHistoricalOverlap = max(bestHistoricalOverlap, length)
+                    }
+                }
+            }
+            if bestHistoricalOverlap > 0 { break }
+        }
+        return ChatViewportClassification(
+            state: bestHistoricalOverlap > 0 ? .historical : .uncertain,
+            tailOverlap: 0,
+            historicalOverlap: bestHistoricalOverlap
+        )
     }
 
     static func appended(previous: [ChatMessage], merged: [ChatMessage]) -> [ChatMessage] {
