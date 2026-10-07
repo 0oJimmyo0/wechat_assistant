@@ -16,7 +16,9 @@ final class WeChatScreenReader {
     private var cachedKey: String?
     private var cachedAt = Date.distantPast
     private var cachedSnapshot: VisibleWeChatSnapshot?
-    private let cacheDuration: TimeInterval = 1.5
+    // Reuse the title-detection capture for the immediately following message
+    // read. The monitor's regular polling interval is three seconds.
+    private let cacheDuration: TimeInterval = 2.7
 
     static var hasScreenCapturePermission: Bool { CGPreflightScreenCaptureAccess() }
 
@@ -49,7 +51,7 @@ final class WeChatScreenReader {
         guard let image = capturedWindow.cropping(to: conversationCrop) else { return nil }
 
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
+        request.recognitionLevel = .fast
         request.usesLanguageCorrection = false
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         let handler = VNImageRequestHandler(cgImage: image)

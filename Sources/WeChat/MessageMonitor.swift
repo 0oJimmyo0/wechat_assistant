@@ -42,7 +42,6 @@ final class MessageMonitor: ObservableObject {
             let contact = bridge.currentContact()
             let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
             let screenCaptureAllowed = WeChatScreenReader.hasScreenCapturePermission
-            let result = contact == nil ? nil : bridge.readMessages()
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
@@ -55,7 +54,16 @@ final class MessageMonitor: ObservableObject {
                 self.contactName = contact
                 self.lockedContact = contact
                 self.isRunning = true
-                if let result { self.applyInitialReadResult(result, contact: contact) }
+                self.status = "Connected · reading recent messages"
+            }
+            guard let contact else { return }
+            let result = bridge.readMessages()
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.generation == token,
+                      self.isRunning,
+                      self.lockedContact == contact else { return }
+                self.applyInitialReadResult(result, contact: contact)
                 self.timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.poll() }
                 }
