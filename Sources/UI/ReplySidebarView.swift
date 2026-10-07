@@ -147,7 +147,7 @@ struct ReplySidebarView: View {
 
     private func recentMessageRow(_ message: ChatMessage) -> some View {
         let isMe = message.senderIdentified && message.isFromMe
-        let sender = isMe ? "You" : (message.senderIdentified ? (monitor.contactName ?? "Contact") : "Sender unclear")
+        let sender = isMe ? "Self" : (message.senderIdentified ? "Target · \(monitor.contactName ?? "Contact")" : "Sender unclear")
         return HStack {
             if isMe { Spacer(minLength: 36) }
             VStack(alignment: isMe ? .trailing : .leading, spacing: 3) {

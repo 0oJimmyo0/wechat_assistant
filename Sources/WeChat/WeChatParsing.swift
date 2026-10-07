@@ -49,7 +49,7 @@ enum WeChatParsing {
 
     static func canAutomaticallyAnalyze(_ messages: [ChatMessage]) -> Bool {
         !messages.isEmpty &&
-            messages.allSatisfy { $0.sender != .unknown } &&
+            messages.allSatisfy { $0.sender != .unknown && $0.allowsAutomaticAnalysis } &&
             messages.contains { $0.sender == .other }
     }
 

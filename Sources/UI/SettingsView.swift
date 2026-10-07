@@ -42,7 +42,7 @@ struct SettingsView: View {
             }
             Section("Monitoring") {
                 Toggle("Automatically analyze identified messages", isOn: $autoAnalyze)
-                Text("Off by default. When enabled, only clearly identified incoming Accessibility messages in the conversation active at activation can trigger inference. OCR fallback messages have unknown senders and stay manual-only.")
+                Text("Off by default. When enabled, only clearly identified incoming Accessibility messages in the conversation active at activation can trigger inference. OCR uses bubble alignment for cautious Self/Target labels, leaves ambiguous rows unclear, and always stays manual-only.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section("Developer diagnostics") {
@@ -65,7 +65,7 @@ struct SettingsView: View {
                 }
             }
             Section("Privacy") {
-                Text("The conversation is locked to the chat active when you activate monitoring. Switching chats stops monitoring and clears the local session. If WeChat hides its Accessibility tree, the app can request Screen Recording to capture only the visible WeChat window for local OCR; screenshots and OCR text are not saved or sent by this fallback. By default, chat text stays local until you choose Analyze. An analysis sends up to 20 visible messages, your local relationship profile, and any special instruction to OpenAI; the contact name is not sent. OCR messages have unknown senders and cannot trigger automatic analysis. Deactivation cannot recall a request OpenAI has already received. Chat text is not saved by this app. Your profile is saved in local app preferences without separate app-level encryption. store=false is not a zero-retention guarantee. Copying a reply leaves it on the system clipboard.")
+                Text("The conversation is locked to the chat active when you activate monitoring. Switching chats stops monitoring and clears the local session. If WeChat hides its Accessibility tree, the app can request Screen Recording to capture only the visible WeChat window for local OCR; screenshots and OCR text are not saved or sent by this fallback. OCR may label clear left/right bubble alignment as Target/Self; uncertain labels remain unclear, and OCR never triggers automatic analysis. By default, chat text stays local until you choose Analyze. An analysis sends up to 20 visible messages, your local relationship profile, and any special instruction to OpenAI; the contact name is not sent. Deactivation cannot recall a request OpenAI has already received. Chat text is not saved by this app. Your profile is saved in local app preferences without separate app-level encryption. store=false is not a zero-retention guarantee. Copying a reply leaves it on the system clipboard.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Link("OpenAI data controls", destination: URL(string: "https://developers.openai.com/api/docs/guides/your-data")!)
                     .font(.caption)

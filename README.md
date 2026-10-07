@@ -71,7 +71,7 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it can request Screen Recording access and OCR only that visible WeChat window locally. OCR is limited to the conversation header and right-hand message pane; OCR rows have unknown senders and cannot trigger automatic analysis. It does not read WeChat's local database, access chat history outside the visible window, or automatically scroll older messages. Captured images and OCR text are not saved; text stays local until the user chooses Analyze.
+The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it can request Screen Recording access and OCR only that visible WeChat window locally. OCR is limited to the conversation header and right-hand message pane; clear left/right bubble alignment may be labeled Target/Self, ambiguous rows stay unknown, and OCR never triggers automatic analysis. It does not read WeChat's local database, access chat history outside the visible window, or automatically scroll older messages. Captured images and OCR text are not saved; text stays local until the user chooses Analyze.
 
 For target-Mac Accessibility troubleshooting, open **Settings → Developer diagnostics → Inspect WeChat AX**. The report is saved only after you choose a location and contains structural roles, sanitized identifiers, frames, and row counts; it omits message text, contact names, profile notes, and credentials.
 
@@ -92,7 +92,7 @@ For target-Mac Accessibility troubleshooting, open **Settings → Developer diag
 
 ## Known limitations
 
-- Accessibility structure varies by WeChat release. OCR fallback depends on Screen Recording permission and visible-window text recognition. OCR rows remain sender-unknown and are never sent automatically.
+- Accessibility structure varies by WeChat release. OCR fallback depends on Screen Recording permission and visible-window text recognition. OCR sender hints use conservative bubble alignment; uncertain rows remain unknown and all OCR rows are manual-only.
 - Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.

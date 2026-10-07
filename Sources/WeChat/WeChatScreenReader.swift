@@ -75,14 +75,14 @@ final class WeChatScreenReader {
             .map(WeChatParsing.normalizeChatTitle)
             .first { !$0.isEmpty && !WeChatParsing.isGenericWindowTitle($0) }
 
-        // OCR cannot safely establish sender identity. Keep every OCR row
-        // manual-only so auto-analysis remains disabled for this fallback.
+        // Bubble alignment provides a conservative sender hint. Ambiguous rows
+        // stay unknown, and every OCR row remains manual-only regardless.
         let messages = lines
             .filter { $0.1.minX >= 0.01 && $0.1.minY >= 0.14 && $0.1.maxY <= 0.80 }
             .filter { !looksLikeTimestampOrControl($0.0) }
             .sorted { $0.1.maxY > $1.1.maxY }
             .suffix(20)
-            .map { ChatMessage(text: $0.0, sender: .unknown) }
+            .map { ChatMessage(text: $0.0, sender: sender(for: $0.1), allowsAutomaticAnalysis: false) }
 
         return VisibleWeChatSnapshot(title: title, messages: Array(messages))
     }
@@ -110,5 +110,11 @@ final class WeChatScreenReader {
         }
         return ["WeChat", "微信", "Search", "搜索", "Chats", "聊天", "Contacts", "通讯录"]
             .contains(text)
+    }
+
+    private func sender(for textBounds: CGRect) -> MessageSender {
+        if textBounds.minX >= 0.55 { return .me }
+        if textBounds.minX <= 0.20 && textBounds.maxX <= 0.55 { return .other }
+        return .unknown
     }
 }
