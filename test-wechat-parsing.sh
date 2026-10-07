@@ -9,6 +9,7 @@ swiftc \
     -o "$TEST_BINARY" \
     "$PROJECT_DIR/Sources/WeChat/ChatMessage.swift" \
     "$PROJECT_DIR/Sources/WeChat/WeChatParsing.swift" \
+    "$PROJECT_DIR/Sources/WeChat/VisionConversationIdentity.swift" \
     "$PROJECT_DIR/Tests/WeChatParsingTests.swift"
 
 "$TEST_BINARY"

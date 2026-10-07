@@ -31,22 +31,6 @@ struct VisibleWeChatSnapshot: Sendable {
     let rejectedMessageBounds: [CGRect]
 }
 
-struct VisionConversationIdentity: Sendable, Equatable {
-    let normalizedTitle: String
-    let titleCenterX: CGFloat
-    let titleCenterY: CGFloat
-    let titleWidth: CGFloat
-    let confidence: Float
-
-    func isSpatiallyConsistent(with other: VisionConversationIdentity) -> Bool {
-        normalizedTitle == other.normalizedTitle &&
-            abs(titleCenterX - other.titleCenterX) <= 0.025 &&
-            abs(titleCenterY - other.titleCenterY) <= 0.025 &&
-            abs(titleWidth - other.titleWidth) <= 0.05 &&
-            confidence >= 0.35 && other.confidence >= 0.35
-    }
-}
-
 struct VisionLayoutCalibration {
     let conversationLeftX: CGFloat
     let headerBottomY: CGFloat

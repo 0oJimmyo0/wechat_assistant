@@ -13,6 +13,8 @@ struct ReplySidebarView: View {
     @State private var generationID: UUID?
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
+    private let displayedMessageLimit = 20
+    private let manualAnalysisContextLimit = 30
 
     var body: some View {
         VStack(spacing: 0) {
@@ -49,11 +51,11 @@ struct ReplySidebarView: View {
                          ? "Clearly identified incoming messages may be sent to OpenAI after the conversation pauses."
                          : "Messages stay on this Mac until you choose Analyze.")
                         .font(.caption2).foregroundStyle(.secondary)
-                    Button { generate(context: monitor.messages, model: auth.everydayModel) } label: {
+                    Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.everydayModel) } label: {
                         Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
                     }.buttonStyle(.borderedProminent).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
-                    Button { generate(context: monitor.messages, model: auth.carefulModel) } label: {
+                    Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.carefulModel) } label: {
                         Label("Regenerate carefully", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
                     }.buttonStyle(.bordered).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
                 }
@@ -127,8 +129,9 @@ struct ReplySidebarView: View {
     }
 
     private var recentMessagesSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("RECENT MESSAGES · LAST \(min(5, monitor.messages.count)) OF \(monitor.messages.count)")
+        let visibleMessages = Array(monitor.messages.suffix(displayedMessageLimit))
+        return VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("RECENT MESSAGES · LAST \(visibleMessages.count) OF \(monitor.messages.count)")
             if monitor.messages.isEmpty {
                 Text("No chat message text is available from this WeChat view yet.")
                     .font(.callout)
@@ -138,7 +141,7 @@ struct ReplySidebarView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             } else {
-                ForEach(Array(monitor.messages.suffix(5).enumerated()), id: \.offset) { item in
+                ForEach(Array(visibleMessages.enumerated()), id: \.offset) { item in
                     recentMessageRow(item.element)
                 }
             }

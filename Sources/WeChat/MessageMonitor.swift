@@ -43,7 +43,8 @@ final class MessageMonitor: ObservableObject {
     private let visionSwitchConfirmationCount = 3
     private let minimumVisionSwitchTitleConfidence: Float = 0.35
     private let contextHistoryLimit = 100
-    private let automaticAnalysisContextLimit = 50
+    private let automaticAnalysisContextLimit = 30
+    private var lastTitleConsensusDiagnostic = "Title consensus: not run"
     private let pollingInterval: TimeInterval = 1
 
     var visionIdentityDiagnostic: String {
@@ -53,6 +54,7 @@ final class MessageMonitor: ObservableObject {
             "Candidate contact consecutive detections: \(candidateContactPolls)",
             "Vision title consensus count: \(titleConsensusCount)",
             "Consecutive title misses: \(unidentifiedPolls)",
+            lastTitleConsensusDiagnostic,
             lastActivationDiagnostic
         ].joined(separator: "\n")
     }
@@ -72,6 +74,7 @@ final class MessageMonitor: ObservableObject {
         stableVisionIdentity = nil
         candidateVisionIdentity = nil
         titleConsensusCount = 0
+        lastTitleConsensusDiagnostic = "Title observations: pending"
         generation += 1
         let token = generation
         let cancellation = MonitorWorkCancellation()
@@ -95,6 +98,7 @@ final class MessageMonitor: ObservableObject {
         let minimumTitleConfidence = minimumVisionSwitchTitleConfidence
         accessibilityQueue.async { [weak self] in
             var titleCaptureWallMilliseconds: [Int] = []
+            var titleConsensusDiagnostic = "Title consensus: not run"
             let stageUpdate: (String) -> Void = { [weak self] value in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token, self.isCheckingConversation else { return }
@@ -142,27 +146,34 @@ final class MessageMonitor: ObservableObject {
                     titleDetections.append(thirdDetection)
                     titleCaptureWallMilliseconds.append(Int((ProcessInfo.processInfo.systemUptime - thirdCaptureStarted) * 1000))
                     guard !cancellation.isCancelled else { return }
-                    let latestPairConfirmsTitle: Bool = {
-                        guard let earlier = captures[1].visionSnapshot?.titleIdentity,
-                              let later = captures[2].visionSnapshot?.titleIdentity else { return false }
-                        return (captures[1].visionSnapshot?.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence &&
-                            (captures[2].visionSnapshot?.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence &&
-                            earlier.isSpatiallyConsistent(with: later)
-                    }()
-                    let confirmedIndex = latestPairConfirmsTitle ? 2 : nil
-                    if let confirmedIndex {
-                        detection = captures[confirmedIndex]
+                    let consensus = VisionTitleConsensus.evaluate(
+                        captures.map { $0.visionSnapshot?.titleIdentity },
+                        minimumConfidence: minimumTitleConfidence
+                    )
+                    if let bestPair = consensus.bestPair {
+                        detection = captures[bestPair.secondIndex]
                         contact = detection.contact
                         consensusCount = 2
+                        titleConsensusDiagnostic = consensus.diagnostic
                     } else {
                         detection = captures.last ?? detection
                         contact = nil
                         titleWasUnstable = true
+                        titleConsensusDiagnostic = consensus.diagnostic
                     }
                 }
+                if fastPairIsStrong {
+                    titleConsensusDiagnostic = VisionTitleConsensus.evaluate(
+                        captures.map { $0.visionSnapshot?.titleIdentity },
+                        minimumConfidence: 0.60
+                    ).diagnostic
+                }
+            } else {
+                titleConsensusDiagnostic = "Title observations: 1\nBackend: \(detection.backend.rawValue)\nSemantic title accepted"
             }
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
+                self.lastTitleConsensusDiagnostic = titleConsensusDiagnostic
                 self.isCheckingConversation = false
                 self.activationTimeoutWorkItem?.cancel()
                 self.activationTimeoutWorkItem = nil

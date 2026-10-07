@@ -49,7 +49,32 @@ enum WeChatParsingTests {
         expect(WeChatParsing.diagnosticIdentifier("session_item_Alex") == "session_item_<redacted>", "redacts names embedded in session identifiers")
         expect(WeChatParsing.genericDiagnosticWindowTitle("WeChat (Chats)") == "WeChat (Chats)", "allows generic window title in diagnostics")
         expect(WeChatParsing.genericDiagnosticWindowTitle("Alex") == "<redacted>", "redacts contact names in diagnostics")
+
+        let titleA = identity("Alice")
+        let titleB = identity("Bob")
+        let titleC = identity("Carol")
+        expect(consensus(titleA, titleA)?.secondIndex == 1, "A/A confirms after two captures")
+        expect(consensus(titleA, nil, titleA)?.firstIndex == 0 && consensus(titleA, nil, titleA)?.secondIndex == 2,
+               "A/noise/A confirms using captures one and three")
+        expect(consensus(nil, titleA, titleA)?.firstIndex == 1 && consensus(nil, titleA, titleA)?.secondIndex == 2,
+               "noise/A/A confirms using captures two and three")
+        expect(consensus(titleA, titleB, titleA)?.firstIndex == 0 && consensus(titleA, titleB, titleA)?.secondIndex == 2,
+               "A/B/A confirms the matching spatially consistent pair")
+        expect(consensus(titleA, titleB, titleB)?.firstIndex == 1 && consensus(titleA, titleB, titleB)?.secondIndex == 2,
+               "A/B/B confirms B only when the B pair matches")
+        expect(consensus(titleA, titleB, titleC) == nil, "A/B/C fails safely")
+        let displacedTitleA = identity("Alice", x: 0.70)
+        expect(consensus(titleA, nil, displacedTitleA) == nil, "all-pairs recovery retains spatial constraints")
         print("All WeChat parsing checks passed.")
+    }
+
+    private static func identity(_ title: String, x: CGFloat = 0.50) -> VisionConversationIdentity {
+        VisionConversationIdentity(normalizedTitle: title, titleCenterX: x, titleCenterY: 0.08,
+                                   titleWidth: 0.12, confidence: 0.70)
+    }
+
+    private static func consensus(_ identities: VisionConversationIdentity?...) -> VisionTitlePair? {
+        VisionTitleConsensus.evaluate(identities).bestPair
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ description: String) {
