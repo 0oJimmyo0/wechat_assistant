@@ -31,6 +31,10 @@ struct VisibleWeChatSnapshot: Sendable {
     let rejectedMessageBounds: [CGRect]
     let messageFingerprint: String?
     let messageFrameUnchanged: Bool
+    let headerFingerprint: String?
+    let headerFrameUnchanged: Bool
+    let headerOCRDurationMilliseconds: Int
+    let messageOCRDurationMilliseconds: Int
 }
 
 struct VisionLayoutCalibration {
@@ -132,8 +136,26 @@ final class WeChatScreenReader {
              forceFresh: forceFresh, previousMessageFingerprint: previousFingerprint)
     }
 
+    func readConversationObservation(pid: pid_t, windowFrame: CGRect, includeTitle: Bool,
+                                     includeMessages: Bool, forceFresh: Bool,
+                                     accurateMessages: Bool = false,
+                                     previousHeaderFingerprint: String? = nil,
+                                     previousMessageFingerprint: String? = nil) -> VisibleWeChatSnapshot {
+        let mode: VisionReadMode
+        switch (includeTitle, includeMessages) {
+        case (true, true): mode = accurateMessages ? .full : .fullFast
+        case (true, false): mode = .titleOnly
+        case (false, true): mode = accurateMessages ? .messagesAccurate : .messagesFast
+        case (false, false): mode = .titleOnly
+        }
+        return read(pid: pid, windowFrame: windowFrame, mode: mode, forceFresh: forceFresh,
+                    previousHeaderFingerprint: previousHeaderFingerprint,
+                    previousMessageFingerprint: previousMessageFingerprint)
+    }
+
     private func read(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
-                      forceFresh: Bool, previousMessageFingerprint: String? = nil) -> VisibleWeChatSnapshot {
+                      forceFresh: Bool, previousHeaderFingerprint: String? = nil,
+                      previousMessageFingerprint: String? = nil) -> VisibleWeChatSnapshot {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
         cacheCondition.lock()
         while captureInProgress { cacheCondition.wait() }
@@ -150,6 +172,7 @@ final class WeChatScreenReader {
         // never start a duplicate capture while these mutable window caches
         // are in use.
         let result = capture(pid: pid, windowFrame: windowFrame, mode: mode, forceFresh: forceFresh,
+                             previousHeaderFingerprint: previousHeaderFingerprint,
                              previousMessageFingerprint: previousMessageFingerprint)
         cacheCondition.lock()
         if mode == .full {
@@ -165,6 +188,7 @@ final class WeChatScreenReader {
 
     private func capture(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
                          forceFresh: Bool = true,
+                         previousHeaderFingerprint: String? = nil,
                          previousMessageFingerprint: String? = nil) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
         guard CGPreflightScreenCaptureAccess() else {
             return (emptySnapshot(pid: pid, crop: conversationCropRatio, state: .screenRecordingPermissionRequired), nil)
@@ -204,18 +228,30 @@ final class WeChatScreenReader {
         var messageObservations: [VNRecognizedTextObservation] = []
         var messageFingerprint: String?
         var messageFrameUnchanged = false
+        var headerFingerprint: String?
+        var headerFrameUnchanged = false
+        var headerOCRDurationMilliseconds = 0
+        var messageOCRDurationMilliseconds = 0
         let visionStarted = Date()
         var visionSucceeded = true
 
         if mode.readsTitle {
             if let headerImage = crop(image, to: headerSearchRegion) {
-                let request = VNRecognizeTextRequest()
-                request.recognitionLevel = .accurate
-                request.usesLanguageCorrection = true
-                request.recognitionLanguages = ["zh-Hans", "en-US"]
-                request.minimumTextHeight = 0.006
-                visionSucceeded = (try? VNImageRequestHandler(cgImage: headerImage).perform([request])) != nil
-                headerObservations = request.results ?? []
+                headerFingerprint = perceptualFingerprint(headerImage, width: 32, height: 24)
+                headerFrameUnchanged = previousHeaderFingerprint.map {
+                    fingerprintDistance(headerFingerprint ?? "", $0) <= 0.003
+                } ?? false
+                if !headerFrameUnchanged {
+                    let ocrStarted = Date()
+                    let request = VNRecognizeTextRequest()
+                    request.recognitionLevel = .accurate
+                    request.usesLanguageCorrection = true
+                    request.recognitionLanguages = ["zh-Hans", "en-US"]
+                    request.minimumTextHeight = 0.006
+                    visionSucceeded = (try? VNImageRequestHandler(cgImage: headerImage).perform([request])) != nil
+                    headerObservations = request.results ?? []
+                    headerOCRDurationMilliseconds = Int(Date().timeIntervalSince(ocrStarted) * 1000)
+                }
             } else {
                 visionSucceeded = false
             }
@@ -229,6 +265,7 @@ final class WeChatScreenReader {
                     fingerprintDistance(fingerprint, $0) <= 0.015
                 } ?? false
                 if !messageFrameUnchanged {
+                    let ocrStarted = Date()
                     let request = VNRecognizeTextRequest()
                     request.recognitionLevel = mode.messageRecognitionLevel
                     request.usesLanguageCorrection = mode.messageRecognitionLevel == .accurate
@@ -237,6 +274,7 @@ final class WeChatScreenReader {
                     let messageSucceeded = (try? VNImageRequestHandler(cgImage: messageImage).perform([request])) != nil
                     visionSucceeded = visionSucceeded && messageSucceeded
                     messageObservations = request.results ?? []
+                    messageOCRDurationMilliseconds = Int(Date().timeIntervalSince(ocrStarted) * 1000)
                 }
             } else {
                 visionSucceeded = false
@@ -249,7 +287,11 @@ final class WeChatScreenReader {
                 target: target, headerObservations: 0, headerCandidates: [], acceptedTitleBounds: nil,
                 acceptedTitleConfidence: nil, titleIdentity: nil,
                 titleRejectedAsMessageCount: 0, titleRejectedAsSentenceCount: 0,
-                messageObservations: 0, messageBounds: [], rejectedMessageBounds: []
+                messageObservations: 0, messageBounds: [], rejectedMessageBounds: [],
+                messageFingerprint: messageFingerprint, messageFrameUnchanged: messageFrameUnchanged,
+                headerFingerprint: headerFingerprint, headerFrameUnchanged: headerFrameUnchanged,
+                headerOCRDurationMilliseconds: headerOCRDurationMilliseconds,
+                messageOCRDurationMilliseconds: messageOCRDurationMilliseconds
             ), capturedWindow)
         }
 
@@ -318,6 +360,10 @@ final class WeChatScreenReader {
             rejectedMessageBounds: rejectedMessageBounds,
             messageFingerprint: messageFingerprint,
             messageFrameUnchanged: messageFrameUnchanged,
+            headerFingerprint: headerFingerprint,
+            headerFrameUnchanged: headerFrameUnchanged,
+            headerOCRDurationMilliseconds: headerOCRDurationMilliseconds,
+            messageOCRDurationMilliseconds: messageOCRDurationMilliseconds,
             visionDurationMilliseconds: Int(Date().timeIntervalSince(visionStarted) * 1000)
         ), capturedWindow)
     }
@@ -461,7 +507,9 @@ final class WeChatScreenReader {
             acceptedTitleBounds: nil, acceptedTitleConfidence: nil,
             titleIdentity: nil, titleRejectedAsMessageCount: 0, titleRejectedAsSentenceCount: 0,
             messageObservationCount: 0, messageBounds: [], rejectedMessageBounds: [],
-            messageFingerprint: nil, messageFrameUnchanged: false
+            messageFingerprint: nil, messageFrameUnchanged: false,
+            headerFingerprint: nil, headerFrameUnchanged: false,
+            headerOCRDurationMilliseconds: 0, messageOCRDurationMilliseconds: 0
         )
     }
 
@@ -473,6 +521,8 @@ final class WeChatScreenReader {
         titleRejectedAsSentenceCount: Int,
         messageObservations: Int, messageBounds: [CGRect], rejectedMessageBounds: [CGRect],
         messageFingerprint: String? = nil, messageFrameUnchanged: Bool = false,
+        headerFingerprint: String? = nil, headerFrameUnchanged: Bool = false,
+        headerOCRDurationMilliseconds: Int = 0, messageOCRDurationMilliseconds: Int = 0,
         visionDurationMilliseconds: Int = 0
     ) -> VisibleWeChatSnapshot {
         VisibleWeChatSnapshot(
@@ -491,13 +541,14 @@ final class WeChatScreenReader {
             titleRejectedAsSentenceCount: titleRejectedAsSentenceCount,
             messageObservationCount: messageObservations,
             messageBounds: messageBounds, rejectedMessageBounds: rejectedMessageBounds,
-            messageFingerprint: messageFingerprint, messageFrameUnchanged: messageFrameUnchanged
+            messageFingerprint: messageFingerprint, messageFrameUnchanged: messageFrameUnchanged,
+            headerFingerprint: headerFingerprint, headerFrameUnchanged: headerFrameUnchanged,
+            headerOCRDurationMilliseconds: headerOCRDurationMilliseconds,
+            messageOCRDurationMilliseconds: messageOCRDurationMilliseconds
         )
     }
 
-    private func perceptualFingerprint(_ image: CGImage) -> String? {
-        let width = 16
-        let height = 16
+    private func perceptualFingerprint(_ image: CGImage, width: Int = 16, height: Int = 16) -> String? {
         var pixels = [UInt8](repeating: 0, count: width * height)
         let rendered = pixels.withUnsafeMutableBytes { storage -> Bool in
             guard let context = CGContext(
@@ -832,13 +883,14 @@ private enum VisionReadMode: Equatable {
     case messagesFast
     case messagesAccurate
     case full
+    case fullFast
 
-    var readsTitle: Bool { self == .titleOnly || self == .full }
+    var readsTitle: Bool { self == .titleOnly || self == .full || self == .fullFast }
     var readsMessages: Bool { self != .titleOnly }
     var messageRecognitionLevel: VNRequestTextRecognitionLevel {
-        self == .messagesFast ? .fast : .accurate
+        self == .messagesFast || self == .fullFast ? .fast : .accurate
     }
-    var captureScale: CGFloat { self == .messagesFast ? 1.25 : 1.5 }
+    var captureScale: CGFloat { self == .messagesFast || self == .fullFast ? 1.25 : 1.5 }
 }
 
 private struct LegacyWindow {

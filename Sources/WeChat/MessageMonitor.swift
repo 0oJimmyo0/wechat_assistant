@@ -58,10 +58,14 @@ final class MessageMonitor: ObservableObject {
     private var isPolling = false
     private var generation = 0
     private var lastObservedSnapshot: [String] = []
+    private var lastHeaderFingerprint: String?
+    private var lastMessageFingerprint: String?
     private var lastProcessedIncomingMessage: UUID?
     private var sessionCancellation: MonitorWorkCancellation?
     private var lastTitleValidationUptime: TimeInterval = 0
     private var messageCaptureCount = 0
+    private var consecutiveEmptyAXSnapshots = 0
+    private var consecutiveCaptureFailures = 0
     private var latestSnapshotBlockCount = 0
     private var latestTailOverlap = 0
     private var latestHistoricalOverlap = 0
@@ -122,16 +126,23 @@ final class MessageMonitor: ObservableObject {
         sessionCancellation?.cancel()
         sessionCancellation = cancellation
         let bridge = self.bridge
+        let previousHeaderFingerprint = lastHeaderFingerprint
+        let previousMessageFingerprint = lastMessageFingerprint
         accessibilityQueue.async { [weak self] in
-            let snapshot = bridge.captureConversationSnapshot()
+            let snapshot = bridge.captureConversationSnapshot(
+                previousHeaderFingerprint: previousHeaderFingerprint,
+                previousMessageFingerprint: previousMessageFingerprint
+            )
             guard cancellation.isCancelled == false else { return }
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token, self.isCheckingConversation else { return }
                 self.isCheckingConversation = false
                 guard let snapshot else {
+                    self.noteCaptureFailure()
                     self.status = "Could not read the active WeChat conversation"
                     return
                 }
+                self.consecutiveCaptureFailures = 0
                 self.lockedContact = snapshot.contact
                 self.lockedVisionIdentity = snapshot.visionIdentity
                 self.contactName = snapshot.contact
@@ -155,6 +166,8 @@ final class MessageMonitor: ObservableObject {
         conversationStore.clear()
         messages = []
         lastObservedSnapshot = []
+        lastHeaderFingerprint = nil
+        lastMessageFingerprint = nil
         lastProcessedIncomingMessage = nil
         lockedContact = nil
         lockedVisionIdentity = nil
@@ -175,6 +188,8 @@ final class MessageMonitor: ObservableObject {
         latestSnapshotBlockCount = 0
         latestTailOverlap = 0
         latestHistoricalOverlap = 0
+        consecutiveEmptyAXSnapshots = 0
+        consecutiveCaptureFailures = 0
     }
 
     func stop() {
@@ -196,6 +211,8 @@ final class MessageMonitor: ObservableObject {
         conversationStore.clear()
         messages = []
         lastObservedSnapshot = []
+        lastHeaderFingerprint = nil
+        lastMessageFingerprint = nil
         lastProcessedIncomingMessage = nil
         lockedContact = nil
         lockedVisionIdentity = nil
@@ -205,6 +222,8 @@ final class MessageMonitor: ObservableObject {
         viewportState = .uncertain
         conversationIdentityState = .temporarilyUncertain
         hasUnverifiedMessageChanges = false
+        consecutiveEmptyAXSnapshots = 0
+        consecutiveCaptureFailures = 0
         status = "Paused"
         if wasActive { onDeactivated?() }
     }
@@ -381,13 +400,21 @@ final class MessageMonitor: ObservableObject {
                                  cancellation: MonitorWorkCancellation?, generation token: Int) async -> CaptureMergeOutcome {
         let bridge = self.bridge
         let identity = lockedVisionIdentity
+        let previousHeaderFingerprint = lastHeaderFingerprint
+        let previousMessageFingerprint = lastMessageFingerprint
         let captured: OlderContextReadResult? = await performAccessibilityOperation {
             if purpose == .historical {
                 return bridge.readMessagesIfConversationMatches(contact: contact, identity: identity,
                                                                accurate: false, forceFresh: true,
+                                                               previousHeaderFingerprint: previousHeaderFingerprint,
+                                                               previousMessageFingerprint: previousMessageFingerprint,
                                                                cancellation: cancellation)
             }
-            guard let snapshot = bridge.captureConversationSnapshot() else { return nil }
+            guard let snapshot = bridge.captureConversationSnapshot(
+                previousHeaderFingerprint: previousHeaderFingerprint,
+                previousMessageFingerprint: previousMessageFingerprint,
+                lockedContact: contact
+            ) else { return nil }
             return .snapshot(snapshot)
         }
         guard isRunning, generation == token, cancellation?.isCancelled != true else { return .unavailable }
@@ -398,17 +425,27 @@ final class MessageMonitor: ObservableObject {
         case .identityUncertain, .captureUnavailable, .cancelled, .none: snapshot = nil
         }
         guard let snapshot else {
+            noteCaptureFailure()
             status = "Conversation capture unavailable · keeping stored context"
             conversationIdentityState = .temporarilyUncertain
             hasUnverifiedMessageChanges = true
             return .unavailable
         }
+        consecutiveCaptureFailures = 0
         switch confirmSnapshotContact(snapshot.contact) {
         case .confirmed: break
         case .candidate: return .identityUncertain
         case .changed: return .conversationChanged
         }
         lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
+        refreshReaderIfAXSnapshotUnexpectedlyEmpty(snapshot)
+        lastHeaderFingerprint = snapshot.headerFingerprint
+        lastMessageFingerprint = snapshot.messageFingerprint
+        if snapshot.messagesUnchanged {
+            status = "Monitoring · no visible message changes"
+            let result = ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: viewportState)
+            return .merged(result)
+        }
         guard !snapshot.messages.isEmpty else {
             latestSnapshotBlockCount = 0
             status = "No message rows visible · keeping stored context"
@@ -421,6 +458,8 @@ final class MessageMonitor: ObservableObject {
     private func mergeSnapshot(_ snapshot: WeChatSnapshot, purpose: SnapshotPurpose) -> ConversationMergeResult {
         let result = conversationStore.merge(snapshot.messages)
         if lockedVisionIdentity == nil { lockedVisionIdentity = snapshot.visionIdentity }
+        lastHeaderFingerprint = snapshot.headerFingerprint
+        lastMessageFingerprint = snapshot.messageFingerprint
         messages = conversationStore.messages
         viewportState = result.viewport
         latestTailOverlap = result.viewport == .liveTail ? result.appended.count : 0
@@ -475,8 +514,10 @@ final class MessageMonitor: ObservableObject {
     private func applySnapshot(_ snapshot: WeChatSnapshot, purpose: SnapshotPurpose,
                                allowAutomaticAnalysis: Bool) {
         guard confirmSnapshotContact(snapshot.contact) == .confirmed else { return }
+        lastHeaderFingerprint = snapshot.headerFingerprint
+        lastMessageFingerprint = snapshot.messageFingerprint
         guard !snapshot.messages.isEmpty else {
-            status = "Accessibility exposed no message rows · keeping stored context"
+            status = "No message rows visible · keeping stored context"
             return
         }
         let result = mergeSnapshot(snapshot, purpose: purpose)
@@ -517,14 +558,21 @@ final class MessageMonitor: ObservableObject {
         let token = generation
         let cancellation = sessionCancellation
         let bridge = self.bridge
+        let previousHeaderFingerprint = lastHeaderFingerprint
+        let previousMessageFingerprint = lastMessageFingerprint
         accessibilityQueue.async { [weak self] in
-            let snapshot = bridge.captureConversationSnapshot()
+            let snapshot = bridge.captureConversationSnapshot(
+                previousHeaderFingerprint: previousHeaderFingerprint,
+                previousMessageFingerprint: previousMessageFingerprint,
+                lockedContact: contact
+            )
             guard cancellation?.isCancelled != true else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
                 guard let snapshot else {
+                    self.noteCaptureFailure()
                     // A temporary failure in the selected source does not
                     // change stored context or the successful merge baseline.
                     self.status = "Conversation capture unavailable · keeping stored context"
@@ -532,8 +580,16 @@ final class MessageMonitor: ObservableObject {
                     self.hasUnverifiedMessageChanges = true
                     return
                 }
+                self.consecutiveCaptureFailures = 0
                 guard self.confirmSnapshotContact(snapshot.contact) == .confirmed else { return }
                 self.lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
+                self.refreshReaderIfAXSnapshotUnexpectedlyEmpty(snapshot)
+                self.lastHeaderFingerprint = snapshot.headerFingerprint
+                self.lastMessageFingerprint = snapshot.messageFingerprint
+                if snapshot.messagesUnchanged {
+                    self.status = "Monitoring · no visible message changes"
+                    return
+                }
                 guard !snapshot.messages.isEmpty else {
                     self.latestSnapshotBlockCount = 0
                     self.status = "No message rows visible · keeping stored context"
@@ -552,6 +608,29 @@ final class MessageMonitor: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: watchdogInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.poll() }
         }
+    }
+
+    private func refreshReaderIfAXSnapshotUnexpectedlyEmpty(_ snapshot: WeChatSnapshot) {
+        if snapshot.messageSource == .accessibility,
+           snapshot.messages.isEmpty,
+           !conversationStore.messages.isEmpty {
+            consecutiveEmptyAXSnapshots += 1
+            if consecutiveEmptyAXSnapshots >= 3 {
+                bridge.resetReaderBackend()
+                consecutiveEmptyAXSnapshots = 0
+                lastOlderContextDiagnostic = "AX capability cache refreshed after repeated empty message snapshots"
+            }
+        } else {
+            consecutiveEmptyAXSnapshots = 0
+        }
+    }
+
+    private func noteCaptureFailure() {
+        consecutiveCaptureFailures += 1
+        guard consecutiveCaptureFailures >= 3 else { return }
+        bridge.resetReaderBackend()
+        consecutiveCaptureFailures = 0
+        lastOlderContextDiagnostic = "AX capability cache refreshed after repeated capture failures"
     }
 
     private func startAXObserver() {
