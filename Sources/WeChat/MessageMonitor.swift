@@ -24,30 +24,29 @@ final class MessageMonitor: ObservableObject {
     func start() {
         guard !isRunning, !isCheckingConversation else { return }
         guard bridge.hasAccessibilityPermission else { status = "Accessibility permission required"; bridge.requestAccessibilityPermission(); return }
-        guard bridge.isWeChatRunning else { status = "Open WeChat to start monitoring"; return }
+        guard bridge.isWeChatRunning else { status = "WeChat not running"; return }
         isCheckingConversation = true
-        status = "Checking the open WeChat conversation…"
+        status = "Connected to WeChat · checking conversation"
         generation += 1
         let token = generation
         let bridge = self.bridge
         accessibilityQueue.async { [weak self] in
             let contact = bridge.currentContact()
-            let snapshot = contact == nil ? [] : bridge.recentMessages()
+            let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
+            let result = contact == nil ? nil : bridge.readMessages()
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
                 guard let contact, !contact.isEmpty else {
-                    self.status = "Open a conversation before activating"
+                    self.status = treeCollapsed
+                        ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                        : "Could not identify the open WeChat conversation"
                     return
                 }
                 self.contactName = contact
-                self.messages = snapshot
                 self.lockedContact = contact
-                self.lastIDs = snapshot.map(\.id)
                 self.isRunning = true
-                self.status = snapshot.isEmpty
-                    ? "Chat opened · WeChat exposed no message text"
-                    : (snapshot.contains(where: { !$0.senderIdentified }) ? "Manual analysis only · sender unclear" : "Monitoring this conversation")
+                if let result { self.applyInitialReadResult(result, contact: contact) }
                 self.timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.poll() }
                 }
@@ -77,19 +76,66 @@ final class MessageMonitor: ObservableObject {
         isPolling = true
         let token = generation
         let bridge = self.bridge
+        let lockedContact = self.lockedContact
         accessibilityQueue.async { [weak self] in
             let contact = bridge.currentContact()
-            let snapshot = contact == nil ? [] : bridge.recentMessages(limit: 20)
+            let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
+            let result = contact == nil || contact != lockedContact ? nil : bridge.readMessages(limit: 20)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
                 guard let contact, contact == self.lockedContact else {
                     self.stop()
-                    self.status = "Conversation changed or WeChat did not respond — activate again when the chat is open."
+                    self.status = treeCollapsed
+                        ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                        : "Conversation changed or could not be identified — activate again when the chat is open."
                     return
                 }
-                self.processSnapshot(snapshot, contact: contact)
+                guard let result else { return }
+                switch result {
+                case .messageListUnavailable(let collapsed):
+                    self.messages = []
+                    self.lastIDs = []
+                    self.status = collapsed
+                        ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                        : "Conversation detected, but message list is unavailable"
+                case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
+                    guard !snapshot.isEmpty else {
+                        self.messages = []
+                        self.lastIDs = []
+                        self.status = renderedRows == 0 || bubbleRows == 0
+                            ? "Message list found, but no rendered message rows are available"
+                            : "Message rows found, but message text is unavailable"
+                        return
+                    }
+                    self.processSnapshot(snapshot, contact: contact)
+                }
+            }
+        }
+    }
+
+    private func applyInitialReadResult(_ result: MessageReadResult, contact: String) {
+        switch result {
+        case .messageListUnavailable(let collapsed):
+            messages = []
+            lastIDs = []
+            status = collapsed
+                ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                : "Conversation detected: \(contact) · message list is unavailable"
+        case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
+            messages = snapshot
+            lastIDs = snapshot.map(\.id)
+            if snapshot.isEmpty {
+                status = renderedRows == 0 || bubbleRows == 0
+                    ? "Message list found, but no rendered message rows are available"
+                    : "Message rows found, but message text is unavailable"
+            } else if snapshot.allSatisfy({ !$0.senderIdentified }) {
+                status = "Message rows found, sender identity unavailable"
+            } else if snapshot.contains(where: { !$0.senderIdentified }) {
+                status = "Message rows found, some sender identities are unavailable"
+            } else {
+                status = "Monitoring this conversation"
             }
         }
     }
@@ -109,8 +155,11 @@ final class MessageMonitor: ObservableObject {
         guard !added.isEmpty else { status = "Monitoring this conversation"; return }
         let hasIncoming = added.contains(where: { $0.senderIdentified && !$0.isFromMe })
         let hasUnknown = added.contains(where: { !$0.senderIdentified })
-        guard hasIncoming || hasUnknown else { status = "Monitoring this conversation"; return }
-        scheduleBurst(contact: contact, canAutoAnalyze: hasIncoming && snapshot.allSatisfy(\.senderIdentified))
+        guard hasIncoming else {
+            status = hasUnknown ? "Message rows found, sender identity unavailable" : "Monitoring this conversation"
+            return
+        }
+        scheduleBurst(contact: contact, canAutoAnalyze: WeChatParsing.canAutomaticallyAnalyze(snapshot))
     }
 
     private func newMessages(_ current: [ChatMessage], old: [String]) -> [ChatMessage] {
@@ -131,7 +180,9 @@ final class MessageMonitor: ObservableObject {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled, let self, self.isRunning, self.generation == token else { return }
             self.status = canAutoAnalyze ? "Message ready · analyzing" : "Message ready · Analyze manually"
-            self.onBurst?(contact, self.messages.suffix(20).map { $0 }, canAutoAnalyze)
+            if canAutoAnalyze {
+                self.onBurst?(contact, self.messages.suffix(20).map { $0 }, true)
+            }
         }
     }
 }

@@ -25,6 +25,12 @@ bash build.sh --install
 open /Applications/WeChatReplyCopilot.app
 ```
 
+Run the local parser and sender-safety checks with:
+
+```bash
+bash test-wechat-parsing.sh
+```
+
 The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature unless a stable local signing identity is installed. Ad-hoc builds can require granting Accessibility permission again after each rebuild. The app bundle name is `WeChatReplyCopilot.app`.
 
 ### Keep Accessibility approval across rebuilds
@@ -67,6 +73,8 @@ Sources/
 
 The monitor reads the currently selected WeChat window's recognized message list. It does not read WeChat's local database, infer chat content from arbitrary visible text, access chat history outside the visible/retrievable Accessibility tree, or automatically scroll older messages.
 
+For target-Mac Accessibility troubleshooting, open **Settings → Developer diagnostics → Inspect WeChat AX**. The report is saved only after you choose a location and contains structural roles, sanitized identifiers, frames, and row counts; it omits message text, contact names, profile notes, and credentials.
+
 ## Manual acceptance checklist
 
 - [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission.
@@ -78,12 +86,13 @@ The monitor reads the currently selected WeChat window's recognized message list
 - [ ] Use Analyze, Regenerate carefully, and a special instruction.
 - [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
 - [ ] Confirm text outside the recognized message list is ignored and is never sent for analysis.
+- [ ] Save an **Inspect WeChat AX** report and verify only structural metadata is included.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 
 ## Known limitations
 
-- Accessibility structure varies by WeChat release. If message rows or sender identities are not exposed, visible text is marked uncertain and can only be sent through a manual Analyze action.
+- Accessibility structure varies by WeChat release. If no recognized message list is exposed, the app reads no message text. Bubble rows with unknown senders remain marked unknown and are never sent automatically.
 - Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.

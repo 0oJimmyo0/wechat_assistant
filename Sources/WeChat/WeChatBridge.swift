@@ -1,33 +1,28 @@
 import Cocoa
 import ApplicationServices
 
+enum MessageReadResult: Sendable {
+    case messageListUnavailable(treeCollapsed: Bool)
+    case messageListFound(messages: [ChatMessage], renderedRows: Int, bubbleRows: Int, placeholders: Int)
+}
+
 /// Read-only Accessibility access to the active WeChat conversation.
 final class WeChatBridge: @unchecked Sendable {
     static let shared = WeChatBridge()
 
+    private let officialWeChatBundleID = "com.tencent.xinWeChat"
+    private let helperBundleID = "com.wechatreplycopilot.app"
+
     var hasAccessibilityPermission: Bool { AXIsProcessTrusted() }
 
-    private let officialWeChatBundleID = "com.tencent.xinWeChat"
-
-    /// Resolve the real WeChat process by bundle identifier, never by a fuzzy
-    /// application-name match. The helper itself is named "WeChat Reply Copilot",
-    /// so matching `localizedName.contains("WeChat")` can accidentally bind the
-    /// Accessibility bridge to this app instead of WeChat.
     private func weChatApplication() -> NSRunningApplication? {
-        let apps = NSWorkspace.shared.runningApplications
-
-        // Prefer the official WeChat bundle exactly.
-        if let official = apps.first(where: { $0.bundleIdentifier == officialWeChatBundleID }) {
-            return official
-        }
-
-        // Conservative fallback for locally cloned WeChat builds whose bundle ID
-        // keeps Tencent's prefix. Explicitly exclude this helper's own process.
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        return apps.first {
+        let matches = NSWorkspace.shared.runningApplications.filter {
+            $0.bundleIdentifier == officialWeChatBundleID &&
             $0.processIdentifier != ownPID &&
-            ($0.bundleIdentifier?.hasPrefix(officialWeChatBundleID) == true)
+            $0.bundleIdentifier != helperBundleID
         }
+        return matches.first(where: { $0.isActive }) ?? matches.first(where: { $0.activationPolicy == .regular }) ?? matches.first
     }
 
     var isWeChatRunning: Bool { weChatApplication() != nil }
@@ -43,182 +38,275 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func value(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-        // WeChat may take a long time to answer Accessibility requests. Never let
-        // one unresponsive element hold the monitor indefinitely.
         AXUIElementSetMessagingTimeout(element, 1.0)
         var result: CFTypeRef?
-        AXUIElementCopyAttributeValue(element, name as CFString, &result)
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else { return nil }
         return result
     }
 
     private func string(_ element: AXUIElement, _ name: String) -> String? { value(element, name) as? String }
     private func identifier(_ element: AXUIElement) -> String { string(element, "AXIdentifier") ?? "" }
-    private func isSelected(_ element: AXUIElement) -> Bool { (value(element, "AXSelected") as? NSNumber)?.boolValue ?? false }
+    private func bool(_ element: AXUIElement, _ name: String) -> Bool { (value(element, name) as? NSNumber)?.boolValue ?? false }
+    private func children(_ element: AXUIElement) -> [AXUIElement] { (value(element, "AXChildren") as? [AXUIElement]) ?? [] }
 
     private func frame(_ element: AXUIElement) -> CGRect {
         var origin = CGPoint.zero
         var size = CGSize.zero
-        if let raw = value(element, "AXPosition") { AXValueGetValue(raw as! AXValue, .cgPoint, &origin) }
-        if let raw = value(element, "AXSize") { AXValueGetValue(raw as! AXValue, .cgSize, &size) }
+        if let raw = value(element, "AXPosition"), CFGetTypeID(raw) == AXValueGetTypeID() {
+            AXValueGetValue(raw as! AXValue, .cgPoint, &origin)
+        }
+        if let raw = value(element, "AXSize"), CFGetTypeID(raw) == AXValueGetTypeID() {
+            AXValueGetValue(raw as! AXValue, .cgSize, &size)
+        }
         return CGRect(origin: origin, size: size)
     }
-
-    private func children(_ element: AXUIElement) -> [AXUIElement] { (value(element, "AXChildren") as? [AXUIElement]) ?? [] }
 
     private func find(_ root: AXUIElement, depth: Int = 24, where predicate: (AXUIElement) -> Bool) -> [AXUIElement] {
         guard depth > 0 else { return predicate(root) ? [root] : [] }
         var results = predicate(root) ? [root] : []
-        for child in children(root) { results.append(contentsOf: find(child, depth: depth - 1, where: predicate)) }
+        for child in children(root) {
+            results.append(contentsOf: find(child, depth: depth - 1, where: predicate))
+        }
         return results
     }
 
+    private func windows(in appElement: AXUIElement) -> [AXUIElement] {
+        (value(appElement, "AXWindows") as? [AXUIElement]) ?? []
+    }
+
+    /// Select a visible, standard WeChat window. Focused/main windows win over
+    /// other standard windows; popovers, dialogs, minimized and settings/login
+    /// windows are excluded.
     private func mainWindow() -> AXUIElement? {
         guard let app = applicationElement() else { return nil }
-        if let focused = value(app, "AXFocusedWindow") { return (focused as! AXUIElement) }
-        return (value(app, "AXWindows") as? [AXUIElement])?.first
+        let allWindows = windows(in: app)
+        let candidates = allWindows.filter { window in
+            guard string(window, "AXRole") == "AXWindow" else { return false }
+            let subrole = string(window, "AXSubrole") ?? ""
+            guard subrole.isEmpty || subrole == "AXStandardWindow" else { return false }
+            guard !bool(window, "AXMinimized"), !bool(window, "AXHidden") else { return false }
+            let title = (string(window, "AXTitle") ?? "").lowercased()
+            let excludedTerms = ["settings", "preferences", "login", "sign in", "qr code", "扫码登录", "设置"]
+            return !excludedTerms.contains(where: title.contains)
+        }
+        guard !candidates.isEmpty else { return nil }
+
+        if let focusedValue = value(app, "AXFocusedWindow") {
+            let focused = focusedValue as! AXUIElement
+            if let match = candidates.first(where: { CFEqual($0, focused) }) { return match }
+        }
+        if let main = candidates.first(where: { bool($0, "AXMain") }) { return main }
+        return candidates.first
     }
 
     func currentContact() -> String? {
         guard let window = mainWindow() else { return nil }
-        if let title = string(window, "AXTitle"), !title.isEmpty, !isGenericWindowTitle(title) {
-            return normalizeChatTitle(title)
+
+        // 1. WeChat 4.x's stable conversation-title node.
+        let titleNodes = find(window) {
+            string($0, "AXRole") == "AXStaticText" && identifier($0) == WeChatParsing.chatTitleIdentifier
+        }
+        for node in titleNodes {
+            let raw = string(node, "AXValue") ?? string(node, "AXTitle") ?? ""
+            let name = WeChatParsing.normalizeChatTitle(raw)
+            if !name.isEmpty && !WeChatParsing.isGenericWindowTitle(name) { return name }
         }
 
-        // WeChat 4.x exposes the open conversation title as a stable
-        // AXStaticText identifier. Prefer this over sidebar-selection state:
-        // recent clients do not consistently expose AXSelected on session rows.
-        let titleElements = find(window, depth: 24) {
-            self.string($0, "AXRole") == "AXStaticText" &&
-            self.identifier($0) == "big_title_line_h_view"
+        // 2. Session item identifiers are useful only when WeChat explicitly
+        // exposes the row's selected state. Never guess from arbitrary text.
+        let selectedSessionRows = find(window) {
+            identifier($0).hasPrefix("session_item_") && bool($0, "AXSelected")
         }
-        for element in titleElements {
-            let raw = self.string(element, "AXValue") ?? self.string(element, "AXTitle") ?? ""
-            let name = normalizeChatTitle(raw)
-            if !name.isEmpty, !isGenericWindowTitle(name) { return name }
-        }
-
-        // Some WeChat builds keep the window title at "WeChat (Chats)" even
-        // while a conversation is open. Prefer the selected chat row's stable
-        // identifier, whose value is the display name in WeChat's sidebar.
-        let selectedChatRows = find(window, depth: 16) {
-            self.identifier($0).hasPrefix("session_item_") && self.isSelected($0)
-        }
-        for row in selectedChatRows {
-            let prefix = "session_item_"
-            let idName = String(identifier(row).dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !idName.isEmpty { return normalizeChatTitle(idName) }
-            if let rowTitle = string(row, "AXTitle"), let firstLine = firstLine(of: rowTitle), !isGenericWindowTitle(firstLine) {
-                return normalizeChatTitle(firstLine)
+        for row in selectedSessionRows {
+            if let name = WeChatParsing.selectedSessionName(from: identifier(row), isSelected: true) {
+                return name
             }
-        }
-
-        // Older clients may not expose the session row identifier. Use a
-        // selected sidebar row or a conversation header only when the window
-        // also exposes a message list or the chat composer.
-        let hasChatEvidence = hasRecognizedMessageList(in: window) || hasConversationComposer(in: window)
-        guard hasChatEvidence else { return nil }
-        let bounds = frame(window)
-        let selectedRows = find(window, depth: 16) { element in
-            guard ["AXRow", "AXCell", "AXOutlineRow"].contains(self.string(element, "AXRole") ?? ""), self.isSelected(element) else { return false }
-            return self.frame(element).minX < bounds.minX + bounds.width * 0.45
-        }
-        for row in selectedRows {
-            let rowText = string(row, "AXTitle") ?? string(row, "AXValue") ?? ""
-            if let name = firstLine(of: rowText), !isGenericWindowTitle(name) { return normalizeChatTitle(name) }
-        }
-
-        let headerLabels = find(window, depth: 16) { element in
-            guard self.string(element, "AXRole") == "AXStaticText" else { return false }
-            let rect = self.frame(element)
-            guard rect.minX > bounds.minX + bounds.width * 0.28,
-                  rect.minY >= bounds.minY + 30,
-                  rect.minY < bounds.minY + 150 else { return false }
-            let text = self.string(element, "AXValue") ?? self.string(element, "AXTitle") ?? ""
-            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !self.isGenericWindowTitle(text)
-        }.sorted { frame($0).minY < frame($1).minY }
-        for label in headerLabels {
-            let text = string(label, "AXValue") ?? string(label, "AXTitle") ?? ""
-            if let name = firstLine(of: text), !isGenericWindowTitle(name) { return normalizeChatTitle(name) }
         }
         return nil
     }
 
-    private func isGenericWindowTitle(_ title: String) -> Bool {
-        let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: " ", with: "")
-            .lowercased()
-        return ["wechat", "wechat(chats)", "wechat(contacts)", "wechat(discover)", "微信", "微信(聊天)", "微信(通讯录)"].contains(normalized)
-    }
+    func readMessages(limit: Int = 20) -> MessageReadResult {
+        guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false) }
 
-    private func firstLine(of text: String) -> String? {
-        text.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func normalizeChatTitle(_ text: String) -> String {
-        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Group chats can be rendered as "Group Name(23)" where the suffix is
-        // the member count. Strip only a trailing numeric parenthesized suffix.
-        if let range = value.range(of: #"\(\d+\)$"#, options: .regularExpression) {
-            value.removeSubrange(range)
-            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 1. Stable WeChat 4.x message-list identifier.
+        if let list = find(window, where: {
+            string($0, "AXRole") == "AXList" && identifier($0) == WeChatParsing.messageListIdentifier
+        }).first {
+            return readRows(in: list, limit: limit)
         }
-        return value
+
+        // 2. Localized AXTitle fallback.
+        if let list = find(window, where: {
+            string($0, "AXRole") == "AXList" && ["Messages", "消息"].contains(string($0, "AXTitle") ?? "")
+        }).first {
+            return readRows(in: list, limit: limit)
+        }
+
+        // 3. Conservative older-client fallback: only inspect AXLists under a
+        // large right-side scroll area when the chat composer is also present.
+        guard hasConversationComposer(in: window) else {
+            return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window))
+        }
+        let windowFrame = frame(window)
+        let paneAreas = find(window) {
+            guard string($0, "AXRole") == "AXScrollArea" else { return false }
+            let bounds = frame($0)
+            return bounds.minX > windowFrame.minX + windowFrame.width * 0.25 &&
+                bounds.width > 220 && bounds.height > 300
+        }
+        for area in paneAreas {
+            if let list = find(area, depth: 8, where: { string($0, "AXRole") == "AXList" }).first {
+                return readRows(in: list, limit: limit)
+            }
+        }
+        return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window))
     }
 
-    private func hasRecognizedMessageList(in root: AXUIElement) -> Bool {
-        !find(root) {
-            self.string($0, "AXRole") == "AXList" &&
-            (["Messages", "消息"].contains(self.string($0, "AXTitle") ?? "") || self.identifier($0) == "chat_message_list")
-        }.isEmpty
+    private func readRows(in list: AXUIElement, limit: Int) -> MessageReadResult {
+        let rows = children(list)
+        var messages: [ChatMessage] = []
+        var bubbleRows = 0
+        var placeholders = 0
+        for row in rows {
+            // Read the row's structural fields together with its preferred text.
+            let rowIdentifier = identifier(row)
+            let rowTitle = string(row, "AXTitle")
+            let rowValue = string(row, "AXValue")
+            let rowFrame = frame(row)
+            _ = rowFrame
+
+            if rowIdentifier == WeChatParsing.placeholderRowIdentifier {
+                placeholders += 1
+                continue
+            }
+            guard rowIdentifier == WeChatParsing.messageRowIdentifier else { continue }
+            bubbleRows += 1
+
+            guard let text = WeChatParsing.messageText(identifier: rowIdentifier, title: rowTitle, value: rowValue) else { continue }
+            let description = string(row, "AXDescription") ?? ""
+            let sender = WeChatParsing.sender(from: description)
+            messages.append(ChatMessage(text: text, sender: sender))
+        }
+        return .messageListFound(
+            messages: Array(messages.suffix(limit)),
+            renderedRows: rows.count,
+            bubbleRows: bubbleRows,
+            placeholders: placeholders
+        )
     }
 
     private func hasConversationComposer(in root: AXUIElement) -> Bool {
         let bounds = frame(root)
         return !find(root, depth: 16) { element in
-            guard self.string(element, "AXRole") == "AXTextArea" else { return false }
-            let rect = self.frame(element)
+            guard string(element, "AXRole") == "AXTextArea" else { return false }
+            let rect = frame(element)
             return rect.minX > bounds.minX + bounds.width * 0.25 &&
                 rect.minY > bounds.minY + bounds.height * 0.65 &&
                 rect.width > 180 && rect.height > 30
         }.isEmpty
     }
 
-    func recentMessages(limit: Int = 20) -> [ChatMessage] {
-        guard let window = mainWindow() else { return [] }
-        let lists = find(window) {
-            self.string($0, "AXRole") == "AXList" &&
-            (["Messages", "消息"].contains(self.string($0, "AXTitle") ?? "") || self.identifier($0) == "chat_message_list")
-        }
-        if let list = lists.first { return Array(parse(list).suffix(limit)) }
-
-        let windowFrame = frame(window)
-        let areas = find(window) {
-            guard self.string($0, "AXRole") == "AXScrollArea" else { return false }
-            let bounds = self.frame($0)
-            return bounds.minX > windowFrame.minX + 200 && bounds.height > 300
-        }
-        for area in areas {
-            if let list = find(area, depth: 6, where: { self.string($0, "AXRole") == "AXList" }).first {
-                let messages = parse(list)
-                if !messages.isEmpty { return Array(messages.suffix(limit)) }
-            }
-        }
-        // Do not treat arbitrary visible text as chat content: WeChat's contact
-        // details and notes can appear in the same part of the window.
-        return []
+    func accessibilityTreeAppearsCollapsed() -> Bool {
+        guard let window = mainWindow() else { return false }
+        return accessibilityTreeAppearsCollapsed(in: window)
     }
 
-    private func parse(_ list: AXUIElement) -> [ChatMessage] {
-        children(list).compactMap { row in
-            let texts = find(row, depth: 8) { ["AXStaticText", "AXTextArea"].contains(self.string($0, "AXRole") ?? "") }
-            let text = texts.compactMap { self.string($0, "AXValue") ?? self.string($0, "AXTitle") }.max { $0.count < $1.count }
-                ?? self.string(row, "AXValue") ?? self.string(row, "AXTitle") ?? ""
-            guard text.count >= 1 else { return nil }
-            let description = self.string(row, "AXDescription") ?? ""
-            let normalized = description.lowercased()
-            let mine = normalized.hasPrefix("sent") || description.hasPrefix("发出") || description.hasPrefix("我说")
-            let received = normalized.hasPrefix("received") || description.hasPrefix("收到") || description.hasPrefix("对方")
-            return ChatMessage(text: text, isFromMe: mine, senderIdentified: mine || received)
+    private func accessibilityTreeAppearsCollapsed(in window: AXUIElement) -> Bool {
+        let nodes = find(window, depth: 8) { element in
+            ["AXTextArea", "AXList", "AXScrollArea"].contains(string(element, "AXRole") ?? "") ||
+                identifier(element) == WeChatParsing.chatTitleIdentifier ||
+                identifier(element) == WeChatParsing.messageListIdentifier
         }
+        return nodes.isEmpty && children(window).count <= 8
+    }
+
+    /// Produces structural metadata only. This method never reads AXValue or
+    /// prints to a log; the UI writes the returned report only after an explicit
+    /// user action. Potentially identifying window titles and row identifiers
+    /// are redacted before the report is returned.
+    func diagnosticReport() -> String {
+        guard let runningApp = weChatApplication() else {
+            return "WeChat bundle: \(officialWeChatBundleID)\nProcess: not running\n"
+        }
+        let appElement = AXUIElementCreateApplication(runningApp.processIdentifier)
+        let appWindows = windows(in: appElement)
+        let selectedWindow = mainWindow()
+        var lines = [
+            "WeChat bundle: \(runningApp.bundleIdentifier ?? "<unknown>")",
+            "PID: \(runningApp.processIdentifier)",
+            "Helper excluded: \(runningApp.processIdentifier != ProcessInfo.processInfo.processIdentifier && runningApp.bundleIdentifier != helperBundleID)",
+            "Windows: \(appWindows.count)"
+        ]
+
+        for (index, window) in appWindows.enumerated() {
+            let role = string(window, "AXRole") ?? "<unavailable>"
+            let title = WeChatParsing.genericDiagnosticWindowTitle(string(window, "AXTitle"))
+            let subrole = string(window, "AXSubrole") ?? "<unavailable>"
+            lines.append("Window \(index + 1): role=\(role) subrole=\(subrole) title=\(title) minimized=\(bool(window, "AXMinimized"))")
+        }
+
+        guard let window = selectedWindow else {
+            lines.append("Main conversation window: unavailable")
+            return lines.joined(separator: "\n") + "\n"
+        }
+        let windowRole = string(window, "AXRole") ?? "<unavailable>"
+        let windowIdentifier = WeChatParsing.diagnosticIdentifier(identifier(window))
+        let windowFrame = frame(window)
+        lines.append("Main window:")
+        lines.append("  role=\(windowRole)")
+        lines.append("  identifier=\(windowIdentifier)")
+        lines.append("  frame=\(frameDescription(windowFrame))")
+
+        let titleNodes = find(window) {
+            string($0, "AXRole") == "AXStaticText" && identifier($0) == WeChatParsing.chatTitleIdentifier
+        }
+        lines.append("Current-chat title element:")
+        lines.append("  found=\(!titleNodes.isEmpty)")
+        lines.append("  identifier=\(titleNodes.isEmpty ? "<none>" : WeChatParsing.chatTitleIdentifier)")
+
+        let messageLists = find(window) {
+            string($0, "AXRole") == "AXList" && identifier($0) == WeChatParsing.messageListIdentifier
+        }
+        let localizedLists = find(window) {
+            string($0, "AXRole") == "AXList" && ["Messages", "消息"].contains(string($0, "AXTitle") ?? "")
+        }
+        let allBubbleRows = find(window) { identifier($0) == WeChatParsing.messageRowIdentifier }.count
+        let allPlaceholderRows = find(window) { identifier($0) == WeChatParsing.placeholderRowIdentifier }.count
+        lines.append("Message list:")
+        lines.append("  chat_message_list found=\(!messageLists.isEmpty)")
+        lines.append("  localized Messages/消息 list found=\(!localizedLists.isEmpty)")
+        lines.append("  message rows in window chat_bubble_item_view=\(allBubbleRows) virtual_cell=\(allPlaceholderRows)")
+        if let list = messageLists.first {
+            let rows = children(list)
+            let bubbleCount = rows.filter { identifier($0) == WeChatParsing.messageRowIdentifier }.count
+            let virtualCount = rows.filter { identifier($0) == WeChatParsing.placeholderRowIdentifier }.count
+            lines.append("  role=\(string(list, "AXRole") ?? "<unavailable>")")
+            lines.append("  identifier=\(WeChatParsing.messageListIdentifier)")
+            lines.append("  children total=\(rows.count) chat_bubble_item_view=\(bubbleCount) virtual_cell=\(virtualCount) other=\(max(0, rows.count - bubbleCount - virtualCount))")
+        }
+
+        let nodes = structuralNodes(in: window, maximum: 500)
+        lines.append("Structural nodes (text values omitted; identifiers sanitized):")
+        lines.append(contentsOf: nodes)
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func structuralNodes(in root: AXUIElement, maximum: Int) -> [String] {
+        var output: [String] = []
+        var stack: [(AXUIElement, Int)] = [(root, 0)]
+        while let (element, depth) = stack.popLast(), output.count < maximum {
+            let role = string(element, "AXRole") ?? "<unavailable>"
+            let id = WeChatParsing.diagnosticIdentifier(identifier(element))
+            let childNodes = children(element)
+            let bounds = frame(element)
+            output.append("  \(String(repeating: " ", count: min(depth, 12)))role=\(role) identifier=\(id) children=\(childNodes.count) frame=\(frameDescription(bounds))")
+            for child in childNodes.reversed() { stack.append((child, depth + 1)) }
+        }
+        if !stack.isEmpty { output.append("  <node output capped>") }
+        return output
+    }
+
+    private func frameDescription(_ rect: CGRect) -> String {
+        "\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width)),\(Int(rect.height))"
     }
 }
