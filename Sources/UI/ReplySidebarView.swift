@@ -186,6 +186,13 @@ struct ReplySidebarView: View {
             HStack {
                 Label("Monitor", systemImage: monitor.isRunning ? "eye.fill" : "eye.slash")
                 Spacer()
+                Button {
+                    monitor.pollNow()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered).controlSize(.small)
+                .disabled(!monitor.isRunning)
                 Button(monitor.isRunning ? "Deactivate" : "Activate") {
                     if monitor.isRunning { monitor.stop() } else { usageLimitReached = false; monitor.start() }
                 }
