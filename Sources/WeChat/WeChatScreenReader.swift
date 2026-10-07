@@ -103,7 +103,8 @@ final class WeChatScreenReader {
                       height: calibration.headerBottomY - calibration.composerTopY - 0.02)
     }
 
-    private let lock = NSLock()
+    private let cacheCondition = NSCondition()
+    private var captureInProgress = false
     private var cachedKey: String?
     private var cachedAt = Date.distantPast
     private var cachedSnapshot: VisibleWeChatSnapshot?
@@ -148,18 +149,30 @@ final class WeChatScreenReader {
     private func read(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
                       forceFresh: Bool) -> VisibleWeChatSnapshot {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
-        lock.lock()
-        defer { lock.unlock() }
+        cacheCondition.lock()
+        while captureInProgress { cacheCondition.wait() }
         if mode == .full, !forceFresh, cachedKey == key, Date().timeIntervalSince(cachedAt) < cacheDuration,
            let cachedSnapshot {
+            cacheCondition.unlock()
             return cachedSnapshot
         }
+        captureInProgress = true
+        cacheCondition.unlock()
+
+        // ScreenCaptureKit, semaphore waits, and Vision OCR all run without
+        // holding the cache lock. Other readers wait on the condition and can
+        // never start a duplicate capture while these mutable window caches
+        // are in use.
         let result = capture(pid: pid, windowFrame: windowFrame, mode: mode, forceFresh: forceFresh)
+        cacheCondition.lock()
         if mode == .full {
             cachedKey = key
             cachedSnapshot = result.snapshot
             cachedAt = Date()
         }
+        captureInProgress = false
+        cacheCondition.broadcast()
+        cacheCondition.unlock()
         return result.snapshot
     }
 
@@ -616,12 +629,19 @@ final class WeChatScreenReader {
 
     func annotatedPreview(pid: pid_t, windowFrame: CGRect) -> NSImage? {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
-        lock.lock()
+        cacheCondition.lock()
+        while captureInProgress { cacheCondition.wait() }
+        captureInProgress = true
+        cacheCondition.unlock()
+
         let result = capture(pid: pid, windowFrame: windowFrame, mode: .full, forceFresh: true)
+        cacheCondition.lock()
         cachedKey = key
         cachedSnapshot = result.snapshot
         cachedAt = Date()
-        lock.unlock()
+        captureInProgress = false
+        cacheCondition.broadcast()
+        cacheCondition.unlock()
         guard let source = result.image, result.snapshot.captureSucceeded else { return nil }
 
         let size = NSSize(width: source.width, height: source.height)

@@ -1,6 +1,13 @@
 import Foundation
 import Combine
 
+private final class MonitorWorkCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+}
+
 @MainActor
 final class MessageMonitor: ObservableObject {
     static let shared = MessageMonitor()
@@ -21,6 +28,9 @@ final class MessageMonitor: ObservableObject {
     private var generation = 0
     private var isCheckingConversation = false
     private var isPolling = false
+    private var activationTimeoutWorkItem: DispatchWorkItem?
+    private var sessionCancellation: MonitorWorkCancellation?
+    private var lastActivationDiagnostic = "Activation timing: not recorded yet"
     private var isUsingVision = false
     private var unidentifiedPolls = 0
     private var candidateContact: String?
@@ -42,7 +52,8 @@ final class MessageMonitor: ObservableObject {
             "Candidate contact active: \(candidateContact == nil ? "no" : "yes")",
             "Candidate contact consecutive detections: \(candidateContactPolls)",
             "Vision title consensus count: \(titleConsensusCount)",
-            "Consecutive title misses: \(unidentifiedPolls)"
+            "Consecutive title misses: \(unidentifiedPolls)",
+            lastActivationDiagnostic
         ].joined(separator: "\n")
     }
 
@@ -61,20 +72,54 @@ final class MessageMonitor: ObservableObject {
         stableVisionIdentity = nil
         candidateVisionIdentity = nil
         titleConsensusCount = 0
-        status = "Identifying conversation…"
         generation += 1
         let token = generation
+        let cancellation = MonitorWorkCancellation()
+        sessionCancellation?.cancel()
+        sessionCancellation = cancellation
+        status = "Finding WeChat window…"
+        let timeout = DispatchWorkItem { [weak self, cancellation] in
+            guard let self, self.generation == token, self.isCheckingConversation else { return }
+            cancellation.cancel()
+            self.isCheckingConversation = false
+            self.generation += 1
+            self.activationTimeoutWorkItem = nil
+            self.lastActivationDiagnostic = "Activation total: >=5000 ms\n\(self.bridge.readerBackendDiagnostic)"
+            self.status = "Conversation identification timed out. Retry or inspect Vision diagnostics."
+        }
+        activationTimeoutWorkItem?.cancel()
+        activationTimeoutWorkItem = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+        let activationStarted = ProcessInfo.processInfo.systemUptime
         let bridge = self.bridge
         let minimumTitleConfidence = minimumVisionSwitchTitleConfidence
         accessibilityQueue.async { [weak self] in
-            var detection = bridge.detectCurrentConversation()
+            var titleCaptureWallMilliseconds: [Int] = []
+            let stageUpdate: (String) -> Void = { [weak self] value in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token, self.isCheckingConversation else { return }
+                    self.status = value
+                }
+            }
+            let firstCaptureStarted = ProcessInfo.processInfo.systemUptime
+            var detection = bridge.detectCurrentConversation(onStage: stageUpdate)
+            titleCaptureWallMilliseconds.append(Int((ProcessInfo.processInfo.systemUptime - firstCaptureStarted) * 1000))
+            guard !cancellation.isCancelled else { return }
+            var titleDetections = [detection]
             var contact = detection.contact
             var titleWasUnstable = false
             var consensusCount = 0
             if detection.visionSnapshot != nil {
                 var captures = [detection]
                 Thread.sleep(forTimeInterval: 0.12)
-                captures.append(bridge.detectCurrentConversation(forceFreshVision: true))
+                guard !cancellation.isCancelled else { return }
+                stageUpdate("Confirming conversation…")
+                let secondCaptureStarted = ProcessInfo.processInfo.systemUptime
+                let secondDetection = bridge.detectCurrentConversation(forceFreshVision: true)
+                captures.append(secondDetection)
+                titleDetections.append(secondDetection)
+                titleCaptureWallMilliseconds.append(Int((ProcessInfo.processInfo.systemUptime - secondCaptureStarted) * 1000))
+                guard !cancellation.isCancelled else { return }
 
                 let fastPairIsStrong: Bool = {
                     guard captures.count == 2,
@@ -90,7 +135,13 @@ final class MessageMonitor: ObservableObject {
                     consensusCount = 2
                 } else {
                     Thread.sleep(forTimeInterval: 0.12)
-                    captures.append(bridge.detectCurrentConversation(forceFreshVision: true))
+                    guard !cancellation.isCancelled else { return }
+                    let thirdCaptureStarted = ProcessInfo.processInfo.systemUptime
+                    let thirdDetection = bridge.detectCurrentConversation(forceFreshVision: true)
+                    captures.append(thirdDetection)
+                    titleDetections.append(thirdDetection)
+                    titleCaptureWallMilliseconds.append(Int((ProcessInfo.processInfo.systemUptime - thirdCaptureStarted) * 1000))
+                    guard !cancellation.isCancelled else { return }
                     let latestPairConfirmsTitle: Bool = {
                         guard let earlier = captures[1].visionSnapshot?.titleIdentity,
                               let later = captures[2].visionSnapshot?.titleIdentity else { return false }
@@ -113,10 +164,18 @@ final class MessageMonitor: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
+                self.activationTimeoutWorkItem?.cancel()
+                self.activationTimeoutWorkItem = nil
                 guard let contact, !contact.isEmpty else {
+                    self.lastActivationDiagnostic = self.activationTimingReport(
+                        titleDetections: titleDetections,
+                        titleCaptureWallMilliseconds: titleCaptureWallMilliseconds,
+                        messageReadMilliseconds: nil,
+                        totalMilliseconds: Int((ProcessInfo.processInfo.systemUptime - activationStarted) * 1000)
+                    )
                     self.requestScreenCaptureAccessIfNeeded(detection.visionSnapshot?.captureState)
                     self.status = titleWasUnstable
-                        ? "Identifying conversation… title did not remain stable across captures"
+                        ? "Could not confirm a stable conversation title. Try again or inspect Vision diagnostics."
                         : self.detectionFailureStatus(detection)
                     return
                 }
@@ -130,12 +189,22 @@ final class MessageMonitor: ObservableObject {
                 self.status = "Conversation identified · reading messages"
             }
             guard let contact else { return }
+            guard !cancellation.isCancelled else { return }
+            let messageReadStarted = ProcessInfo.processInfo.systemUptime
             let result = bridge.readMessages(accurateVision: true)
+            let messageReadMilliseconds = Int((ProcessInfo.processInfo.systemUptime - messageReadStarted) * 1000)
+            let totalMilliseconds = Int((ProcessInfo.processInfo.systemUptime - activationStarted) * 1000)
             Task { @MainActor [weak self] in
                 guard let self,
                       self.generation == token,
                       self.isRunning,
                       self.lockedContact == contact else { return }
+                self.lastActivationDiagnostic = self.activationTimingReport(
+                    titleDetections: titleDetections,
+                    titleCaptureWallMilliseconds: titleCaptureWallMilliseconds,
+                    messageReadMilliseconds: messageReadMilliseconds,
+                    totalMilliseconds: totalMilliseconds
+                )
                 self.applyInitialReadResult(result, contact: contact)
                 self.timer = Timer.scheduledTimer(withTimeInterval: self.pollingInterval, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.poll() }
@@ -154,6 +223,10 @@ final class MessageMonitor: ObservableObject {
         stableVisionIdentity = nil
         candidateVisionIdentity = nil
         titleConsensusCount = 0
+        activationTimeoutWorkItem?.cancel()
+        activationTimeoutWorkItem = nil
+        sessionCancellation?.cancel()
+        sessionCancellation = nil
         timer?.invalidate(); timer = nil
         debounce?.cancel(); debounce = nil
         generation += 1
@@ -176,9 +249,11 @@ final class MessageMonitor: ObservableObject {
         let bridge = self.bridge
         let lockedContact = self.lockedContact
         let lockedVisionIdentity = self.stableVisionIdentity
+        let cancellation = self.sessionCancellation
         let minimumTitleConfidence = self.minimumVisionSwitchTitleConfidence
         accessibilityQueue.async { [weak self] in
             let detection = bridge.detectCurrentConversation()
+            guard cancellation?.isCancelled != true else { return }
             let contact: String?
             if let vision = detection.visionSnapshot {
                 contact = (vision.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence
@@ -196,6 +271,7 @@ final class MessageMonitor: ObservableObject {
                 }
                 return true
             } ?? false
+            guard cancellation?.isCancelled != true else { return }
             let result = contactsMatch ? bridge.readMessages(limit: 50, accurateVision: false) : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -317,6 +393,28 @@ final class MessageMonitor: ObservableObject {
                 status = isUsingVision ? "Vision mode · monitoring this conversation" : "Monitoring this conversation"
             }
         }
+    }
+
+    private func activationTimingReport(
+        titleDetections: [WeChatConversationDetection],
+        titleCaptureWallMilliseconds: [Int],
+        messageReadMilliseconds: Int?,
+        totalMilliseconds: Int
+    ) -> String {
+        let first = titleDetections.first
+        var lines = [
+            "Backend: \(first?.backend.rawValue ?? "unknown")",
+            "Main window AX lookup: \(first?.mainWindowLookupMilliseconds ?? 0) ms",
+            "AX capability probe: \(first?.capabilityProbeMilliseconds ?? 0) ms"
+        ]
+        for index in titleDetections.indices {
+            let snapshot = titleDetections[index].visionSnapshot
+            lines.append("Title capture \(index + 1): wall \(index < titleCaptureWallMilliseconds.count ? titleCaptureWallMilliseconds[index] : 0) ms, window discovery \(snapshot?.windowDiscoveryDurationMilliseconds ?? 0) ms, screenshot \(snapshot?.captureDurationMilliseconds ?? 0) ms, OCR \(snapshot?.visionDurationMilliseconds ?? 0) ms")
+        }
+        lines.append("Title confirmation total: \(titleCaptureWallMilliseconds.reduce(0, +)) ms")
+        lines.append("Initial message read (OCR/AX): \(messageReadMilliseconds.map { "\($0) ms" } ?? "not run")")
+        lines.append("Activation total: \(totalMilliseconds) ms")
+        return lines.joined(separator: "\n")
     }
 
     private func collapsedTreeStatus(screenCaptureAllowed: Bool) -> String {

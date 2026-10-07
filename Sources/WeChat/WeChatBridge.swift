@@ -11,6 +11,15 @@ struct WeChatConversationDetection: Sendable {
     let windowFound: Bool
     let treeCollapsed: Bool
     let visionSnapshot: VisibleWeChatSnapshot?
+    let backend: WeChatReaderBackend
+    let mainWindowLookupMilliseconds: Int
+    let capabilityProbeMilliseconds: Int
+}
+
+enum WeChatReaderBackend: String, Sendable {
+    case unknown
+    case accessibility
+    case vision
 }
 
 /// Read-only Accessibility access to the active WeChat conversation.
@@ -19,7 +28,26 @@ final class WeChatBridge: @unchecked Sendable {
 
     private let officialWeChatBundleID = "com.tencent.xinWeChat"
     private let helperBundleID = "com.wechatreplycopilot.app"
-    private let accessibilityTimeout: Float = 0.5
+    private let accessibilityTimeout: Float = 0.15
+    private let backendLock = NSCondition()
+    private var backendPID: pid_t?
+    private var readerBackend: WeChatReaderBackend = .unknown
+    private var backendProbeMilliseconds = 0
+    private var backendProbeResult = "not yet run"
+    private var backendProbeNodes = 0
+    private var backendProbeInProgress = false
+    private var semanticTitleAvailable = false
+    private var cachedAXWindow: AXUIElement?
+    private var cachedAXWindowPID: pid_t?
+
+    private struct AXCapabilityProbe {
+        let title: String?
+        let selectedSession: String?
+        let hasMessageList: Bool
+        let visitedNodes: Int
+        let timedOut: Bool
+        var supportsAccessibility: Bool { title != nil || selectedSession != nil || hasMessageList }
+    }
 
     var hasAccessibilityPermission: Bool { AXIsProcessTrusted() }
 
@@ -30,7 +58,22 @@ final class WeChatBridge: @unchecked Sendable {
             $0.processIdentifier != ownPID &&
             $0.bundleIdentifier != helperBundleID
         }
-        return matches.first(where: { $0.isActive }) ?? matches.first(where: { $0.activationPolicy == .regular }) ?? matches.first
+        let selected = matches.first(where: { $0.isActive }) ?? matches.first(where: { $0.activationPolicy == .regular }) ?? matches.first
+        if selected == nil {
+            backendLock.lock()
+            backendPID = nil
+            readerBackend = .unknown
+            backendProbeMilliseconds = 0
+            backendProbeResult = "not yet run"
+            backendProbeNodes = 0
+            backendProbeInProgress = false
+            semanticTitleAvailable = false
+            cachedAXWindow = nil
+            cachedAXWindowPID = nil
+            backendLock.broadcast()
+            backendLock.unlock()
+        }
+        return selected
     }
 
     var isWeChatRunning: Bool { weChatApplication() != nil }
@@ -45,25 +88,28 @@ final class WeChatBridge: @unchecked Sendable {
         return AXUIElementCreateApplication(app.processIdentifier)
     }
 
-    private func value(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-        AXUIElementSetMessagingTimeout(element, accessibilityTimeout)
+    private func value(_ element: AXUIElement, _ name: String, timeout: Float? = nil) -> CFTypeRef? {
+        AXUIElementSetMessagingTimeout(element, timeout ?? accessibilityTimeout)
         var result: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else { return nil }
         return result
     }
 
-    private func string(_ element: AXUIElement, _ name: String) -> String? { value(element, name) as? String }
-    private func identifier(_ element: AXUIElement) -> String { string(element, "AXIdentifier") ?? "" }
+    private func string(_ element: AXUIElement, _ name: String, timeout: Float? = nil) -> String? { value(element, name, timeout: timeout) as? String }
+    private func identifier(_ element: AXUIElement, timeout: Float? = nil) -> String { string(element, "AXIdentifier", timeout: timeout) ?? "" }
     private func bool(_ element: AXUIElement, _ name: String) -> Bool { (value(element, name) as? NSNumber)?.boolValue ?? false }
-    private func children(_ element: AXUIElement) -> [AXUIElement] { (value(element, "AXChildren") as? [AXUIElement]) ?? [] }
+    private func bool(_ element: AXUIElement, _ name: String, timeout: Float) -> Bool {
+        (value(element, name, timeout: timeout) as? NSNumber)?.boolValue ?? false
+    }
+    private func children(_ element: AXUIElement, timeout: Float? = nil) -> [AXUIElement] { (value(element, "AXChildren", timeout: timeout) as? [AXUIElement]) ?? [] }
 
-    private func frame(_ element: AXUIElement) -> CGRect {
+    private func frame(_ element: AXUIElement, timeout: Float? = nil) -> CGRect {
         var origin = CGPoint.zero
         var size = CGSize.zero
-        if let raw = value(element, "AXPosition"), CFGetTypeID(raw) == AXValueGetTypeID() {
+        if let raw = value(element, "AXPosition", timeout: timeout), CFGetTypeID(raw) == AXValueGetTypeID() {
             AXValueGetValue(raw as! AXValue, .cgPoint, &origin)
         }
-        if let raw = value(element, "AXSize"), CFGetTypeID(raw) == AXValueGetTypeID() {
+        if let raw = value(element, "AXSize", timeout: timeout), CFGetTypeID(raw) == AXValueGetTypeID() {
             AXValueGetValue(raw as! AXValue, .cgSize, &size)
         }
         return CGRect(origin: origin, size: size)
@@ -91,8 +137,8 @@ final class WeChatBridge: @unchecked Sendable {
         (value(appElement, "AXWindows") as? [AXUIElement]) ?? []
     }
 
-    private func windowElement(_ appElement: AXUIElement, attribute: String) -> AXUIElement? {
-        guard let raw = value(appElement, attribute) else { return nil }
+    private func windowElement(_ appElement: AXUIElement, attribute: String, timeout: Float? = nil) -> AXUIElement? {
+        guard let raw = value(appElement, attribute, timeout: timeout) else { return nil }
         guard CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
         return (raw as! AXUIElement)
     }
@@ -125,33 +171,210 @@ final class WeChatBridge: @unchecked Sendable {
     /// other standard windows; popovers, dialogs, minimized and settings/login
     /// windows are excluded.
     private func mainWindow() -> AXUIElement? {
-        guard let app = applicationElement() else { return nil }
-        let allWindows = windowCandidates(in: app)
-        let candidates = allWindows.filter { window in
-            guard string(window, "AXRole") == "AXWindow" else { return false }
-            let subrole = string(window, "AXSubrole") ?? ""
-            guard subrole.isEmpty || subrole == "AXStandardWindow" else { return false }
-            guard !bool(window, "AXMinimized"), !bool(window, "AXHidden") else { return false }
-            let title = (string(window, "AXTitle") ?? "").lowercased()
-            let excludedTerms = ["settings", "preferences", "login", "sign in", "qr code", "扫码登录", "设置"]
-            return !excludedTerms.contains(where: title.contains)
-        }
-        guard !candidates.isEmpty else { return nil }
+        guard let runningApp = weChatApplication() else { return nil }
+        let pid = runningApp.processIdentifier
+        let app = AXUIElementCreateApplication(pid)
 
-        if let focused = windowElement(app, attribute: "AXFocusedWindow") {
-            if let match = candidates.first(where: { CFEqual($0, focused) }) { return match }
+        backendLock.lock()
+        let cached = cachedAXWindowPID == pid ? cachedAXWindow : nil
+        backendLock.unlock()
+        if let focused = windowElement(app, attribute: "AXFocusedWindow", timeout: 0.08) {
+            guard isUsableConversationWindow(focused) else { return nil }
+            cacheMainWindow(focused, pid: pid)
+            return focused
         }
-        if let main = candidates.first(where: { bool($0, "AXMain") }) { return main }
-        return candidates.first
+        if let cached, isUsableConversationWindow(cached) { return cached }
+
+        // Focused/main window attributes are cheaper than materializing and
+        // filtering the full AXWindows tree on every Vision poll.
+        for attribute in ["AXMainWindow"] {
+            guard let candidate = windowElement(app, attribute: attribute, timeout: 0.08),
+                  isUsableConversationWindow(candidate) else { continue }
+            cacheMainWindow(candidate, pid: pid)
+            return candidate
+        }
+
+        let candidates = windows(in: app).filter(isUsableConversationWindow)
+        guard let selected = candidates.first else { return nil }
+        cacheMainWindow(selected, pid: pid)
+        return selected
+    }
+
+    private func isUsableConversationWindow(_ window: AXUIElement) -> Bool {
+        let shortTimeout: Float = 0.08
+        guard string(window, "AXRole", timeout: shortTimeout) == "AXWindow" else { return false }
+        let subrole = string(window, "AXSubrole", timeout: shortTimeout) ?? ""
+        guard subrole.isEmpty || subrole == "AXStandardWindow" else { return false }
+        guard !bool(window, "AXMinimized", timeout: shortTimeout), !bool(window, "AXHidden", timeout: shortTimeout) else { return false }
+        let title = (string(window, "AXTitle", timeout: shortTimeout) ?? "").lowercased()
+        let excludedTerms = ["settings", "preferences", "login", "sign in", "qr code", "扫码登录", "设置"]
+        return !excludedTerms.contains(where: title.contains)
+    }
+
+    private func cacheMainWindow(_ window: AXUIElement, pid: pid_t) {
+        backendLock.lock()
+        cachedAXWindow = window
+        cachedAXWindowPID = pid
+        backendLock.unlock()
+    }
+
+    private func backendState(for pid: pid_t, window: AXUIElement) -> (backend: WeChatReaderBackend, probeMilliseconds: Int, initialProbe: AXCapabilityProbe?) {
+        backendLock.lock()
+        while backendPID == pid && backendProbeInProgress { backendLock.wait() }
+        if backendPID == pid, readerBackend != .unknown {
+            let value = (readerBackend, backendProbeMilliseconds, Optional<AXCapabilityProbe>.none)
+            backendLock.unlock()
+            return value
+        }
+        backendPID = pid
+        readerBackend = .unknown
+        backendProbeMilliseconds = 0
+        backendProbeResult = "probing"
+        backendProbeNodes = 0
+        semanticTitleAvailable = false
+        backendProbeInProgress = true
+        backendLock.broadcast()
+        backendLock.unlock()
+
+        let started = Date()
+        let result = CapabilityProbeResult()
+        let cancellation = ProbeCancellation()
+        let semaphore = DispatchSemaphore(value: 0)
+        let probeWork = DispatchWorkItem { [weak self] in
+            guard let self else { semaphore.signal(); return }
+            result.set(self.probeAXCapabilities(in: window, cancellation: cancellation))
+            semaphore.signal()
+        }
+        DispatchQueue.global(qos: .utility).async(execute: probeWork)
+        let completed = semaphore.wait(timeout: .now() + 0.40) == .success
+        if !completed { cancellation.cancel(); probeWork.cancel() }
+        let probe = completed ? result.get() : nil
+        let selected: WeChatReaderBackend = probe?.supportsAccessibility == true ? .accessibility : .vision
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        backendLock.lock()
+        // A PID change during the asynchronous probe invalidates its result.
+        if backendPID == pid {
+            readerBackend = selected
+            backendProbeMilliseconds = elapsed
+            backendProbeNodes = probe?.visitedNodes ?? 0
+            backendProbeResult = probe == nil ? "deadline exceeded; selected Vision" :
+                (probe?.supportsAccessibility == true ? "semantic chat nodes found" : "no semantic chat nodes found; selected Vision")
+            semanticTitleAvailable = probe?.title != nil || probe?.selectedSession != nil
+            backendProbeInProgress = false
+            backendLock.broadcast()
+        }
+        let current = backendPID == pid
+            ? (readerBackend, backendProbeMilliseconds, probe)
+            : (readerBackend, backendProbeMilliseconds, Optional<AXCapabilityProbe>.none)
+        backendLock.unlock()
+        return current
+    }
+
+    private func probeAXCapabilities(in window: AXUIElement, cancellation: ProbeCancellation) -> AXCapabilityProbe {
+        let deadline = Date().addingTimeInterval(0.34)
+        var stack: [(AXUIElement, Int)] = [(window, 0)]
+        var visited = 0
+        var title: String?
+        var selectedSession: String?
+        var hasMessageList = false
+        let shortTimeout: Float = 0.02
+        while let (element, depth) = stack.popLast(), visited < 96 {
+            if cancellation.isCancelled || Date() >= deadline { break }
+            visited += 1
+            let id = identifier(element, timeout: shortTimeout)
+            if id == WeChatParsing.chatTitleIdentifier {
+                let raw = string(element, "AXValue", timeout: shortTimeout) ?? string(element, "AXTitle", timeout: shortTimeout) ?? ""
+                let normalized = WeChatParsing.normalizeChatTitle(raw)
+                if !normalized.isEmpty && !WeChatParsing.isGenericWindowTitle(normalized) { title = normalized }
+            } else if id.hasPrefix("session_item_"), bool(element, "AXSelected", timeout: shortTimeout) {
+                selectedSession = WeChatParsing.selectedSessionName(from: id, isSelected: true)
+            } else if id == WeChatParsing.messageListIdentifier {
+                hasMessageList = true
+            }
+            if depth < 8, Date() < deadline {
+                stack.append(contentsOf: children(element, timeout: shortTimeout).reversed().map { ($0, depth + 1) })
+            }
+            if title != nil || selectedSession != nil || hasMessageList { break }
+        }
+        return AXCapabilityProbe(title: title, selectedSession: selectedSession,
+                                 hasMessageList: hasMessageList, visitedNodes: visited,
+                                 timedOut: Date() >= deadline || visited >= 96)
+    }
+
+    var readerBackendDiagnostic: String {
+        backendLock.lock()
+        defer { backendLock.unlock() }
+        return "Backend: \(readerBackend.rawValue)\nAX capability probe: \(backendProbeMilliseconds) ms\nAX probe result: \(backendProbeResult)\nAX probe nodes visited: \(backendProbeNodes)"
+    }
+
+    func resetReaderBackend() {
+        backendLock.lock()
+        backendPID = nil
+        readerBackend = .unknown
+        backendProbeMilliseconds = 0
+        backendProbeResult = "not yet run"
+        backendProbeNodes = 0
+        backendProbeInProgress = false
+        semanticTitleAvailable = false
+        backendLock.broadcast()
+        backendLock.unlock()
     }
 
     func currentContact() -> String? {
         detectCurrentConversation().contact
     }
 
-    func detectCurrentConversation(forceFreshVision: Bool = false) -> WeChatConversationDetection {
+    func detectCurrentConversation(forceFreshVision: Bool = false,
+                                  onStage: ((String) -> Void)? = nil) -> WeChatConversationDetection {
+        onStage?("Finding WeChat window…")
+        let windowStarted = Date()
         guard let window = mainWindow() else {
-            return WeChatConversationDetection(contact: nil, windowFound: false, treeCollapsed: false, visionSnapshot: nil)
+            return WeChatConversationDetection(contact: nil, windowFound: false, treeCollapsed: false,
+                                              visionSnapshot: nil, backend: .unknown,
+                                              mainWindowLookupMilliseconds: Int(Date().timeIntervalSince(windowStarted) * 1000),
+                                              capabilityProbeMilliseconds: 0)
+        }
+        let windowLookupMilliseconds = Int(Date().timeIntervalSince(windowStarted) * 1000)
+        guard let app = weChatApplication() else {
+            return WeChatConversationDetection(contact: nil, windowFound: false, treeCollapsed: false,
+                                              visionSnapshot: nil, backend: .unknown,
+                                              mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                                              capabilityProbeMilliseconds: 0)
+        }
+        let backendInfo = backendState(for: app.processIdentifier, window: window)
+        let backend = backendInfo.backend
+        let titleAXAvailable: Bool
+        backendLock.lock()
+        titleAXAvailable = semanticTitleAvailable
+        backendLock.unlock()
+        onStage?("Reading conversation title…")
+
+        if backend == .vision || (backend == .accessibility && !titleAXAvailable) {
+            let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision)
+            return WeChatConversationDetection(
+                contact: snapshot?.title,
+                windowFound: true,
+                treeCollapsed: true,
+                visionSnapshot: snapshot,
+                backend: backend,
+                mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                capabilityProbeMilliseconds: backendInfo.probeMilliseconds
+            )
+        }
+
+        if let probe = backendInfo.initialProbe, backend == .accessibility {
+            if let title = probe.title {
+                return WeChatConversationDetection(contact: title, windowFound: true, treeCollapsed: false,
+                                                  visionSnapshot: nil, backend: backend,
+                                                  mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                                                  capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
+            }
+            if let name = probe.selectedSession {
+                return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false,
+                                                  visionSnapshot: nil, backend: backend,
+                                                  mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                                                  capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
+            }
         }
 
         // 1. WeChat 4.x's stable conversation-title node.
@@ -161,7 +384,10 @@ final class WeChatBridge: @unchecked Sendable {
             let raw = string(titleNode, "AXValue") ?? string(titleNode, "AXTitle") ?? ""
             let name = WeChatParsing.normalizeChatTitle(raw)
             if !name.isEmpty && !WeChatParsing.isGenericWindowTitle(name) {
-                return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false, visionSnapshot: nil)
+                return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false,
+                                                  visionSnapshot: nil, backend: backend,
+                                                  mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                                                  capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
             }
         }
 
@@ -170,19 +396,41 @@ final class WeChatBridge: @unchecked Sendable {
         if let selectedSessionRow = firstMatch(window, where: {
             identifier($0).hasPrefix("session_item_") && bool($0, "AXSelected")
         }), let name = WeChatParsing.selectedSessionName(from: identifier(selectedSessionRow), isSelected: true) {
-            return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false, visionSnapshot: nil)
+            return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false,
+                                              visionSnapshot: nil, backend: backend,
+                                              mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                                              capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
+        }
+        // A semantic backend that exposes messages but no dependable title
+        // still uses Vision for identity, without repeating recursive AX scans.
+        if backend == .accessibility && !titleAXAvailable {
+            let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision)
+            return WeChatConversationDetection(contact: snapshot?.title, windowFound: true,
+                                              treeCollapsed: false, visionSnapshot: snapshot,
+                                              backend: backend,
+                                              mainWindowLookupMilliseconds: windowLookupMilliseconds,
+                                              capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
         }
         let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision)
         return WeChatConversationDetection(
             contact: snapshot?.title,
             windowFound: true,
-            treeCollapsed: accessibilityTreeAppearsCollapsed(in: window),
-            visionSnapshot: snapshot
+            treeCollapsed: backend == .vision,
+            visionSnapshot: snapshot,
+            backend: backend,
+            mainWindowLookupMilliseconds: windowLookupMilliseconds,
+            capabilityProbeMilliseconds: backendInfo.probeMilliseconds
         )
     }
 
     func readMessages(limit: Int = 50, accurateVision: Bool = false) -> MessageReadResult {
         guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
+        guard let app = weChatApplication() else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
+        let backend = backendState(for: app.processIdentifier, window: window).backend
+        if backend == .vision {
+            return readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: true) ??
+                .messageListUnavailable(treeCollapsed: true, visionState: nil)
+        }
 
         // 1. Stable WeChat 4.x message-list identifier.
         if let list = firstMatch(window, where: {
@@ -201,8 +449,8 @@ final class WeChatBridge: @unchecked Sendable {
         // 3. Conservative older-client fallback: only inspect AXLists under a
         // large right-side scroll area when the chat composer is also present.
         guard hasConversationComposer(in: window) else {
-            if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision) { return result }
-            return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window), visionState: nil)
+            if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false) { return result }
+            return .messageListUnavailable(treeCollapsed: false, visionState: nil)
         }
         let windowFrame = frame(window)
         let paneAreas = find(window) {
@@ -216,18 +464,19 @@ final class WeChatBridge: @unchecked Sendable {
                 return readRows(in: list, limit: limit)
             }
         }
-        if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision) { return result }
-        return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window), visionState: nil)
+        if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false) { return result }
+        return .messageListUnavailable(treeCollapsed: false, visionState: nil)
     }
 
-    private func readVisibleMessages(in window: AXUIElement, limit: Int, accurate: Bool) -> MessageReadResult? {
+    private func readVisibleMessages(in window: AXUIElement, limit: Int, accurate: Bool,
+                                     treeCollapsed: Bool) -> MessageReadResult? {
         guard let app = weChatApplication() else { return nil }
         let snapshot = WeChatScreenReader.shared.readMessages(
-            pid: app.processIdentifier, windowFrame: frame(window), accurate: accurate
+            pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), accurate: accurate
         )
         guard snapshot.captureSucceeded else {
             return .messageListUnavailable(
-                treeCollapsed: accessibilityTreeAppearsCollapsed(in: window),
+                treeCollapsed: treeCollapsed,
                 visionState: snapshot.captureState
             )
         }
@@ -243,13 +492,13 @@ final class WeChatBridge: @unchecked Sendable {
 
     private func visibleSnapshot(for window: AXUIElement, forceFresh: Bool = false) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
-        return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window), forceFresh: forceFresh)
+        return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh)
     }
 
     private func visibleTitleIdentity(for window: AXUIElement, forceFresh: Bool = false) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
         return WeChatScreenReader.shared.readTitleIdentity(
-            pid: app.processIdentifier, windowFrame: frame(window), forceFresh: forceFresh
+            pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh
         )
     }
 
@@ -260,7 +509,7 @@ final class WeChatBridge: @unchecked Sendable {
         guard let window = mainWindow() else {
             return "Screen Recording permission: \(WeChatScreenReader.hasScreenCapturePermission ? "granted" : "not granted")\nTarget WeChat PID: \(app.processIdentifier)\nWindow capture: WeChat window not found\n"
         }
-        return WeChatScreenReader.shared.diagnosticReport(pid: app.processIdentifier, windowFrame: frame(window))
+        return "\(readerBackendDiagnostic)\n\(WeChatScreenReader.shared.diagnosticReport(pid: app.processIdentifier, windowFrame: frame(window)))"
     }
 
     func annotatedVisionPreview() -> NSImage? {
@@ -314,17 +563,13 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     func accessibilityTreeAppearsCollapsed() -> Bool {
-        guard let window = mainWindow() else { return false }
-        return accessibilityTreeAppearsCollapsed(in: window)
+        guard let window = mainWindow(), let app = weChatApplication() else { return false }
+        return backendState(for: app.processIdentifier, window: window).backend == .vision
     }
 
     private func accessibilityTreeAppearsCollapsed(in window: AXUIElement) -> Bool {
-        let nodes = find(window, depth: 8) { element in
-            ["AXTextArea", "AXList", "AXScrollArea"].contains(string(element, "AXRole") ?? "") ||
-                identifier(element) == WeChatParsing.chatTitleIdentifier ||
-                identifier(element) == WeChatParsing.messageListIdentifier
-        }
-        return nodes.isEmpty && children(window).count <= 8
+        guard let app = weChatApplication() else { return false }
+        return backendState(for: app.processIdentifier, window: window).backend == .vision
     }
 
     /// Produces structural metadata only. This method never reads AXValue or
@@ -420,5 +665,19 @@ final class WeChatBridge: @unchecked Sendable {
 
     private func frameDescription(_ rect: CGRect) -> String {
         "\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width)),\(Int(rect.height))"
+    }
+
+    private final class CapabilityProbeResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: AXCapabilityProbe?
+        func set(_ result: AXCapabilityProbe) { lock.lock(); self.result = result; lock.unlock() }
+        func get() -> AXCapabilityProbe? { lock.lock(); defer { lock.unlock() }; return result }
+    }
+
+    private final class ProbeCancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        func cancel() { lock.lock(); value = true; lock.unlock() }
     }
 }

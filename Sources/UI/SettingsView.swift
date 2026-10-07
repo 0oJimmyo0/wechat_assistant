@@ -65,6 +65,11 @@ struct SettingsView: View {
                     saveVisionCaptureDiagnostic()
                 }
                 .disabled(isInspectingWeChat)
+                Button("Re-detect WeChat reader backend") {
+                    MessageMonitor.shared.stop()
+                    WeChatBridge.shared.resetReaderBackend()
+                    diagnosticStatus = "Reader backend will be checked again on the next activation."
+                }
                 Button("Save Annotated Vision Preview…") {
                     saveAnnotatedVisionPreview()
                 }
