@@ -145,6 +145,19 @@ enum WeChatParsing {
         return nil
     }
 
+    static func descendantMessageText(role: String, identifier: String, title: String?, value: String?) -> String? {
+        guard ["AXStaticText", "AXTextArea"].contains(role),
+              identifier.isEmpty || ["chat_bubble_text", "chat_message_text"].contains(identifier),
+              let text = messageText(identifier: messageRowIdentifier, title: title, value: value) else { return nil }
+        let label = text.lowercased()
+        guard !["today", "yesterday", "今天", "昨天", "message recalled", "你撤回了一条消息"].contains(label),
+              !label.hasSuffix("撤回了一条消息") else { return nil }
+        // Standalone time/date labels are metadata when found via fallback.
+        let timestamp = #"^(?:\d{1,4}[-/年]\d{1,2}[-/月]\d{1,2}日?|(?:Today|Yesterday|今天|昨天|星期[一二三四五六日天])?(?:\s*)(?:AM|PM|上午|下午)?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?)$"#
+        guard text.range(of: timestamp, options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
+        return text
+    }
+
     static func canAutomaticallyAnalyze(_ messages: [ChatMessage]) -> Bool {
         !messages.isEmpty &&
             messages.allSatisfy { $0.sender != .unknown && $0.allowsAutomaticAnalysis } &&

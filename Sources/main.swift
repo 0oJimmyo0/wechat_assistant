@@ -58,6 +58,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 struct MainApp {
     static func main() {
         let app = NSApplication.shared
+        if CommandLine.arguments.contains("--ax-diagnostic") {
+            print(WeChatBridge.shared.diagnosticReport())
+            return
+        }
+        if CommandLine.arguments.contains("--capture-benchmark") {
+            let bridge = WeChatBridge.shared
+            print("Accessibility trusted: \(bridge.hasAccessibilityPermission)")
+            guard bridge.hasAccessibilityPermission else { return }
+            bridge.beginConversationSession()
+            defer { bridge.endConversationSession() }
+            for index in 0..<10 {
+                let result = bridge.captureConversationSnapshot(initialActivation: index == 0)
+                switch result {
+                case .success(let snapshot):
+                    print("Sample \(index + 1): messages=\(snapshot.messages.count), validated=\(snapshot.hasTrustworthyTranscript), source=\(snapshot.messageSource.rawValue)")
+                case .identityPending: print("Sample \(index + 1): identity pending")
+                case .failure(let failure): print("Sample \(index + 1): \(failure.userMessage)")
+                }
+            }
+            print(bridge.capturePerformanceSummary)
+            print(bridge.conversationCaptureDiagnostic)
+            return
+        }
         let delegate = AppDelegate()
         app.delegate = delegate
         app.run()

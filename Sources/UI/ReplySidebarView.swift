@@ -13,7 +13,7 @@ struct ReplySidebarView: View {
     @State private var generationID: UUID?
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
-    private let displayedMessageLimit = 20
+    @State private var displayedMessageLimit = 5
     private let manualAnalysisContextLimit = 20
 
     var body: some View {
@@ -138,9 +138,9 @@ struct ReplySidebarView: View {
                 .font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 Button {
-                    monitor.syncLatest()
+                    monitor.refresh()
                 } label: {
-                    Label(monitor.isSyncing ? "Syncing…" : "Sync latest",
+                    Label(monitor.isSyncing ? "Refreshing…" : "Refresh",
                           systemImage: monitor.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
@@ -160,7 +160,13 @@ struct ReplySidebarView: View {
                 }
                 Spacer(minLength: 0)
             }
-            if monitor.isRunning && visibleMessages.count < displayedMessageLimit && monitor.canLoadOlderContext &&
+            Text(monitor.captureDuration).font(.caption2).foregroundStyle(.secondary)
+            if monitor.messages.count > 5 {
+                Button(displayedMessageLimit == 5 ? "Show latest 20" : "Show latest 5") {
+                    displayedMessageLimit = displayedMessageLimit == 5 ? 20 : 5
+                }.buttonStyle(.plain).font(.caption)
+            }
+            if monitor.isRunning && monitor.messages.count < 20 && monitor.canLoadOlderContext &&
                 monitor.conversationIdentityState == .confirmed && monitor.acquisitionState == .ready {
                 Button {
                     monitor.loadOlderContext()
@@ -191,8 +197,8 @@ struct ReplySidebarView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             } else {
-                ForEach(Array(visibleMessages.enumerated()), id: \.offset) { item in
-                    recentMessageRow(item.element)
+                ForEach(visibleMessages) { message in
+                    recentMessageRow(message)
                 }
             }
         }

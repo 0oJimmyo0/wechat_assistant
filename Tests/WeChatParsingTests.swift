@@ -50,6 +50,19 @@ enum WeChatParsingTests {
         expect(WeChatParsing.messageText(identifier: "date_separator", title: "Today", value: nil) == nil, "ignores date separators")
         expect(WeChatParsing.messageText(identifier: "system_notice", title: "Message recalled", value: nil) == nil, "ignores system rows")
 
+        expect(WeChatParsing.descendantMessageText(role: "AXStaticText", identifier: "", title: nil, value: "actual bubble text") == "actual bubble text",
+               "confirmed bubble descendants support AXValue")
+        expect(WeChatParsing.descendantMessageText(role: "AXStaticText", identifier: "timestamp", title: "10:30", value: nil) == nil,
+               "identified timestamp descendants are excluded")
+        expect(WeChatParsing.descendantMessageText(role: "AXStaticText", identifier: "", title: "昨天 10:30", value: nil) == nil,
+               "standalone timestamp fallback is excluded")
+        expect(WeChatParsing.descendantMessageText(role: "AXStaticText", identifier: "contact_name", title: "Alex", value: nil) == nil,
+               "contact labels cannot supply descendant message text")
+        expect(WeChatParsing.descendantMessageText(role: "AXButton", identifier: "", title: "Send", value: nil) == nil,
+               "controls cannot supply descendant message text")
+        expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "10:30", value: nil) == "10:30",
+               "an actual timestamp-shaped bubble retains its original message text")
+
         let unknown = ChatMessage(text: "hello", sender: .unknown)
         let incoming = ChatMessage(text: "hello", sender: .other)
         let outgoing = ChatMessage(text: "hello", sender: .me)

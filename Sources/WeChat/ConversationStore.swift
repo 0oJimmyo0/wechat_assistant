@@ -5,6 +5,16 @@ struct ConversationMergeResult: Sendable {
     let prepended: [ChatMessage]
     let unchanged: Bool
     let viewport: ChatViewportState
+    let arrivalConfirmed: Bool
+
+    init(appended: [ChatMessage], prepended: [ChatMessage], unchanged: Bool,
+         viewport: ChatViewportState, arrivalConfirmed: Bool = false) {
+        self.appended = appended
+        self.prepended = prepended
+        self.unchanged = unchanged
+        self.viewport = viewport
+        self.arrivalConfirmed = arrivalConfirmed
+    }
 }
 
 /// The in-memory conversation timeline. AX snapshots are observations; only this
@@ -21,7 +31,7 @@ final class ConversationStore {
         messages.removeAll(keepingCapacity: true)
     }
 
-    func merge(_ snapshot: [ChatMessage], trust: ConversationCaptureTrust) -> ConversationMergeResult {
+    func merge(_ snapshot: [ChatMessage], trust: ConversationCaptureTrust, liveEdgeState: Bool? = nil) -> ConversationMergeResult {
         guard trust.mayEnterTrustedStore else {
             return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
         }
@@ -30,23 +40,44 @@ final class ConversationStore {
         }
         guard !messages.isEmpty else {
             messages = Array(snapshot.suffix(maximumMessages))
-            return ConversationMergeResult(appended: messages, prepended: [], unchanged: false, viewport: .liveTail)
+            return ConversationMergeResult(appended: messages, prepended: [], unchanged: false, viewport: liveEdgeState == false ? .historical : .liveTail)
         }
+
+        // Prefer a complete historical match over a shorter repeated tail
+        // match. Scrolling to an earlier "OK" must not append old rows.
+        let historical = Self.historicalOverlap(existing: messages, observed: snapshot)
+        let tail = Self.tailOverlap(existing: messages, observed: snapshot)
+        let preferHistorical = historical.map { history in
+            history.existingStart + history.length < messages.count &&
+                history.length >= (tail?.length ?? 0)
+        } ?? false
 
         // A matching suffix of stored history anchors the visible sequence at
         // the known tail. Only rows after that anchor are new live messages.
-        if let overlap = Self.tailOverlap(existing: messages, observed: snapshot) {
+        if !preferHistorical, let overlap = tail {
             let appended = Array(snapshot.dropFirst(overlap.observedStart + overlap.length))
+            if liveEdgeState == false && !appended.isEmpty {
+                return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .historical)
+            }
+            let anchor = Array(snapshot[overlap.observedStart..<(overlap.observedStart + overlap.length)])
+            // Multiple distinct ordered anchors are necessary to establish
+            // arrival. A single/repeated text match cannot establish direction.
+            let anchorKeys = Set(anchor.map(ChatHistoryMerger.key(for:)))
+            let anchorOccurrences = (0...(messages.count - overlap.length)).filter {
+                ChatHistoryMerger.sequencesMatch(messages, lhsStart: $0,
+                    snapshot, rhsStart: overlap.observedStart, length: overlap.length)
+            }.count
+            let arrivalConfirmed = overlap.length >= 2 && anchorKeys.count >= 2 && anchorOccurrences == 1
             let merged = messages + appended
             messages = Array(merged.suffix(maximumMessages))
             return ConversationMergeResult(appended: appended, prepended: [],
-                                           unchanged: appended.isEmpty, viewport: .liveTail)
+                                           unchanged: appended.isEmpty, viewport: liveEdgeState == false ? .historical : .liveTail, arrivalConfirmed: arrivalConfirmed && liveEdgeState == true)
         }
 
         // A suffix of the observed rows matching an internal stored sequence
         // identifies a historical viewport. Only its unanchored older prefix
         // is inserted; rows after an internal match never count as live.
-        if let overlap = Self.historicalOverlap(existing: messages, observed: snapshot) {
+        if let overlap = historical {
             let prefix = Array(snapshot.prefix(overlap.observedStart))
             let merged: [ChatMessage]
             if prefix.isEmpty {
@@ -54,12 +85,11 @@ final class ConversationStore {
             } else if overlap.existingStart == 0 {
                 merged = prefix + messages
             } else {
-                let insertionIndex = overlap.existingStart
-                merged = Array(messages.prefix(insertionIndex)) + prefix + Array(messages.dropFirst(insertionIndex))
+                return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
             }
-            let prependedCount = max(0, merged.count - messages.count)
+            let previousIDs = Set(messages.map(\.localID))
             messages = Array(merged.suffix(maximumMessages))
-            let prepended = prependedCount > 0 ? Array(messages.prefix(prependedCount)) : []
+            let prepended = messages.filter { !previousIDs.contains($0.localID) }
             return ConversationMergeResult(appended: [], prepended: prepended,
                                            unchanged: prepended.isEmpty, viewport: .historical)
         }

@@ -40,6 +40,7 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var hasUnverifiedMessageChanges = false
     @Published private(set) var isReturningToLatest = false
     @Published private(set) var isSyncing = false
+    @Published private(set) var captureDuration = "Capture: not run"
 
     var onBurst: ((String, [ChatMessage], Bool) -> Void)?
     var onDeactivated: (() -> Void)?
@@ -72,6 +73,7 @@ final class MessageMonitor: ObservableObject {
     private var messageCaptureCount = 0
     private var consecutiveEmptyAXSnapshots = 0
     private var consecutiveCaptureFailures = 0
+    private var latestLiveEdgeConfirmed = false
     private var latestSnapshotBlockCount = 0
     private var latestTailOverlap = 0
     private var latestHistoricalOverlap = 0
@@ -285,6 +287,24 @@ final class MessageMonitor: ObservableObject {
 
     func pollNow() { poll() }
 
+    /// Capture the user's current viewport. Manual history never triggers analysis.
+    func refresh() {
+        guard canSyncNow, let contact = lockedContact else { return }
+        isSyncing = true
+        generation += 1
+        let token = generation
+        burstDebounce?.cancel(); burstDebounce = nil
+        let cancellation = sessionCancellation
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.captureAndMerge(contact: contact, purpose: .manualSync,
+                cancellation: cancellation, generation: token)
+            guard self.isRunning, self.generation == token else { return }
+            self.isSyncing = false
+            if case .merged = result { self.status = "Refreshed · \(self.messages.count) captured messages" }
+        }
+    }
+
     func syncLatest() {
         guard canSyncNow, let contact = lockedContact else { return }
         isSyncing = true
@@ -321,7 +341,6 @@ final class MessageMonitor: ObservableObject {
             self.isSyncing = false
             self.isReturningToLatest = false
             if !discoveredIncoming.isEmpty {
-                self.processIncoming(discoveredIncoming, contact: contact)
                 self.status = "Synced · \(discoveredIncoming.count) new messages"
             } else if case .merged(let merge) = result, merge.unchanged {
                 self.status = "Sync complete · no visible changes"
@@ -351,7 +370,6 @@ final class MessageMonitor: ObservableObject {
             self.isFollowingLatest = false
             self.isReturningToLatest = false
             self.isSyncing = false
-            if !latest.appended.isEmpty { self.processIncoming(latest.appended, contact: contact) }
             self.status = latest.reached
                 ? "Live monitoring resumed"
                 : "Viewing older messages · live incoming tracking paused"
@@ -486,7 +504,6 @@ final class MessageMonitor: ObservableObject {
                 "stored count: \(self.messages.count)",
                 "elapsed ms: \(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))"
             ].joined(separator: "\n")
-            if !latest.appended.isEmpty { self.processIncoming(latest.appended, contact: contact) }
             self.startWatchdog()
         }
     }
@@ -526,6 +543,7 @@ final class MessageMonitor: ObservableObject {
             return .snapshot(snapshot)
         }
         guard isRunning, generation == token, cancellation?.isCancelled != true else { return .unavailable }
+        captureDuration = bridge.capturePerformanceSummary
         let snapshot: WeChatSnapshot?
         switch captured {
         case .snapshot(let value): snapshot = value
@@ -535,7 +553,7 @@ final class MessageMonitor: ObservableObject {
         guard let snapshot else {
             if purpose == .historical { lastHistoricalCaptureObservation = .rowsUnrecognized }
             noteCaptureFailure()
-            status = "Conversation capture unavailable · keeping stored context"
+            status = "Capture unavailable · " + bridge.lastCaptureFailureStage
             conversationIdentityState = .temporarilyUncertain
             hasUnverifiedMessageChanges = true
             return .unavailable
@@ -624,14 +642,16 @@ final class MessageMonitor: ObservableObject {
             hasUnverifiedMessageChanges = true
             return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
         }
+        captureDuration = bridge.capturePerformanceSummary
         unverifiedCaptureMessages.removeAll()
-        let result = conversationStore.merge(snapshot.messages, trust: captureTrust(snapshot))
+        let result = conversationStore.merge(snapshot.messages, trust: captureTrust(snapshot), liveEdgeState: snapshot.liveEdgeState)
         if lockedVisionIdentity == nil { lockedVisionIdentity = snapshot.visionIdentity }
         recordCaptureFingerprints(snapshot)
         messages = conversationStore.messages
         viewportState = result.viewport
         latestTailOverlap = result.viewport == .liveTail ? result.appended.count : 0
         latestHistoricalOverlap = result.viewport == .historical ? result.prepended.count : 0
+        latestLiveEdgeConfirmed = snapshot.liveEdgeState == true
         latestSnapshotBlockCount = snapshot.messageRowCount
         lastObservedSnapshot = snapshot.messages.map(ChatHistoryMerger.key(for:))
         messageCaptureCount += 1
@@ -756,7 +776,7 @@ final class MessageMonitor: ObservableObject {
         }
         recordCaptureFingerprints(snapshot)
         let result = mergeSnapshot(snapshot, purpose: purpose)
-        if allowAutomaticAnalysis, result.viewport == .liveTail, !result.appended.isEmpty {
+        if allowAutomaticAnalysis, result.arrivalConfirmed, result.viewport == .liveTail, !result.appended.isEmpty {
             processIncoming(result.appended, contact: snapshot.contact)
         }
     }
@@ -774,14 +794,14 @@ final class MessageMonitor: ObservableObject {
         generation += 1
         let token = generation
         burstDebounce?.cancel()
-        guard viewportState == .liveTail, conversationIdentityState == .confirmed,
-              acquisitionState == .ready else { return }
+        guard viewportState == .liveTail, latestLiveEdgeConfirmed, !hasUnverifiedMessageChanges,
+              conversationIdentityState == .confirmed, acquisitionState == .ready else { return }
         status = "Waiting for the message burst to finish…"
         burstDebounce = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled, let self, self.isRunning, self.generation == token else { return }
-            guard self.viewportState == .liveTail, self.conversationIdentityState == .confirmed,
-                  self.acquisitionState == .ready else { return }
+            guard self.viewportState == .liveTail, self.latestLiveEdgeConfirmed, !self.hasUnverifiedMessageChanges,
+                  self.conversationIdentityState == .confirmed, self.acquisitionState == .ready else { return }
             self.status = "Message ready · Analyze"
             if canAutoAnalyze {
                 self.onBurst?(contact, Array(self.messages.suffix(self.analysisContextLimit)), true)
@@ -861,8 +881,9 @@ final class MessageMonitor: ObservableObject {
                     self.status = "Conversation identified, but visible messages could not be read · retrying"
                     return
                 }
+                let previouslyLive = self.viewportState == .liveTail
                 let result = self.mergeSnapshot(snapshot, purpose: .live)
-                if result.viewport == .liveTail && !result.appended.isEmpty {
+                if previouslyLive && result.arrivalConfirmed && result.viewport == .liveTail && !result.appended.isEmpty {
                     if let contact = self.lockedContact {
                         self.processIncoming(result.appended, contact: contact)
                     }
@@ -931,6 +952,7 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func noteCaptureFailure() {
+        captureDuration = bridge.capturePerformanceSummary
         consecutiveCaptureFailures += 1
         guard consecutiveCaptureFailures >= 3 else { return }
         bridge.resetReaderBackend()

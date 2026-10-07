@@ -31,7 +31,9 @@ enum ChatHistoryMerger {
     }
 
     static func key(for message: ChatMessage) -> String {
-        let normalized = normalizedText(message.text)
+        // AX text is exact: punctuation, spacing, and case can distinguish
+        // real occurrences. OCR alone uses tolerant comparison.
+        let normalized = message.source == .accessibility ? message.text : normalizedText(message.text)
         let sender: String
         switch message.sender {
         case .me: sender = "me"

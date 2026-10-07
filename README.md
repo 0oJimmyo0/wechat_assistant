@@ -48,12 +48,12 @@ For a personal local build, create a self-signed code-signing identity in **Keyc
 
 ## What is kept and sent
 
-- Conversation context exists in memory only while monitoring the active chat. The store retains up to 200 observed messages and clears on deactivation or a confirmed conversation change. It does not write raw chat content to disk. The sidebar shows the latest 20 messages; each model request receives at most those 20 messages, the local relationship profile, and any special instruction. **Sync latest** returns to the bottom when needed and merges a fresh AX snapshot without discarding existing context.
+- Conversation context exists in memory only while monitoring the active chat. The store retains up to 200 observed messages and clears on deactivation or a confirmed conversation change. It does not write raw chat content to disk. The sidebar shows 5 messages initially and can expand to the latest 20; each model request receives at most those 20 messages, the local relationship profile, and any special instruction. **Refresh** reads the current viewport without scrolling or triggering automatic analysis. **Follow latest** returns to the bottom when needed. Both preserve the validated conversation history.
 - Responses API requests use `stream: true` and `store: false` with the selected account's OAuth access token.
 - `store: false` prevents Responses application-state storage; it is not a zero-retention guarantee. OpenAI's current API data controls say abuse-monitoring logs may contain prompts and responses and are generally retained for up to 30 days. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
 - Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
 - Relationship profile details are stored in local app preferences and are not encrypted separately by the app. Raw chat text and credentials are not written to logs.
-- Monitoring is locked to the conversation active at activation. A confirmed conversation change stops monitoring and clears the in-memory context and suggestions. Automatic analysis is off by default; when enabled, only Accessibility messages with identified senders can trigger requests. If WeChat's Accessibility tree is collapsed, the active monitor cannot read the chat. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
+- Monitoring is locked to the conversation active at activation. A confirmed conversation change stops monitoring and clears the in-memory context and suggestions. Automatic analysis is off by default; when enabled, only Accessibility messages with identified senders, a unique ordered overlap, and confirmed bottom-scrollbar evidence can trigger requests. Missing arrival evidence requires manual analysis. If WeChat's Accessibility tree is collapsed, the active monitor cannot read the chat. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
 - The model prompt uses speaker labels such as “我”, “对方”, or “说话方不确定”; it does not include the contact's display name. Analysis sends at most 20 recent captured messages and the configured local relationship profile.
 - Everyday and Careful model choices come from the signed-in account's live model catalog. A usage-limit response stops monitoring and disables automatic analysis until you reactivate.
 - Sign out attempts to revoke the refresh token and always removes local credentials. Keychain credentials are available only while the device is unlocked.
@@ -71,7 +71,7 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor captures one unified snapshot using independent identity and message sources. When both the chat identity and message list are available through Accessibility, it reads them from the same WeChat window/list. If AX exposes only one, it combines that half with local Vision capture; if neither is exposed, it uses the existing Vision title and message readers. Vision reads the visible WeChat window locally and needs Screen Recording permission. The in-memory `ConversationStore` owns the accumulated timeline. Snapshots merge by ordered overlap, so virtualization and temporary empty reads do not erase observed rows, and repeated identical messages remain separate entries. Snapshots that overlap the known tail can append live rows; historical rows can only backfill earlier context and never trigger incoming-message analysis. The active monitor watches WeChat with `AXObserver` where notifications are supported and retains a 3-second polling watchdog. **Sync latest** scrolls toward the bottom, waits for rows to materialize, and merges; **Load older to 20** performs at most six upward scroll/capture attempts and returns to the latest viewport when it can verify it. Analysis receives at most the latest 20 messages. Vision capture remains local; model requests occur only under the app's manual or automatic analysis settings. If no source can identify the chat or read messages, activation or sync reports that limitation and keeps previously stored context. Developer diagnostics list the identity/message source and the permission state.
+The monitor captures one unified snapshot using independent identity and message sources. When both the chat identity and message list are available through Accessibility, it reads them from the same WeChat window/list. If AX exposes only one, it combines that half with local Vision capture; if neither is exposed, it uses the existing Vision title and message readers. Vision reads the visible WeChat window locally and needs Screen Recording permission. The in-memory `ConversationStore` owns the accumulated timeline. Snapshots merge by ordered overlap, so virtualization and temporary empty reads do not erase observed rows, and repeated identical messages remain separate entries. Snapshots that overlap the known tail can append live rows; historical rows can only backfill earlier context and never trigger incoming-message analysis. The active monitor watches WeChat with `AXObserver` where notifications are supported and retains a 3-second polling watchdog. **Refresh** captures the current viewport without scrolling or triggering analysis; **Follow latest** scrolls toward the bottom, waits for rows to materialize, and merges; **Load older to 20** performs at most six upward scroll/capture attempts and returns to the latest viewport when it can verify it. Analysis receives at most the latest 20 messages. Vision capture remains local; model requests occur only under the app's manual or automatic analysis settings. If no source can identify the chat or read messages, activation or sync reports that limitation and keeps previously stored context. Developer diagnostics list the identity/message source and the permission state.
 
 For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only. **Inspect Vision Capture** reports window/crop geometry and observation counts; it omits recognized text, contact names, and messages. In **Settings → Developer diagnostics**, adjust the normalized conversation-left, header-bottom, and composer-top ratios, then use **Save Annotated Vision Preview** to inspect the blue pane boundary, yellow header, green message canvas, orange excluded composer, accepted red title, rejected purple title candidates, accepted green message blocks, and rejected gray observations. The preview is saved only after you explicitly choose a destination; it contains visible WeChat content, so handle and remove it as sensitive data after debugging.
 
@@ -90,7 +90,7 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 - [ ] Save an **Inspect Vision Capture** report and confirm it contains counts/geometry only; save an annotated preview only when explicitly needed and treat the image as sensitive.
 - [ ] With WeChat open, check that incoming messages and manual scrolling update within about 1–2 seconds; verify historical rows never trigger analysis and returning to the bottom resumes live tracking.
 - [ ] Load older to 20 and confirm the app either restores the latest viewport or explicitly reports that live tracking remains paused.
-- [ ] Click **Sync latest** after a new message or while viewing older rows; confirm it reconciles visible text without automatically requesting analysis.
+- [ ] Click **Refresh** after a new message or while viewing older rows; confirm it reconciles visible text without automatically requesting analysis.
 - [ ] Adjust the Vision layout sliders so the conversation list is outside the pane crop and the composer is below the message canvas; verify with the annotated preview.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
@@ -98,8 +98,42 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 ## Known limitations
 
 - Accessibility structure varies by WeChat release. When AX lacks the identity or message list, local Vision capture fills the missing source and requires Screen Recording permission. If neither source can identify the chat or read messages, live capture cannot proceed.
-- Only visible/retrievable messages are available; the app does not read WeChat's database. Incoming messages may not appear in a historical viewport until **Sync latest** or **Follow latest** returns to the bottom. Ordered overlap can be uncertain when WeChat exposes too few shared rows; the app keeps the existing context and waits for an anchored snapshot.
+- Only visible/retrievable messages are available; the app does not read WeChat's database. Incoming messages may not appear in a historical viewport until **Follow latest** returns to the bottom. Ordered overlap can be uncertain when WeChat exposes too few shared rows; the app keeps the existing context and waits for an anchored snapshot.
 - The reader identifies conversations by the confirmed display title. Two distinct chats with the same normalized title may not be distinguishable; monitoring stops when a title change is confirmed.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.
 - Live WeChat and OAuth behavior must be manually checked on the target Mac; a successful compile cannot verify those integrations.
+
+## AX extraction validation
+
+The AX message source requires `chat_message_list` and reads only confirmed
+`chat_bubble_item_view` rows. Direct `AXTitle`/`AXValue` reads are batched;
+missing row text falls back to text descendants inside that bubble, with
+metadata/control identifiers and timestamp labels excluded. A known list with
+unreadable bubble text reports its exact failure stage instead of treating an
+unrelated list as the transcript. Existing local Vision support remains; no new
+OCR source or database access was added.
+
+Message-list elements are cached for the current window/PID, checked before
+reuse, and rediscovered with bounded probes after invalidation. Row reading
+prefers `AXVisibleChildren`, reads at most 200 rows, and caps traversal at 500
+nodes, four descendant levels, and a 700 ms budget plus the final AX IPC call.
+Discovery and diagnostic walks have independent limits. The sidebar reports
+last capture duration and rolling P50/P95 for validated captures only; failed
+captures do not count as evidence of fast extraction. Metrics retain at most
+200 samples and include no message text.
+
+Content-free command-line probes are available in the built app:
+
+```bash
+.build/WeChatReplyCopilot.app/Contents/MacOS/WeChatReplyCopilot --ax-diagnostic
+.build/WeChatReplyCopilot.app/Contents/MacOS/WeChatReplyCopilot --capture-benchmark
+```
+
+The diagnostic reports bounded hierarchy, sanitized identifiers, roles, sampled
+row counts, and supported text attribute names without printing their values.
+The benchmark performs ten read-only capture attempts, reports extracted counts
+and trust status, and makes no model requests or scroll actions. It can use the
+existing local Vision source when AX cannot supply a source. An open WeChat
+conversation and the app's macOS permissions are required. See
+[LIVE_VALIDATION.md](LIVE_VALIDATION.md) for the outstanding WeChat 4.x merge gate.

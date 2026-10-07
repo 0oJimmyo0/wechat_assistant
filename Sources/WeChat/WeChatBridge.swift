@@ -25,6 +25,7 @@ struct WeChatSnapshot: Sendable {
     let messagesUnchanged: Bool
     let headerUnchanged: Bool
     let captureTimingDiagnostic: String
+    let liveEdgeState: Bool?
 
     var hasTrustworthyTranscript: Bool {
         paneGeometry.isValidated && messageExtractionTrustworthy && !messages.isEmpty &&
@@ -50,6 +51,7 @@ enum ConversationCaptureFailure: Sendable {
     case messagesUnavailable
     case visionCaptureFailed
     case axProbeUncertain
+    case accessibilityExtractionFailed(stage: String)
 
     var userMessage: String {
         switch self {
@@ -63,6 +65,8 @@ enum ConversationCaptureFailure: Sendable {
             return "Conversation identified, but the message area could not be read."
         case .visionCaptureFailed:
             return "WeChat is open, but its window could not be captured. Check Screen Recording permission and try again."
+        case .accessibilityExtractionFailed(let stage):
+            return "Accessibility extraction failed: \(stage). Refresh after opening the conversation."
         case .axProbeUncertain:
             return "WeChat accessibility data is incomplete and no usable capture source was found."
         }
@@ -125,7 +129,7 @@ final class WeChatBridge: @unchecked Sendable {
 
     private let officialWeChatBundleID = "com.tencent.xinWeChat"
     private let helperBundleID = "com.wechatreplycopilot.app"
-    private let accessibilityTimeout: Float = 0.15
+    private let accessibilityTimeout: Float = 0.03
     private let backendLock = NSCondition()
     private var backendPID: pid_t?
     private var readerBackend: WeChatReaderBackend = .unknown
@@ -150,6 +154,39 @@ final class WeChatBridge: @unchecked Sendable {
     private var activePlanWindow: AXUIElement?
     private var activePlanWindowFrame: CGRect?
     private var visionTitleTracker = VisionTitleTracker()
+
+    private var captureLatencies: [(milliseconds: Int, validated: Bool)] = []
+    private var lastAXReadDiagnostic = "AX rows: not read"
+
+    /// One IPC request for independent row attributes; unavailable fields stay nil.
+    private func attributes(_ element: AXUIElement, _ names: [String]) -> [String: Any] {
+        AXUIElementSetMessagingTimeout(element, 0.02)
+        var raw: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(element, names as CFArray, [], &raw) == .success,
+              let values = raw as? [Any], values.count == names.count else { return [:] }
+        return Dictionary(uniqueKeysWithValues: zip(names, values).map { ($0, $1) })
+    }
+
+    private func boundedChildren(_ element: AXUIElement, attribute: String = "AXChildren", maximum: Int = 200) -> [AXUIElement]? {
+        AXUIElementSetMessagingTimeout(element, 0.02)
+        var count: CFIndex = 0
+        guard AXUIElementGetAttributeValueCount(element, attribute as CFString, &count) == .success else { return nil }
+        if count == 0 { return [] }
+        var raw: CFArray?
+        let amount = min(count, maximum)
+        guard AXUIElementCopyAttributeValues(element, attribute as CFString, max(0, count - amount), amount, &raw) == .success else { return nil }
+        return raw as? [AXUIElement]
+    }
+
+    var capturePerformanceSummary: String {
+        captureDiagnosticLock.lock()
+        defer { captureDiagnosticLock.unlock() }
+        guard let latest = captureLatencies.last else { return "Capture latency: no completed samples" }
+        let sorted = captureLatencies.filter(\.validated).map(\.milliseconds).sorted()
+        guard !sorted.isEmpty else { return "Last capture: \(latest.milliseconds) ms · no validated latency samples (\(captureLatencies.count) attempts)" }
+        func percentile(_ fraction: Double) -> Int { sorted[max(0, Int(ceil(Double(sorted.count) * fraction)) - 1)] }
+        return "Last capture: \(latest.milliseconds) ms · validated P50 \(percentile(0.5)) / P95 \(percentile(0.95)) ms · \(sorted.count)/\(captureLatencies.count) samples"
+    }
 
     private struct AXSessionElement {
         let identifier: String
@@ -244,21 +281,30 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func find(_ root: AXUIElement, depth: Int = 24, where predicate: (AXUIElement) -> Bool) -> [AXUIElement] {
-        guard depth > 0 else { return predicate(root) ? [root] : [] }
-        var results = predicate(root) ? [root] : []
-        for child in children(root) {
-            results.append(contentsOf: find(child, depth: depth - 1, where: predicate))
-        }
-        return results
+        boundedSearch(root, depth: depth, stopAtFirst: false, predicate: predicate)
     }
 
     private func firstMatch(_ root: AXUIElement, depth: Int = 24, where predicate: (AXUIElement) -> Bool) -> AXUIElement? {
-        guard depth > 0 else { return predicate(root) ? root : nil }
-        if predicate(root) { return root }
-        for child in children(root) {
-            if let match = firstMatch(child, depth: depth - 1, where: predicate) { return match }
+        boundedSearch(root, depth: depth, stopAtFirst: true, predicate: predicate).first
+    }
+
+    private func boundedSearch(_ root: AXUIElement, depth: Int, stopAtFirst: Bool,
+                               predicate: (AXUIElement) -> Bool) -> [AXUIElement] {
+        var stack = [(root, 0)]
+        var matches: [AXUIElement] = []
+        var visited = 0
+        let deadline = Date().addingTimeInterval(0.55)
+        while let (node, level) = stack.popLast(), visited < 300, Date() < deadline {
+            visited += 1
+            if predicate(node) {
+                matches.append(node)
+                if stopAtFirst { break }
+            }
+            if level < min(depth, 18) {
+                stack.append(contentsOf: (boundedChildren(node, maximum: 80) ?? []).reversed().map { ($0, level + 1) })
+            }
         }
-        return nil
+        return matches
     }
 
     private func windows(in appElement: AXUIElement) -> [AXUIElement] {
@@ -283,7 +329,7 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func diagnosticAttributeState(_ element: AXUIElement, attribute: String) -> String {
-        AXUIElementSetMessagingTimeout(element, 1.0)
+        AXUIElementSetMessagingTimeout(element, 0.03)
         var raw: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
         guard error == .success, let raw else { return "unavailable (AXError \(error.rawValue))" }
@@ -446,22 +492,12 @@ final class WeChatBridge: @unchecked Sendable {
                     selectedSession = WeChatParsing.selectedSessionName(from: id, isSelected: true)
                 }
             }
-            let role = string(element, "AXRole", timeout: shortTimeout)
-            let rowTitle = string(element, "AXTitle", timeout: shortTimeout) ?? ""
-            var isMessageList = id == WeChatParsing.messageListIdentifier ||
-                (role == "AXList" && ["Messages", "消息"].contains(rowTitle))
-            if !isMessageList, role == "AXList" {
-                let outer = frame(window, timeout: shortTimeout)
-                let bounds = frame(element, timeout: shortTimeout)
-                isMessageList = bounds.minX > outer.minX + outer.width * 0.25 &&
-                    bounds.width > 220 && bounds.height > 300
-            }
-            if isMessageList, hasMessageLikeRows(children(element, timeout: shortTimeout)) {
+            if id == WeChatParsing.messageListIdentifier {
                 hasMessageList = true
                 messageList = element
             }
             if depth < 8, Date() < deadline {
-                stack.append(contentsOf: children(element, timeout: shortTimeout).reversed().map { ($0, depth + 1) })
+                stack.append(contentsOf: (boundedChildren(element, maximum: 80) ?? []).reversed().map { ($0, depth + 1) })
             }
             if (title != nil || selectedSession != nil) && hasMessageList { break }
         }
@@ -483,7 +519,6 @@ final class WeChatBridge: @unchecked Sendable {
         var sessionElements = base.sessionElements
         var messageList = base.messageListElement
         var foundList = base.hasMessageList
-        let outer = frame(window, timeout: 0.02)
         while let (element, depth) = stack.popLast(), visited < 250, Date() < deadline {
             visited += 1
             let id = identifier(element, timeout: 0.006)
@@ -503,22 +538,12 @@ final class WeChatBridge: @unchecked Sendable {
                     selectedSession = WeChatParsing.selectedSessionName(from: id, isSelected: true)
                 }
             }
-            if !foundList {
-                let role = string(element, "AXRole", timeout: 0.006)
-                let rowTitle = string(element, "AXTitle", timeout: 0.006) ?? ""
-                let bounds = role == "AXList" ? frame(element, timeout: 0.006) : .zero
-                let isKnownList = id == WeChatParsing.messageListIdentifier ||
-                    (role == "AXList" && ["Messages", "消息"].contains(rowTitle))
-                let isRightPaneList = role == "AXList" && bounds.minX > outer.minX + outer.width * 0.25 &&
-                    bounds.width > 220 && bounds.height > 300
-                if (isKnownList || isRightPaneList),
-                   hasMessageLikeRows(children(element, timeout: 0.02)) {
-                    foundList = true
-                    messageList = element
-                }
+            if !foundList, id == WeChatParsing.messageListIdentifier {
+                foundList = true
+                messageList = element
             }
             if depth < 18, Date() < deadline {
-                stack.append(contentsOf: children(element, timeout: 0.006).reversed().map { ($0, depth + 1) })
+                stack.append(contentsOf: (boundedChildren(element, maximum: 80) ?? []).reversed().map { ($0, depth + 1) })
             }
             if (title != nil || selectedSession != nil) && foundList { break }
         }
@@ -647,6 +672,13 @@ final class WeChatBridge: @unchecked Sendable {
                                     messagePaneLeftX: CGFloat? = nil,
                                     paneGeometry: ConversationPaneGeometry? = nil) -> ConversationCaptureResult {
         let totalStarted = Date()
+        var validatedCapture = false
+        defer {
+            captureDiagnosticLock.lock()
+            captureLatencies.append((Int(Date().timeIntervalSince(totalStarted) * 1000), validatedCapture))
+            captureLatencies = Array(captureLatencies.suffix(200))
+            captureDiagnosticLock.unlock()
+        }
         guard let window = mainWindow(), let app = weChatApplication() else {
             updateCaptureDiagnostic(plan: nil, hasAXIdentity: false, hasAXMessages: false,
                                     failure: "WeChat window unavailable")
@@ -714,24 +746,25 @@ final class WeChatBridge: @unchecked Sendable {
             return .failure(.axProbeUncertain)
         }
 
-        var capturePlan = plan
+        let capturePlan = plan
         var capturedAXMessages: [ChatMessage]?
         var capturedAXRowCount = 0
         var axMessageReadMilliseconds = 0
+        var axHasUnreadableBubbles = false
         if plan.messages == .accessibility, let list {
             let readStarted = Date()
-            let rows = children(list)
-            let parsed = readAccessibilityMessages(from: rows, limit: max(0, limit ?? 50))
+            let parsed = readAccessibilityMessages(in: list, limit: max(0, limit ?? 50))
             axMessageReadMilliseconds = Int(Date().timeIntervalSince(readStarted) * 1000)
-            if parsed.isEmpty {
-                // A large right-pane list can still be a false positive. If it
-                // has no parseable message rows, use Vision for messages.
-                capturePlan = ConversationCapturePlan(identity: plan.identity, messages: .vision)
-            } else {
-                capturedAXMessages = parsed
-                capturedAXRowCount = rows.count
+            if let failure = parsed.failure {
+                updateCaptureDiagnostic(plan: plan, hasAXIdentity: axContact != nil, hasAXMessages: true,
+                    failure: failure, hasAXTitle: axIdentity.hasTitle)
+                return .failure(.accessibilityExtractionFailed(stage: failure))
             }
+            capturedAXMessages = parsed.messages
+            capturedAXRowCount = parsed.rows
+            axHasUnreadableBubbles = parsed.unreadableBubbles > 0
         }
+
         let hasValidatedAXMessages = capturedAXMessages != nil
 
         // If AX supplied text but not a usable transcript frame, require
@@ -825,6 +858,14 @@ final class WeChatBridge: @unchecked Sendable {
             return .failure(.identityUnavailable)
         }
 
+        if capturePlan.identity == .accessibility {
+            guard let checked = accessibilityIdentity(in: window, app: app).contact,
+                  WeChatParsing.conversationIdentityKey(checked) == WeChatParsing.conversationIdentityKey(contact) else {
+                updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: false, hasAXMessages: true,
+                                        failure: "conversation changed or became uncertain during extraction")
+                return .failure(.identityUnavailable)
+            }
+        }
         let totalMilliseconds = Int(Date().timeIntervalSince(totalStarted) * 1000)
         var capturedGeometry = visionObservation?.paneGeometry ?? resolvedGeometry
         var visualTitleMatchesAXIdentity: Bool?
@@ -863,6 +904,7 @@ final class WeChatBridge: @unchecked Sendable {
                 visionTimingDiagnostic($0, titleFound: $0.title != nil, geometry: capturedGeometry)
             } ?? "Vision: not used"
         ].joined(separator: "\n")
+        validatedCapture = extractionTrustworthy && capturedGeometry.isValidated
         updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil,
                                 hasAXMessages: capturePlan.messages == .accessibility && list != nil,
                                 failure: "none", hasAXTitle: axIdentity.hasTitle, timing: timing)
@@ -878,7 +920,8 @@ final class WeChatBridge: @unchecked Sendable {
                               messagePaneLeftX: capturedGeometry.leftX,
                               messagesUnchanged: messagesUnchanged,
                               headerUnchanged: visionObservation?.headerFrameUnchanged ?? false,
-                              captureTimingDiagnostic: timing))
+                              captureTimingDiagnostic: timing,
+                              liveEdgeState: axHasUnreadableBubbles ? nil : list.flatMap { liveEdgeState(in: $0) }))
     }
 
     private func axProbeDiagnostic(_ fastProbe: AXCapabilityProbe?, resolvedProbe: AXCapabilityProbe?, fallbackAttempted: Bool,
@@ -919,6 +962,12 @@ final class WeChatBridge: @unchecked Sendable {
         "additional title screenshot retries: none; next watchdog observation retries if needed"
     }
 
+    var lastCaptureFailureStage: String {
+        captureDiagnosticLock.lock()
+        defer { captureDiagnosticLock.unlock() }
+        return lastCaptureFailure
+    }
+
     var conversationCaptureDiagnostic: String {
         captureDiagnosticLock.lock()
         defer { captureDiagnosticLock.unlock() }
@@ -931,7 +980,8 @@ final class WeChatBridge: @unchecked Sendable {
             "AX message list available: \(lastAXMessageListAvailable ? "yes" : "no")",
             "Screen Recording permission: \(WeChatScreenReader.hasScreenCapturePermission ? "yes" : "no")",
             "Last capture failure: \(lastCaptureFailure)",
-            lastCaptureTimingDiagnostic
+            lastCaptureTimingDiagnostic,
+            lastAXReadDiagnostic
         ].joined(separator: "\n")
     }
 
@@ -964,24 +1014,45 @@ final class WeChatBridge: @unchecked Sendable {
     private func accessibilityIdentity(in window: AXUIElement, app: NSRunningApplication) -> (contact: String?, hasTitle: Bool) {
         let info = backendState(for: app.processIdentifier, window: window)
         guard let probe = info.initialProbe else { return (nil, false) }
+        var title: String?
         if let titleElement = probe.titleElement {
-            let raw = string(titleElement, "AXValue", timeout: 0.06) ??
-                string(titleElement, "AXTitle", timeout: 0.06) ?? probe.title ?? ""
-            let title = WeChatParsing.normalizeChatTitle(raw)
-            if !title.isEmpty && !WeChatParsing.isGenericWindowTitle(title) { return (title, true) }
-        }
-        for session in probe.sessionElements where bool(session.element, "AXSelected", timeout: 0.06) {
-            if let name = WeChatParsing.selectedSessionName(from: session.identifier, isSelected: true) {
-                return (name, false)
+            let fields = attributes(titleElement, ["AXIdentifier", "AXValue", "AXTitle"])
+            if fields["AXIdentifier"] as? String == WeChatParsing.chatTitleIdentifier {
+                let raw = WeChatParsing.messageText(identifier: WeChatParsing.messageRowIdentifier,
+                    title: fields["AXValue"] as? String, value: fields["AXTitle"] as? String) ?? ""
+                let normalized = WeChatParsing.normalizeChatTitle(raw)
+                if !normalized.isEmpty && !WeChatParsing.isGenericWindowTitle(normalized) { title = normalized }
             }
         }
-        if let selected = probe.selectedSession { return (selected, false) }
-        return (probe.title, probe.title != nil)
+        var selected: String?
+        let identityDeadline = Date().addingTimeInterval(0.15)
+        for session in probe.sessionElements {
+            if Date() >= identityDeadline { break }
+            let fields = attributes(session.element, ["AXIdentifier", "AXSelected"])
+            if let id = fields["AXIdentifier"] as? String,
+               let name = WeChatParsing.selectedSessionName(from: id,
+                    isSelected: (fields["AXSelected"] as? NSNumber)?.boolValue == true) { selected = name; break }
+        }
+        if let title, let selected,
+           WeChatParsing.conversationIdentityKey(title) != WeChatParsing.conversationIdentityKey(selected) {
+            return (nil, false)
+        }
+        return (title ?? selected, title != nil)
     }
 
     private func messageListElement(in window: AXUIElement) -> AXUIElement? {
         guard let app = weChatApplication() else { return nil }
-        return backendState(for: app.processIdentifier, window: window).initialProbe?.messageListElement
+        guard let list = backendState(for: app.processIdentifier, window: window).initialProbe?.messageListElement else { return nil }
+        if identifier(list, timeout: 0.02) == WeChatParsing.messageListIdentifier { return list }
+        // A destroyed/replaced list invalidates the successful plan. Rediscover
+        // within a bounded probe, never traverse the full window every poll.
+        backendLock.lock()
+        activeCapturePlan = nil
+        backendLock.unlock()
+        let fast = probeAXCapabilities(in: window, cancellation: ProbeCancellation())
+        let probe = fast.hasAXMessageList ? fast : targetedAXFallback(in: window, base: fast).probe
+        cacheCapabilityProbe(probe, pid: app.processIdentifier, window: window)
+        return probe.messageListElement
     }
 
     private func accessibilityPaneGeometry(in window: AXUIElement,
@@ -1041,27 +1112,84 @@ final class WeChatBridge: @unchecked Sendable {
         )
     }
 
-    private func hasMessageLikeRows(_ rows: [AXUIElement]) -> Bool {
-        rows.contains { row in
-            let id = identifier(row, timeout: 0.02)
-            return id == WeChatParsing.messageRowIdentifier || id == WeChatParsing.placeholderRowIdentifier
+    private struct AXMessageRead {
+        var messages: [ChatMessage] = []
+        var rows = 0
+        var bubbles = 0
+        var placeholders = 0
+        var nodes = 0
+        var exhausted = false
+        var rowAttributesUnavailable = false
+        var unreadableBubbles = 0
+        var failure: String? {
+            if exhausted { return "row traversal budget exceeded" }
+            if rowAttributesUnavailable { return "AXVisibleChildren and AXChildren unavailable" }
+            if rows == 0 { return "message list has no visible rows" }
+            if bubbles == 0 { return "no confirmed chat_bubble_item_view rows" }
+            if messages.isEmpty { return "confirmed bubbles have no readable AXTitle/AXValue or descendant text" }
+            return nil
         }
     }
 
-    private func readAccessibilityMessages(from rows: [AXUIElement], limit: Int?) -> [ChatMessage] {
-        var messages: [ChatMessage] = []
-        for row in rows {
-            let rowID = identifier(row)
-            guard rowID == WeChatParsing.messageRowIdentifier,
-                  let text = WeChatParsing.messageText(
-                    identifier: rowID,
-                    title: string(row, "AXTitle"),
-                    value: string(row, "AXValue")
-                  ) else { continue }
-            let sender = WeChatParsing.sender(from: string(row, "AXDescription") ?? "")
-            messages.append(ChatMessage(text: text, sender: sender, source: .accessibility))
+    private func readAccessibilityMessages(in list: AXUIElement, limit: Int) -> AXMessageRead {
+        var result = AXMessageRead()
+        let deadline = Date().addingTimeInterval(0.70)
+        let visible = boundedChildren(list, attribute: "AXVisibleChildren")
+        let fallback = visible == nil || visible?.isEmpty == true ? boundedChildren(list) : nil
+        let rows = visible?.isEmpty == false ? visible! : fallback ?? []
+        result.rowAttributesUnavailable = visible == nil && fallback == nil
+        result.rows = rows.count
+        var rowStack = rows.reversed().map { ($0, 0) }
+        while let (row, rowDepth) = rowStack.popLast() {
+            guard Date() < deadline, result.nodes < 500 else { result.exhausted = true; break }
+            result.nodes += 1
+            let fields = attributes(row, ["AXIdentifier", "AXRole", "AXTitle", "AXValue", "AXDescription"])
+            let id = fields["AXIdentifier"] as? String ?? ""
+            if id == WeChatParsing.placeholderRowIdentifier { result.placeholders += 1; continue }
+            guard id == WeChatParsing.messageRowIdentifier else {
+                // Some releases wrap confirmed bubbles in list rows/cells.
+                // These wrappers never supply message text themselves.
+                let role = fields["AXRole"] as? String ?? ""
+                if rowDepth < 2, ["AXRow", "AXCell", "AXGroup", "AXUnknown"].contains(role) {
+                    rowStack.append(contentsOf: (boundedChildren(row, maximum: 8) ?? []).reversed().map { ($0, rowDepth + 1) })
+                }
+                continue
+            }
+            result.bubbles += 1
+            var text = WeChatParsing.messageText(identifier: id, title: fields["AXTitle"] as? String, value: fields["AXValue"] as? String)
+            if text == nil {
+                // Descend only inside a positively identified bubble. Metadata
+                // and controls cannot supply fallback message text.
+                var stack = (boundedChildren(row, maximum: 32) ?? []).reversed().map { ($0, 1) }
+                var fragments: [String] = []
+                while let (node, depth) = stack.popLast() {
+                    guard Date() < deadline, result.nodes < 500 else { result.exhausted = true; break }
+                    result.nodes += 1
+                    let child = attributes(node, ["AXIdentifier", "AXRole", "AXTitle", "AXValue"])
+                    let childID = child["AXIdentifier"] as? String ?? ""
+                    let role = child["AXRole"] as? String ?? ""
+                    guard childID.isEmpty || ["chat_bubble_text", "chat_message_text"].contains(childID) else { continue }
+                    if role == "AXStaticText" || role == "AXTextArea" {
+                        if let fragment = WeChatParsing.descendantMessageText(role: role, identifier: childID,
+                            title: child["AXTitle"] as? String, value: child["AXValue"] as? String) {
+                            fragments.append(fragment)
+                        }
+                    } else if ["AXGroup", "AXUnknown"].contains(role), depth < 4 {
+                        stack.append(contentsOf: (boundedChildren(node, maximum: 32) ?? []).reversed().map { ($0, depth + 1) })
+                    }
+                }
+                if !fragments.isEmpty { text = fragments.joined(separator: "\n") }
+            }
+            if let text {
+                result.messages.append(ChatMessage(text: text,
+                    sender: WeChatParsing.sender(from: fields["AXDescription"] as? String ?? ""), source: .accessibility))
+            } else { result.unreadableBubbles += 1 }
         }
-        return limit.map { Array(messages.suffix(max(0, $0))) } ?? messages
+        result.messages = Array(result.messages.suffix(max(0, limit)))
+        captureDiagnosticLock.lock()
+        lastAXReadDiagnostic = "AX rows: \(result.rows), bubbles: \(result.bubbles), placeholders: \(result.placeholders), scanned nodes: \(result.nodes), extracted: \(result.messages.count), unreadable bubbles: \(result.unreadableBubbles), stage: \(result.failure ?? "complete")"
+        captureDiagnosticLock.unlock()
+        return result
     }
 
     func detectCurrentConversation(forceFreshVision: Bool = false,
@@ -1123,41 +1251,7 @@ final class WeChatBridge: @unchecked Sendable {
                 .messageListUnavailable(treeCollapsed: true, visionState: nil)
         }
 
-        // 1. Stable WeChat 4.x message-list identifier.
-        if let list = firstMatch(window, where: {
-            string($0, "AXRole") == "AXList" && identifier($0) == WeChatParsing.messageListIdentifier
-        }) {
-            return readRows(in: list, limit: limit)
-        }
-
-        // 2. Localized AXTitle fallback.
-        if let list = firstMatch(window, where: {
-            string($0, "AXRole") == "AXList" && ["Messages", "消息"].contains(string($0, "AXTitle") ?? "")
-        }) {
-            return readRows(in: list, limit: limit)
-        }
-
-        // 3. Conservative older-client fallback: only inspect AXLists under a
-        // large right-side scroll area when the chat composer is also present.
-        guard hasConversationComposer(in: window) else {
-            if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false,
-                                                forceFresh: forceFresh, previousFingerprint: previousFingerprint) { return result }
-            return .messageListUnavailable(treeCollapsed: false, visionState: nil)
-        }
-        let windowFrame = frame(window)
-        let paneAreas = find(window) {
-            guard string($0, "AXRole") == "AXScrollArea" else { return false }
-            let bounds = frame($0)
-            return bounds.minX > windowFrame.minX + windowFrame.width * 0.25 &&
-                bounds.width > 220 && bounds.height > 300
-        }
-        for area in paneAreas {
-            if let list = firstMatch(area, depth: 8, where: { string($0, "AXRole") == "AXList" }) {
-                return readRows(in: list, limit: limit)
-            }
-        }
-        if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision, treeCollapsed: false,
-                                            forceFresh: forceFresh, previousFingerprint: previousFingerprint) { return result }
+        if let list = messageListElement(in: window) { return readRows(in: list, limit: limit) }
         return .messageListUnavailable(treeCollapsed: false, visionState: nil)
     }
 
@@ -1371,50 +1465,37 @@ final class WeChatBridge: @unchecked Sendable {
         return WeChatScreenReader.shared.annotatedPreview(pid: app.processIdentifier, windowFrame: frame(window))
     }
 
-    private func readRows(in list: AXUIElement, limit: Int) -> MessageReadResult {
-        let rows = children(list)
-        var messages: [ChatMessage] = []
-        var bubbleRows = 0
-        var placeholders = 0
-        for row in rows {
-            // Read the row's structural fields together with its preferred text.
-            let rowIdentifier = identifier(row)
-            let rowTitle = string(row, "AXTitle")
-            let rowValue = string(row, "AXValue")
-            let rowFrame = frame(row)
-            _ = rowFrame
-
-            if rowIdentifier == WeChatParsing.placeholderRowIdentifier {
-                placeholders += 1
-                continue
+    /// Scrollbar evidence establishes arrival direction. Missing or
+    /// unsupported evidence stays unknown and cannot authorize automatic analysis.
+    private func liveEdgeState(in list: AXUIElement) -> Bool? {
+        var current: AXUIElement? = list
+        for _ in 0..<4 {
+            guard let element = current else { break }
+            let fields = attributes(element, ["AXVerticalScrollBar", "AXParent"])
+            if let raw = fields["AXVerticalScrollBar"], CFGetTypeID(raw as CFTypeRef) == AXUIElementGetTypeID() {
+                let bar = raw as! AXUIElement
+                let values = attributes(bar, ["AXValue", "AXMinValue", "AXMaxValue"])
+                if let value = values["AXValue"] as? NSNumber,
+                   let minimum = values["AXMinValue"] as? NSNumber,
+                   let maximum = values["AXMaxValue"] as? NSNumber,
+                   maximum.doubleValue > minimum.doubleValue {
+                    let position = (value.doubleValue - minimum.doubleValue) / (maximum.doubleValue - minimum.doubleValue)
+                    guard position.isFinite, (0...1).contains(position) else { return nil }
+                    return position >= 0.999
+                }
             }
-            guard rowIdentifier == WeChatParsing.messageRowIdentifier else { continue }
-            bubbleRows += 1
-
-            guard let text = WeChatParsing.messageText(identifier: rowIdentifier, title: rowTitle, value: rowValue) else { continue }
-            let description = string(row, "AXDescription") ?? ""
-            let sender = WeChatParsing.sender(from: description)
-            messages.append(ChatMessage(text: text, sender: sender))
+            if let raw = fields["AXParent"], CFGetTypeID(raw as CFTypeRef) == AXUIElementGetTypeID() {
+                current = (raw as! AXUIElement)
+            } else { current = nil }
         }
-        return .messageListFound(
-            messages: Array(messages.suffix(limit)),
-            renderedRows: rows.count,
-            bubbleRows: bubbleRows,
-            placeholders: placeholders,
-            isVision: false,
-            fingerprint: nil
-        )
+        return nil
     }
 
-    private func hasConversationComposer(in root: AXUIElement) -> Bool {
-        let bounds = frame(root)
-        return firstMatch(root, depth: 16) { element in
-            guard string(element, "AXRole") == "AXTextArea" else { return false }
-            let rect = frame(element)
-            return rect.minX > bounds.minX + bounds.width * 0.25 &&
-                rect.minY > bounds.minY + bounds.height * 0.65 &&
-                rect.width > 180 && rect.height > 30
-        } != nil
+    private func readRows(in list: AXUIElement, limit: Int) -> MessageReadResult {
+        let read = readAccessibilityMessages(in: list, limit: limit)
+        guard read.failure == nil else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
+        return .messageListFound(messages: read.messages, renderedRows: read.rows,
+            bubbleRows: read.bubbles, placeholders: read.placeholders, isVision: false, fingerprint: nil)
     }
 
     func accessibilityTreeAppearsCollapsed() -> Bool {
@@ -1441,6 +1522,7 @@ final class WeChatBridge: @unchecked Sendable {
         var lines = [
             "WeChat bundle: \(runningApp.bundleIdentifier ?? "<unknown>")",
             "PID: \(runningApp.processIdentifier)",
+            "Accessibility trusted: \(hasAccessibilityPermission)",
             "Helper excluded: \(runningApp.processIdentifier != ProcessInfo.processInfo.processIdentifier && runningApp.bundleIdentifier != helperBundleID)",
             "Windows: \(appWindows.count)"
         ]
@@ -1469,50 +1551,29 @@ final class WeChatBridge: @unchecked Sendable {
         lines.append("  identifier=\(windowIdentifier)")
         lines.append("  frame=\(frameDescription(windowFrame))")
 
-        let titleNodes = find(window) {
-            string($0, "AXRole") == "AXStaticText" && identifier($0) == WeChatParsing.chatTitleIdentifier
-        }
-        lines.append("Current-chat title element:")
-        lines.append("  found=\(!titleNodes.isEmpty)")
-        lines.append("  identifier=\(titleNodes.isEmpty ? "<none>" : WeChatParsing.chatTitleIdentifier)")
-
-        let messageLists = find(window) {
-            string($0, "AXRole") == "AXList" && identifier($0) == WeChatParsing.messageListIdentifier
-        }
-        let localizedLists = find(window) {
-            string($0, "AXRole") == "AXList" && ["Messages", "消息"].contains(string($0, "AXTitle") ?? "")
-        }
-        let allBubbleRows = find(window) { identifier($0) == WeChatParsing.messageRowIdentifier }.count
-        let allPlaceholderRows = find(window) { identifier($0) == WeChatParsing.placeholderRowIdentifier }.count
-        lines.append("Message list:")
-        lines.append("  chat_message_list found=\(!messageLists.isEmpty)")
-        lines.append("  localized Messages/消息 list found=\(!localizedLists.isEmpty)")
-        lines.append("  message rows in window chat_bubble_item_view=\(allBubbleRows) virtual_cell=\(allPlaceholderRows)")
-        if let list = messageLists.first {
-            let rows = children(list)
-            let bubbleCount = rows.filter { identifier($0) == WeChatParsing.messageRowIdentifier }.count
-            let virtualCount = rows.filter { identifier($0) == WeChatParsing.placeholderRowIdentifier }.count
-            lines.append("  role=\(string(list, "AXRole") ?? "<unavailable>")")
-            lines.append("  identifier=\(WeChatParsing.messageListIdentifier)")
-            lines.append("  children total=\(rows.count) chat_bubble_item_view=\(bubbleCount) virtual_cell=\(virtualCount) other=\(max(0, rows.count - bubbleCount - virtualCount))")
-        }
-
+        lines.append(conversationCaptureDiagnostic)
+        lines.append(capturePerformanceSummary)
         let nodes = structuralNodes(in: window, maximum: 500)
         lines.append("Structural nodes (text values omitted; identifiers sanitized):")
         lines.append(contentsOf: nodes)
+        lines.append("Structural row counts: bubbles=\(nodes.filter { $0.contains("identifier=" + WeChatParsing.messageRowIdentifier + " ") }.count), placeholders=\(nodes.filter { $0.contains("identifier=" + WeChatParsing.placeholderRowIdentifier + " ") }.count); bounded diagnostic sample")
         return lines.joined(separator: "\n") + "\n"
     }
 
     private func structuralNodes(in root: AXUIElement, maximum: Int) -> [String] {
         var output: [String] = []
         var stack: [(AXUIElement, Int)] = [(root, 0)]
-        while let (element, depth) = stack.popLast(), output.count < maximum {
+        let deadline = Date().addingTimeInterval(2)
+        while let (element, depth) = stack.popLast(), output.count < maximum, Date() < deadline {
             let role = string(element, "AXRole") ?? "<unavailable>"
             let id = WeChatParsing.diagnosticIdentifier(identifier(element))
-            let childNodes = children(element)
-            let bounds = frame(element)
-            output.append("  \(String(repeating: " ", count: min(depth, 12)))role=\(role) identifier=\(id) children=\(childNodes.count) frame=\(frameDescription(bounds))")
-            for child in childNodes.reversed() { stack.append((child, depth + 1)) }
+            let childNodes = boundedChildren(element, maximum: 80) ?? []
+            var names: CFArray?
+            AXUIElementSetMessagingTimeout(element, 0.02)
+            AXUIElementCopyAttributeNames(element, &names)
+            let supported = names as? [String] ?? []
+            output.append("  \(String(repeating: " ", count: min(depth, 12)))role=\(role) identifier=\(id) children=\(childNodes.count) AXTitle=\(supported.contains("AXTitle")) AXValue=\(supported.contains("AXValue"))")
+            if depth < 18 { for child in childNodes.reversed() { stack.append((child, depth + 1)) } }
         }
         if !stack.isEmpty { output.append("  <node output capped>") }
         return output
