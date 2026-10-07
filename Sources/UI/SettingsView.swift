@@ -112,10 +112,12 @@ struct SettingsView: View {
     private func saveVisionCaptureDiagnostic() {
         isInspectingWeChat = true
         diagnosticStatus = nil
+        let monitorState = MessageMonitor.shared.visionIdentityDiagnostic
         Task {
-            let report = await Task.detached(priority: .utility) {
+            var report = await Task.detached(priority: .utility) {
                 WeChatBridge.shared.visionDiagnosticReport()
             }.value
+            report += "\nMonitor identity state (names omitted):\n\(monitorState)\n"
             isInspectingWeChat = false
 
             let panel = NSSavePanel()

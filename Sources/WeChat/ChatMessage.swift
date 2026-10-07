@@ -15,7 +15,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var isFromMe: Bool { sender == .me }
     var senderIdentified: Bool { sender != .unknown }
 
-    init(text: String, sender: MessageSender, allowsAutomaticAnalysis: Bool = true) {
+    init(text: String, sender: MessageSender, allowsAutomaticAnalysis: Bool = true, id: String? = nil) {
         self.text = text
         self.sender = sender
         self.allowsAutomaticAnalysis = allowsAutomaticAnalysis
@@ -25,7 +25,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         case .other: senderKey = "other"
         case .unknown: senderKey = "unknown"
         }
-        self.id = "\(senderKey):\(text)"
+        self.id = id ?? "\(senderKey):\(text)"
     }
 
     init(text: String, isFromMe: Bool, senderIdentified: Bool = true, allowsAutomaticAnalysis: Bool = true) {

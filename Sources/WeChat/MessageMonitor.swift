@@ -26,10 +26,21 @@ final class MessageMonitor: ObservableObject {
     private var candidateContact: String?
     private var candidateContactPolls = 0
     private let unidentifiedPollLimit = 5
-    private let contactSwitchConfirmationCount = 2
+    private let accessibilitySwitchConfirmationCount = 2
+    private let visionSwitchConfirmationCount = 3
+    private let minimumVisionSwitchTitleConfidence: Float = 0.35
     private let contextHistoryLimit = 100
     private let automaticAnalysisContextLimit = 50
     private let pollingInterval: TimeInterval = 1
+
+    var visionIdentityDiagnostic: String {
+        [
+            "Stable contact state: \(lockedContact == nil ? "unset" : "set")",
+            "Candidate contact active: \(candidateContact == nil ? "no" : "yes")",
+            "Candidate contact consecutive detections: \(candidateContactPolls)",
+            "Consecutive title misses: \(unidentifiedPolls)"
+        ].joined(separator: "\n")
+    }
 
     func start() {
         guard !isRunning, !isCheckingConversation else { return }
@@ -39,6 +50,7 @@ final class MessageMonitor: ObservableObject {
         unidentifiedPolls = 0
         candidateContact = nil
         candidateContactPolls = 0
+        isUsingVision = false
         messages = []
         contextHistory = []
         lastIDs = []
@@ -106,10 +118,22 @@ final class MessageMonitor: ObservableObject {
         let token = generation
         let bridge = self.bridge
         let lockedContact = self.lockedContact
+        let minimumTitleConfidence = self.minimumVisionSwitchTitleConfidence
         accessibilityQueue.async { [weak self] in
             let detection = bridge.detectCurrentConversation()
-            let contact = detection.contact
-            let result = contact == nil || contact != lockedContact ? nil : bridge.readMessages(limit: 50)
+            let contact: String?
+            if let vision = detection.visionSnapshot {
+                contact = (vision.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence
+                    ? detection.contact
+                    : nil
+            } else {
+                contact = detection.contact
+            }
+            let contactsMatch = contact.map { detected in
+                guard let lockedContact else { return false }
+                return WeChatParsing.conversationIdentityKey(detected) == WeChatParsing.conversationIdentityKey(lockedContact)
+            } ?? false
+            let result = contactsMatch ? bridge.readMessages(limit: 50) : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
@@ -118,35 +142,38 @@ final class MessageMonitor: ObservableObject {
                     self.unidentifiedPolls += 1
                     self.candidateContact = nil
                     self.candidateContactPolls = 0
-                    self.contactName = nil
-                    self.messages = []
                     if self.unidentifiedPolls >= self.unidentifiedPollLimit {
+                        let failureStatus = self.detectionFailureStatus(detection)
                         self.stop()
-                        self.status = self.detectionFailureStatus(detection)
+                        self.status = failureStatus
                     } else {
-                        self.status = self.detectionFailureStatus(detection)
+                        self.status = "Verifying conversation… (\(self.unidentifiedPolls)/\(self.unidentifiedPollLimit))"
                     }
                     return
                 }
-                self.unidentifiedPolls = 0
 
-                guard contact == self.lockedContact else {
-                    if self.candidateContact == contact {
+                guard let stableContact = self.lockedContact,
+                      self.conversationKey(contact) == self.conversationKey(stableContact) else {
+                    let incomingKey = self.conversationKey(contact)
+                    if let candidate = self.candidateContact,
+                       self.conversationKey(candidate) == incomingKey {
                         self.candidateContactPolls += 1
                     } else {
                         self.candidateContact = contact
                         self.candidateContactPolls = 1
                     }
-                    self.contactName = nil
-                    self.messages = []
-                    if self.candidateContactPolls >= self.contactSwitchConfirmationCount {
+                    let requiredCount = detection.visionSnapshot == nil
+                        ? self.accessibilitySwitchConfirmationCount
+                        : self.visionSwitchConfirmationCount
+                    if self.candidateContactPolls >= requiredCount {
                         self.stop()
                         self.status = "Conversation changed. Activate again in the chat you want to monitor."
                     } else {
-                        self.status = "Checking a possible conversation change…"
+                        self.status = "Checking a possible conversation change… (\(self.candidateContactPolls)/\(requiredCount))"
                     }
                     return
                 }
+                self.unidentifiedPolls = 0
                 self.candidateContact = nil
                 self.candidateContactPolls = 0
                 self.isUsingVision = detection.visionSnapshot != nil
@@ -348,13 +375,24 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func contextKey(_ message: ChatMessage) -> String {
+        if message.id.hasPrefix("vision:") { return message.id }
         let normalized = message.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         let scalars = normalized.unicodeScalars.filter {
             !CharacterSet.whitespacesAndNewlines.contains($0) &&
                 !CharacterSet.punctuationCharacters.contains($0)
         }
         let key = String(String.UnicodeScalarView(scalars))
-        return key.isEmpty ? message.text : key
+        let sender: String
+        switch message.sender {
+        case .me: sender = "me"
+        case .other: sender = "other"
+        case .unknown: sender = "unknown"
+        }
+        return "\(sender):\(key.isEmpty ? message.text : key)"
+    }
+
+    private func conversationKey(_ contact: String) -> String {
+        WeChatParsing.conversationIdentityKey(contact)
     }
 
     private func scheduleBurst(contact: String, canAutoAnalyze: Bool) {

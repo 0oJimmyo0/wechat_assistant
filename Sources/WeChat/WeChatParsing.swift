@@ -14,6 +14,12 @@ enum WeChatParsing {
         return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static func conversationIdentityKey(_ text: String) -> String {
+        normalizeChatTitle(text)
+            .precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
     static func isGenericWindowTitle(_ title: String) -> Bool {
         let normalized = title.split(whereSeparator: \.isWhitespace).joined().lowercased()
         return ["wechat", "wechat(chats)", "wechat(contacts)", "wechat(discover)", "微信", "微信(聊天)", "微信(通讯录)"].contains(normalized)

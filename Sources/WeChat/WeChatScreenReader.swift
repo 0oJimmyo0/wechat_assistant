@@ -19,6 +19,7 @@ struct VisibleWeChatSnapshot: Sendable {
     let headerObservationCount: Int
     let headerCandidates: [VisionHeaderCandidate]
     let acceptedTitleBounds: CGRect?
+    let acceptedTitleConfidence: Float?
     let messageObservationCount: Int
     let messageBounds: [CGRect]
 }
@@ -48,8 +49,8 @@ final class WeChatScreenReader {
     // The title can sit close to the top edge on newer WeChat layouts. Keep a
     // little extra room and let candidate scoring distinguish the title from
     // toolbar text instead of cutting observations off at a hard Y boundary.
-    private let headerSearchRegion = CGRect(x: 0.0, y: 0.70, width: 1.0, height: 0.299)
-    private let messageRegion = CGRect(x: 0.01, y: 0.14, width: 0.98, height: 0.66)
+    private let headerSearchRegion = CGRect(x: 0.0, y: 0.82, width: 1.0, height: 0.179)
+    private let messageRegion = CGRect(x: 0.01, y: 0.12, width: 0.98, height: 0.68)
 
     private let lock = NSLock()
     private var cachedKey: String?
@@ -128,6 +129,7 @@ final class WeChatScreenReader {
             return (makeSnapshot(
                 title: nil, messages: [], state: .visionFailed, pid: pid, image: capturedWindow,
                 target: target, headerObservations: 0, headerCandidates: [], acceptedTitleBounds: nil,
+                acceptedTitleConfidence: nil,
                 messageObservations: 0, messageBounds: []
             ), capturedWindow)
         }
@@ -138,13 +140,18 @@ final class WeChatScreenReader {
         let title = accepted?.text
 
         let messageObservations = messageRequest.results ?? []
-        let messageLines = messageObservations.compactMap { observation -> (String, CGRect, Float)? in
+        let messageLines = messageObservations.compactMap { observation -> RecognizedMessageLine? in
             guard let candidate = observation.topCandidates(1).first,
                   candidate.confidence >= 0.45 else { return nil }
             let bounds = observation.boundingBox
-            guard bounds.minX >= 0.01, bounds.minY >= 0.14, bounds.maxY <= 0.80,
+            guard bounds.minX >= messageRegion.minX, bounds.minY >= messageRegion.minY,
+                  bounds.maxY <= messageRegion.maxY,
                   !looksLikeTimestampOrControl(candidate.string) else { return nil }
-            return (candidate.string.trimmingCharacters(in: .whitespacesAndNewlines), bounds, candidate.confidence)
+            return RecognizedMessageLine(
+                text: candidate.string.trimmingCharacters(in: .whitespacesAndNewlines),
+                bounds: bounds,
+                confidence: candidate.confidence
+            )
         }
         let (messages, messageBounds) = groupMessageLines(messageLines)
 
@@ -158,6 +165,7 @@ final class WeChatScreenReader {
             headerObservations: headerObservations.count,
             headerCandidates: headerCandidates.map(\.diagnostic),
             acceptedTitleBounds: accepted?.diagnostic.bounds,
+            acceptedTitleConfidence: accepted?.diagnostic.confidence,
             messageObservations: messageObservations.count,
             messageBounds: Array(messageBounds.suffix(50))
         ), capturedWindow)
@@ -250,14 +258,15 @@ final class WeChatScreenReader {
             capturedSize: nil, conversationCrop: crop, targetPID: pid, selectedWindowPID: nil,
             selectedWindowFrame: nil, selectedWindowOnScreen: false, windowFrameDistance: nil,
             ocrObservationCount: 0, headerObservationCount: 0, headerCandidates: [],
-            acceptedTitleBounds: nil, messageObservationCount: 0, messageBounds: []
+            acceptedTitleBounds: nil, acceptedTitleConfidence: nil,
+            messageObservationCount: 0, messageBounds: []
         )
     }
 
     private func makeSnapshot(
         title: String?, messages: [ChatMessage], state: VisionCaptureState, pid: pid_t,
         image: CGImage, target: CapturedWindow, headerObservations: Int,
-        headerCandidates: [VisionHeaderCandidate], acceptedTitleBounds: CGRect?,
+        headerCandidates: [VisionHeaderCandidate], acceptedTitleBounds: CGRect?, acceptedTitleConfidence: Float?,
         messageObservations: Int, messageBounds: [CGRect]
     ) -> VisibleWeChatSnapshot {
         VisibleWeChatSnapshot(
@@ -268,7 +277,8 @@ final class WeChatScreenReader {
             selectedWindowOnScreen: target.onScreen, windowFrameDistance: target.distance,
             ocrObservationCount: headerObservations + messageObservations,
             headerObservationCount: headerObservations, headerCandidates: headerCandidates,
-            acceptedTitleBounds: acceptedTitleBounds, messageObservationCount: messageObservations,
+            acceptedTitleBounds: acceptedTitleBounds, acceptedTitleConfidence: acceptedTitleConfidence,
+            messageObservationCount: messageObservations,
             messageBounds: messageBounds
         )
     }
@@ -348,8 +358,11 @@ final class WeChatScreenReader {
             "Header-region observations: \(snapshot.headerObservationCount)",
             "Header candidates after filtering: \(snapshot.headerCandidates.count)",
             "Accepted title: \(snapshot.title == nil ? "no" : "yes")",
-            "Message-region observations: \(snapshot.messageObservationCount)",
-            "Grouped message blocks: \(snapshot.messages.count)"
+            "Raw OCR line count: \(snapshot.messageObservationCount)",
+            "Grouped message blocks: \(snapshot.messages.count)",
+            "Grouped senders: me=\(snapshot.messages.filter { $0.sender == .me }.count) target=\(snapshot.messages.filter { $0.sender == .other }.count) unknown=\(snapshot.messages.filter { $0.sender == .unknown }.count)",
+            "Header/message ROI overlap: \(!headerSearchRegion.intersection(messageRegion).isNull && !headerSearchRegion.intersection(messageRegion).isEmpty)",
+            "Accepted title confidence: \(snapshot.acceptedTitleConfidence.map { String(format: "%.3f", $0) } ?? "unavailable")"
         ]
         for (index, candidate) in snapshot.headerCandidates.enumerated() {
             lines.append("Header candidate \(index + 1): bbox=\(rectDescription(candidate.bounds)) confidence=\(String(format: "%.3f", candidate.confidence)) characters=\(candidate.characterCount) accepted=\(candidate.accepted)")
@@ -413,35 +426,67 @@ final class WeChatScreenReader {
             .contains(text)
     }
 
-    private func sender(for textBounds: CGRect) -> MessageSender {
-        if textBounds.minX >= 0.55 { return .me }
-        if textBounds.minX <= 0.20 && textBounds.maxX <= 0.55 { return .other }
-        return .unknown
-    }
-
-    private func groupMessageLines(_ lines: [(String, CGRect, Float)]) -> ([ChatMessage], [CGRect]) {
-        var bubbles: [(text: String, bounds: CGRect, sender: MessageSender)] = []
-        for line in lines.sorted(by: { $0.1.maxY > $1.1.maxY }) {
-            let lineSender = sender(for: line.1)
+    private func groupMessageLines(_ lines: [RecognizedMessageLine]) -> ([ChatMessage], [CGRect]) {
+        var bubbles: [(text: String, bounds: CGRect, lines: [RecognizedMessageLine])] = []
+        for line in lines.sorted(by: { $0.bounds.maxY > $1.bounds.maxY }) {
             if let previous = bubbles.last {
-                let verticalGap = previous.bounds.minY - line.1.maxY
-                let sameBubble = lineSender != .unknown &&
-                    lineSender == previous.sender &&
-                    abs(previous.bounds.minX - line.1.minX) <= 0.035 &&
-                    verticalGap >= -0.004 && verticalGap <= 0.008
+                let verticalGap = previous.bounds.minY - line.bounds.maxY
+                let referenceHeight = max(previous.bounds.height / CGFloat(previous.lines.count), line.bounds.height)
+                let verticalTolerance = max(0.010, referenceHeight * 0.75)
+                let overlap = max(0, min(previous.bounds.maxX, line.bounds.maxX) - max(previous.bounds.minX, line.bounds.minX))
+                let narrowerWidth = max(0.001, min(previous.bounds.width, line.bounds.width))
+                let rangesOverlap = overlap / narrowerWidth >= 0.40
+                let alignmentTolerance = max(0.025, referenceHeight * 1.8)
+                let leftAligned = abs(previous.bounds.minX - line.bounds.minX) <= alignmentTolerance
+                let rightAligned = abs(previous.bounds.maxX - line.bounds.maxX) <= alignmentTolerance
+                let previousSide = messageSide(previous.bounds)
+                let lineSide = messageSide(line.bounds)
+                let compatibleSide = previousSide == .unknown || lineSide == .unknown || previousSide == lineSide
+                let sameBubble = verticalGap >= -referenceHeight * 0.4 &&
+                    verticalGap <= verticalTolerance &&
+                    (rangesOverlap || leftAligned || rightAligned) && compatibleSide
                 if sameBubble {
-                    bubbles[bubbles.count - 1].text += "\n" + line.0
-                    bubbles[bubbles.count - 1].bounds = previous.bounds.union(line.1)
+                    bubbles[bubbles.count - 1].text += "\n" + line.text
+                    bubbles[bubbles.count - 1].bounds = previous.bounds.union(line.bounds)
+                    bubbles[bubbles.count - 1].lines.append(line)
                     continue
                 }
             }
-            bubbles.append((line.0, line.1, lineSender))
+            bubbles.append((line.text, line.bounds, [line]))
         }
-        return (
-            bubbles.map { ChatMessage(text: $0.text, sender: $0.sender, allowsAutomaticAnalysis: false) },
-            bubbles.map(\.bounds)
-        )
+        let messages = bubbles.enumerated().map { index, bubble in
+            let sender = messageSide(bubble.bounds)
+            let normalizedText = bubble.text
+                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let senderKey = senderKey(for: sender)
+            // Order within this transient OCR snapshot distinguishes repeated
+            // identical bubbles while remaining stable as bubbles shift vertically.
+            let snapshotKey = "vision:\(senderKey):\(normalizedText):order\(index)"
+            return ChatMessage(text: bubble.text, sender: sender, allowsAutomaticAnalysis: false, id: snapshotKey)
+        }
+        return (messages, bubbles.map(\.bounds))
     }
+
+    private func messageSide(_ bounds: CGRect) -> MessageSender {
+        if bounds.maxX >= 0.88 && bounds.minX >= 0.28 { return .me }
+        if bounds.minX <= 0.12 && bounds.maxX <= 0.72 { return .other }
+        return .unknown
+    }
+
+    private func senderKey(for sender: MessageSender) -> String {
+        switch sender {
+        case .me: return "me"
+        case .other: return "other"
+        case .unknown: return "unknown"
+        }
+    }
+}
+
+private struct RecognizedMessageLine {
+    let text: String
+    let bounds: CGRect
+    let confidence: Float
 }
 
 private struct CapturedWindow {

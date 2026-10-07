@@ -5,6 +5,7 @@ enum WeChatParsingTests {
     static func main() {
         expect(WeChatParsing.normalizeChatTitle("  Group   Name(23)  ") == "Group Name", "normalizes whitespace and removes group count")
         expect(WeChatParsing.normalizeChatTitle("Project Room (active)") == "Project Room (active)", "preserves non-numeric suffix")
+        expect(WeChatParsing.conversationIdentityKey(" Alex (23) ") == WeChatParsing.conversationIdentityKey("alex"), "normalizes conversation identity for comparison")
         expect(WeChatParsing.isGenericWindowTitle("WeChat (Chats)"), "recognizes generic WeChat window title")
         expect(!WeChatParsing.isGenericWindowTitle("Alex"), "does not classify a contact name as generic")
 
@@ -26,6 +27,10 @@ enum WeChatParsingTests {
         let unknown = ChatMessage(text: "hello", sender: .unknown)
         let incoming = ChatMessage(text: "hello", sender: .other)
         let outgoing = ChatMessage(text: "hello", sender: .me)
+        let repeatedOne = ChatMessage(text: "嗯", sender: .other, allowsAutomaticAnalysis: false, id: "vision:other:嗯:order0")
+        let repeatedTwo = ChatMessage(text: "嗯", sender: .other, allowsAutomaticAnalysis: false, id: "vision:other:嗯:order1")
+        expect(repeatedOne.id != repeatedTwo.id, "keeps identical OCR messages distinct within a snapshot")
+        expect(!repeatedOne.allowsAutomaticAnalysis && !repeatedTwo.allowsAutomaticAnalysis, "OCR snapshots remain manual-only")
         expect(!WeChatParsing.canAutomaticallyAnalyze([unknown]), "unknown sender never auto-analyzes")
         expect(!WeChatParsing.canAutomaticallyAnalyze([outgoing]), "outgoing-only context never auto-analyzes")
         expect(!WeChatParsing.canAutomaticallyAnalyze([incoming, unknown]), "mixed known and unknown context never auto-analyzes")
