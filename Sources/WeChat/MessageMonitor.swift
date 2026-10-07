@@ -20,12 +20,20 @@ final class MessageMonitor: ObservableObject {
     private var generation = 0
     private var isCheckingConversation = false
     private var isPolling = false
+    private var unidentifiedPolls = 0
+    private var candidateContact: String?
+    private var candidateContactPolls = 0
+    private let unidentifiedPollLimit = 5
+    private let contactSwitchConfirmationCount = 2
 
     func start() {
         guard !isRunning, !isCheckingConversation else { return }
         guard bridge.hasAccessibilityPermission else { status = "Accessibility permission required"; bridge.requestAccessibilityPermission(); return }
         guard bridge.isWeChatRunning else { status = "WeChat not running"; return }
         isCheckingConversation = true
+        unidentifiedPolls = 0
+        candidateContact = nil
+        candidateContactPolls = 0
         status = "Connected to WeChat · checking conversation"
         generation += 1
         let token = generation
@@ -59,6 +67,9 @@ final class MessageMonitor: ObservableObject {
         isRunning = false
         isCheckingConversation = false
         isPolling = false
+        unidentifiedPolls = 0
+        candidateContact = nil
+        candidateContactPolls = 0
         timer?.invalidate(); timer = nil
         debounce?.cancel(); debounce = nil
         generation += 1
@@ -86,13 +97,43 @@ final class MessageMonitor: ObservableObject {
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
-                guard let contact, contact == self.lockedContact else {
-                    self.stop()
-                    self.status = treeCollapsed
-                        ? self.collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
-                        : "Conversation changed or could not be identified — activate again when the chat is open."
+                guard let contact, !contact.isEmpty else {
+                    self.unidentifiedPolls += 1
+                    self.candidateContact = nil
+                    self.candidateContactPolls = 0
+                    self.contactName = nil
+                    self.messages = []
+                    if self.unidentifiedPolls >= self.unidentifiedPollLimit {
+                        self.stop()
+                        self.status = treeCollapsed
+                            ? "Could not verify the conversation after several checks. Bring the chat to the front and activate again."
+                            : "Could not identify the open WeChat conversation. Activate again when the chat is open."
+                    } else {
+                        self.status = "Conversation check missed (\(self.unidentifiedPolls)/\(self.unidentifiedPollLimit)) · retrying…"
+                    }
                     return
                 }
+                self.unidentifiedPolls = 0
+
+                guard contact == self.lockedContact else {
+                    if self.candidateContact == contact {
+                        self.candidateContactPolls += 1
+                    } else {
+                        self.candidateContact = contact
+                        self.candidateContactPolls = 1
+                    }
+                    self.contactName = nil
+                    self.messages = []
+                    if self.candidateContactPolls >= self.contactSwitchConfirmationCount {
+                        self.stop()
+                        self.status = "Conversation changed. Activate again in the chat you want to monitor."
+                    } else {
+                        self.status = "Checking a possible conversation change…"
+                    }
+                    return
+                }
+                self.candidateContact = nil
+                self.candidateContactPolls = 0
                 guard let result else { return }
                 switch result {
                 case .messageListUnavailable(let collapsed):
@@ -156,7 +197,12 @@ final class MessageMonitor: ObservableObject {
             return
         }
         let ids = snapshot.map(\.id)
-        guard ids != lastIDs else { return }
+        guard ids != lastIDs else {
+            status = snapshot.allSatisfy { !$0.senderIdentified }
+                ? "Monitoring this conversation · sender unclear"
+                : "Monitoring this conversation"
+            return
+        }
         let added = newMessages(snapshot, old: lastIDs)
         lastIDs = ids
         guard !added.isEmpty else { status = "Monitoring this conversation"; return }
