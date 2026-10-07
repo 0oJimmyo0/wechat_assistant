@@ -119,7 +119,7 @@ struct ReplySidebarView: View {
                 Text(monitor.status)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }

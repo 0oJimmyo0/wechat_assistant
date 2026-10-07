@@ -129,17 +129,20 @@ final class MessageMonitor: ObservableObject {
         let previousHeaderFingerprint = lastHeaderFingerprint
         let previousMessageFingerprint = lastMessageFingerprint
         accessibilityQueue.async { [weak self] in
-            let snapshot = bridge.captureConversationSnapshot(
+            let captureResult = bridge.captureConversationSnapshot(
                 previousHeaderFingerprint: previousHeaderFingerprint,
-                previousMessageFingerprint: previousMessageFingerprint
+                previousMessageFingerprint: previousMessageFingerprint,
+                initialActivation: true
             )
             guard cancellation.isCancelled == false else { return }
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token, self.isCheckingConversation else { return }
                 self.isCheckingConversation = false
-                guard let snapshot else {
+                guard case .success(let snapshot) = captureResult else {
                     self.noteCaptureFailure()
-                    self.status = "Could not read the active WeChat conversation"
+                    if case .failure(let failure) = captureResult {
+                        self.status = failure.userMessage
+                    }
                     return
                 }
                 self.consecutiveCaptureFailures = 0
@@ -410,11 +413,12 @@ final class MessageMonitor: ObservableObject {
                                                                previousMessageFingerprint: previousMessageFingerprint,
                                                                cancellation: cancellation)
             }
-            guard let snapshot = bridge.captureConversationSnapshot(
+            let capture = bridge.captureConversationSnapshot(
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
                 lockedContact: contact
-            ) else { return nil }
+            )
+            guard case .success(let snapshot) = capture else { return nil }
             return .snapshot(snapshot)
         }
         guard isRunning, generation == token, cancellation?.isCancelled != true else { return .unavailable }
@@ -561,7 +565,7 @@ final class MessageMonitor: ObservableObject {
         let previousHeaderFingerprint = lastHeaderFingerprint
         let previousMessageFingerprint = lastMessageFingerprint
         accessibilityQueue.async { [weak self] in
-            let snapshot = bridge.captureConversationSnapshot(
+            let capture = bridge.captureConversationSnapshot(
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
                 lockedContact: contact
@@ -571,11 +575,13 @@ final class MessageMonitor: ObservableObject {
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
-                guard let snapshot else {
+                guard case .success(let snapshot) = capture else {
                     self.noteCaptureFailure()
                     // A temporary failure in the selected source does not
                     // change stored context or the successful merge baseline.
-                    self.status = "Conversation capture unavailable · keeping stored context"
+                    if case .failure(let failure) = capture {
+                        self.status = failure.userMessage
+                    }
                     self.conversationIdentityState = .temporarilyUncertain
                     self.hasUnverifiedMessageChanges = true
                     return

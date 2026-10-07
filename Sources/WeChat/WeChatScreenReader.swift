@@ -890,7 +890,7 @@ private enum VisionReadMode: Equatable {
     var messageRecognitionLevel: VNRequestTextRecognitionLevel {
         self == .messagesFast || self == .fullFast ? .fast : .accurate
     }
-    var captureScale: CGFloat { self == .messagesFast || self == .fullFast ? 1.25 : 1.5 }
+    var captureScale: CGFloat { self == .messagesFast ? 1.25 : 1.5 }
 }
 
 private struct LegacyWindow {
