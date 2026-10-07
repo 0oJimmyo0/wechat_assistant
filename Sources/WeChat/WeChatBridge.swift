@@ -172,7 +172,7 @@ final class WeChatBridge: @unchecked Sendable {
         }), let name = WeChatParsing.selectedSessionName(from: identifier(selectedSessionRow), isSelected: true) {
             return WeChatConversationDetection(contact: name, windowFound: true, treeCollapsed: false, visionSnapshot: nil)
         }
-        let snapshot = visibleSnapshot(for: window, forceFresh: forceFreshVision)
+        let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision)
         return WeChatConversationDetection(
             contact: snapshot?.title,
             windowFound: true,
@@ -181,7 +181,7 @@ final class WeChatBridge: @unchecked Sendable {
         )
     }
 
-    func readMessages(limit: Int = 50) -> MessageReadResult {
+    func readMessages(limit: Int = 50, accurateVision: Bool = false) -> MessageReadResult {
         guard let window = mainWindow() else { return .messageListUnavailable(treeCollapsed: false, visionState: nil) }
 
         // 1. Stable WeChat 4.x message-list identifier.
@@ -201,7 +201,7 @@ final class WeChatBridge: @unchecked Sendable {
         // 3. Conservative older-client fallback: only inspect AXLists under a
         // large right-side scroll area when the chat composer is also present.
         guard hasConversationComposer(in: window) else {
-            if let result = readVisibleMessages(in: window, limit: limit) { return result }
+            if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision) { return result }
             return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window), visionState: nil)
         }
         let windowFrame = frame(window)
@@ -216,12 +216,15 @@ final class WeChatBridge: @unchecked Sendable {
                 return readRows(in: list, limit: limit)
             }
         }
-        if let result = readVisibleMessages(in: window, limit: limit) { return result }
+        if let result = readVisibleMessages(in: window, limit: limit, accurate: accurateVision) { return result }
         return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window), visionState: nil)
     }
 
-    private func readVisibleMessages(in window: AXUIElement, limit: Int) -> MessageReadResult? {
-        guard let snapshot = visibleSnapshot(for: window) else { return nil }
+    private func readVisibleMessages(in window: AXUIElement, limit: Int, accurate: Bool) -> MessageReadResult? {
+        guard let app = weChatApplication() else { return nil }
+        let snapshot = WeChatScreenReader.shared.readMessages(
+            pid: app.processIdentifier, windowFrame: frame(window), accurate: accurate
+        )
         guard snapshot.captureSucceeded else {
             return .messageListUnavailable(
                 treeCollapsed: accessibilityTreeAppearsCollapsed(in: window),
@@ -241,6 +244,13 @@ final class WeChatBridge: @unchecked Sendable {
     private func visibleSnapshot(for window: AXUIElement, forceFresh: Bool = false) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
         return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window), forceFresh: forceFresh)
+    }
+
+    private func visibleTitleIdentity(for window: AXUIElement, forceFresh: Bool = false) -> VisibleWeChatSnapshot? {
+        guard let app = weChatApplication() else { return nil }
+        return WeChatScreenReader.shared.readTitleIdentity(
+            pid: app.processIdentifier, windowFrame: frame(window), forceFresh: forceFresh
+        )
     }
 
     func visionDiagnosticReport() -> String {

@@ -73,22 +73,41 @@ final class MessageMonitor: ObservableObject {
             var consensusCount = 0
             if detection.visionSnapshot != nil {
                 var captures = [detection]
-                for _ in 1..<3 {
-                    Thread.sleep(forTimeInterval: 0.20)
-                    captures.append(bridge.detectCurrentConversation(forceFreshVision: true))
-                }
-                let identities = captures.compactMap { $0.visionSnapshot?.titleIdentity }
-                let consensus = identities.count == 3 &&
-                    identities.dropFirst().allSatisfy { identities[0].isSpatiallyConsistent(with: $0) } &&
-                    captures.allSatisfy { ($0.visionSnapshot?.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence }
-                if consensus, let confirmed = captures.last {
-                    detection = confirmed
-                    contact = confirmed.contact
-                    consensusCount = 3
+                Thread.sleep(forTimeInterval: 0.12)
+                captures.append(bridge.detectCurrentConversation(forceFreshVision: true))
+
+                let fastPairIsStrong: Bool = {
+                    guard captures.count == 2,
+                          let first = captures[0].visionSnapshot?.titleIdentity,
+                          let second = captures[1].visionSnapshot?.titleIdentity else { return false }
+                    return first.isSpatiallyConsistent(with: second) &&
+                        (captures[0].visionSnapshot?.acceptedTitleConfidence ?? 0) >= 0.60 &&
+                        (captures[1].visionSnapshot?.acceptedTitleConfidence ?? 0) >= 0.60
+                }()
+                if fastPairIsStrong {
+                    detection = captures[1]
+                    contact = detection.contact
+                    consensusCount = 2
                 } else {
-                    detection = captures.last ?? detection
-                    contact = nil
-                    titleWasUnstable = true
+                    Thread.sleep(forTimeInterval: 0.12)
+                    captures.append(bridge.detectCurrentConversation(forceFreshVision: true))
+                    let latestPairConfirmsTitle: Bool = {
+                        guard let earlier = captures[1].visionSnapshot?.titleIdentity,
+                              let later = captures[2].visionSnapshot?.titleIdentity else { return false }
+                        return (captures[1].visionSnapshot?.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence &&
+                            (captures[2].visionSnapshot?.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence &&
+                            earlier.isSpatiallyConsistent(with: later)
+                    }()
+                    let confirmedIndex = latestPairConfirmsTitle ? 2 : nil
+                    if let confirmedIndex {
+                        detection = captures[confirmedIndex]
+                        contact = detection.contact
+                        consensusCount = 2
+                    } else {
+                        detection = captures.last ?? detection
+                        contact = nil
+                        titleWasUnstable = true
+                    }
                 }
             }
             Task { @MainActor [weak self] in
@@ -108,10 +127,10 @@ final class MessageMonitor: ObservableObject {
                 self.candidateVisionIdentity = nil
                 self.titleConsensusCount = consensusCount
                 self.isRunning = true
-                self.status = "Connected · reading recent messages"
+                self.status = "Conversation identified · reading messages"
             }
             guard let contact else { return }
-            let result = bridge.readMessages()
+            let result = bridge.readMessages(accurateVision: true)
             Task { @MainActor [weak self] in
                 guard let self,
                       self.generation == token,
@@ -177,7 +196,7 @@ final class MessageMonitor: ObservableObject {
                 }
                 return true
             } ?? false
-            let result = contactsMatch ? bridge.readMessages(limit: 50) : nil
+            let result = contactsMatch ? bridge.readMessages(limit: 50, accurateVision: false) : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false

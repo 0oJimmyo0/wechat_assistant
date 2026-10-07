@@ -15,6 +15,9 @@ struct VisibleWeChatSnapshot: Sendable {
     let selectedWindowFrame: CGRect?
     let selectedWindowOnScreen: Bool
     let windowFrameDistance: CGFloat?
+    let windowDiscoveryDurationMilliseconds: Int
+    let captureDurationMilliseconds: Int
+    let visionDurationMilliseconds: Int
     let ocrObservationCount: Int
     let headerObservationCount: Int
     let headerCandidates: [VisionHeaderCandidate]
@@ -104,6 +107,12 @@ final class WeChatScreenReader {
     private var cachedKey: String?
     private var cachedAt = Date.distantPast
     private var cachedSnapshot: VisibleWeChatSnapshot?
+    private var cachedSourceKey: String?
+    private var cachedSourceAt = Date.distantPast
+    private var cachedCapturedWindow: CapturedWindow?
+    private var cachedSCWindow: SCWindow?
+    private var cachedSCWindowPID: pid_t?
+    private var cachedSCWindowFrame: CGRect?
     // Reuse the title-detection capture for the immediately following message
     // read, but expire quickly so a changed chat or incoming message is fresh.
     private let cacheDuration: TimeInterval = 0.5
@@ -119,26 +128,59 @@ final class WeChatScreenReader {
     }
 
     func read(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false) -> VisibleWeChatSnapshot {
+        readFullSnapshot(pid: pid, windowFrame: windowFrame, forceFresh: forceFresh)
+    }
+
+    func readFullSnapshot(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false) -> VisibleWeChatSnapshot {
+        read(pid: pid, windowFrame: windowFrame, mode: .full, forceFresh: forceFresh)
+    }
+
+    func readTitleIdentity(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false) -> VisibleWeChatSnapshot {
+        read(pid: pid, windowFrame: windowFrame, mode: .titleOnly, forceFresh: forceFresh)
+    }
+
+    func readMessages(pid: pid_t, windowFrame: CGRect, forceFresh: Bool = false,
+                      accurate: Bool = false) -> VisibleWeChatSnapshot {
+        read(pid: pid, windowFrame: windowFrame, mode: accurate ? .messagesAccurate : .messagesFast,
+             forceFresh: forceFresh)
+    }
+
+    private func read(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
+                      forceFresh: Bool) -> VisibleWeChatSnapshot {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
         lock.lock()
         defer { lock.unlock() }
-        if !forceFresh, cachedKey == key, Date().timeIntervalSince(cachedAt) < cacheDuration,
+        if mode == .full, !forceFresh, cachedKey == key, Date().timeIntervalSince(cachedAt) < cacheDuration,
            let cachedSnapshot {
             return cachedSnapshot
         }
-        cachedKey = key
-        let result = capture(pid: pid, windowFrame: windowFrame)
-        cachedSnapshot = result.snapshot
-        cachedAt = Date()
+        let result = capture(pid: pid, windowFrame: windowFrame, mode: mode, forceFresh: forceFresh)
+        if mode == .full {
+            cachedKey = key
+            cachedSnapshot = result.snapshot
+            cachedAt = Date()
+        }
         return result.snapshot
     }
 
-    private func capture(pid: pid_t, windowFrame: CGRect) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
+    private func capture(pid: pid_t, windowFrame: CGRect, mode: VisionReadMode,
+                         forceFresh: Bool = true) -> (snapshot: VisibleWeChatSnapshot, image: CGImage?) {
         guard CGPreflightScreenCaptureAccess() else {
             return (emptySnapshot(pid: pid, crop: conversationCropRatio, state: .screenRecordingPermissionRequired), nil)
         }
-        let target = screenCaptureKitWindow(pid: pid, matching: windowFrame) ??
-            legacyWindowCapture(pid: pid, matching: windowFrame)
+        let sourceKey = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
+        let target: CapturedWindow?
+        if !forceFresh, cachedSourceKey == sourceKey,
+           Date().timeIntervalSince(cachedSourceAt) < cacheDuration,
+           let cachedCapturedWindow {
+            target = cachedCapturedWindow
+        } else {
+            target = screenCaptureKitWindow(pid: pid, matching: windowFrame, scale: mode.captureScale) ??
+                legacyWindowCapture(pid: pid, matching: windowFrame)
+            cachedSourceKey = sourceKey
+            cachedSourceAt = Date()
+            cachedCapturedWindow = target
+        }
         guard let target else {
             let state: VisionCaptureState = visibleWindow(pid: pid, matching: windowFrame) == nil
                 ? .windowCaptureFailed
@@ -157,22 +199,40 @@ final class WeChatScreenReader {
             return (emptySnapshot(pid: pid, crop: conversationCropRatio, state: .windowCaptureFailed), capturedWindow)
         }
 
-        let headerRequest = VNRecognizeTextRequest()
-        headerRequest.recognitionLevel = .accurate
-        headerRequest.usesLanguageCorrection = true
-        headerRequest.recognitionLanguages = ["zh-Hans", "en-US"]
-        headerRequest.minimumTextHeight = 0.006
-        headerRequest.regionOfInterest = headerSearchRegion
+        var headerObservations: [VNRecognizedTextObservation] = []
+        var messageObservations: [VNRecognizedTextObservation] = []
+        let visionStarted = Date()
+        var visionSucceeded = true
 
-        let messageRequest = VNRecognizeTextRequest()
-        messageRequest.recognitionLevel = .accurate
-        messageRequest.usesLanguageCorrection = true
-        messageRequest.recognitionLanguages = ["zh-Hans", "en-US"]
-        messageRequest.minimumTextHeight = 0.008
-        messageRequest.regionOfInterest = messageRegion
+        if mode.readsTitle {
+            if let headerImage = crop(image, to: headerSearchRegion) {
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.usesLanguageCorrection = true
+                request.recognitionLanguages = ["zh-Hans", "en-US"]
+                request.minimumTextHeight = 0.006
+                visionSucceeded = (try? VNImageRequestHandler(cgImage: headerImage).perform([request])) != nil
+                headerObservations = request.results ?? []
+            } else {
+                visionSucceeded = false
+            }
+        }
 
-        let handler = VNImageRequestHandler(cgImage: image)
-        let visionSucceeded = (try? handler.perform([headerRequest, messageRequest])) != nil
+        if mode.readsMessages {
+            if let messageImage = crop(image, to: messageRegion) {
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = mode.messageRecognitionLevel
+                request.usesLanguageCorrection = mode.messageRecognitionLevel == .accurate
+                request.recognitionLanguages = ["zh-Hans", "en-US"]
+                request.minimumTextHeight = 0.008
+                let messageSucceeded = (try? VNImageRequestHandler(cgImage: messageImage).perform([request])) != nil
+                visionSucceeded = visionSucceeded && messageSucceeded
+                messageObservations = request.results ?? []
+            } else {
+                visionSucceeded = false
+            }
+        }
+
         guard visionSucceeded else {
             return (makeSnapshot(
                 title: nil, messages: [], state: .visionFailed, pid: pid, image: capturedWindow,
@@ -183,22 +243,20 @@ final class WeChatScreenReader {
             ), capturedWindow)
         }
 
-        let headerObservations = headerRequest.results ?? []
-        let headerCandidates = rankHeaderCandidates(headerObservations)
+        let headerCandidates = rankHeaderCandidates(headerObservations, region: headerSearchRegion)
 
-        let messageObservations = messageRequest.results ?? []
         var rejectedMessageBounds: [CGRect] = []
         let messageLines = messageObservations.compactMap { observation -> RecognizedMessageLine? in
             guard let candidate = observation.topCandidates(1).first else {
-                rejectedMessageBounds.append(observation.boundingBox)
+                rejectedMessageBounds.append(mapBounds(observation.boundingBox, from: messageRegion))
                 return nil
             }
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard WeChatParsing.isPlausibleChatText(text, confidence: candidate.confidence) else {
-                rejectedMessageBounds.append(observation.boundingBox)
+                rejectedMessageBounds.append(mapBounds(observation.boundingBox, from: messageRegion))
                 return nil
             }
-            let bounds = observation.boundingBox
+            let bounds = mapBounds(observation.boundingBox, from: messageRegion)
             guard bounds.minX >= messageRegion.minX, bounds.minY >= messageRegion.minY,
                   bounds.maxY <= messageRegion.maxY,
                   bounds.maxX <= messageRegion.maxX,
@@ -215,7 +273,9 @@ final class WeChatScreenReader {
         }
         let (messages, messageBounds) = groupMessageLines(messageLines)
         let rawMessageTexts = messageObservations.compactMap { $0.topCandidates(1).first?.string }
-        let titleSelection = selectHeaderCandidate(headerCandidates, messageTexts: rawMessageTexts + messages.map(\.text))
+        let titleSelection = mode.readsTitle
+            ? selectHeaderCandidate(headerCandidates, messageTexts: rawMessageTexts + messages.map(\.text))
+            : TitleSelection(candidates: headerCandidates, rejectedAsMessageCount: 0, rejectedAsSentenceCount: 0)
         let selectedCandidates = titleSelection.candidates
         let accepted = selectedCandidates.first(where: { $0.diagnostic.accepted })
         let title = accepted?.text
@@ -245,50 +305,76 @@ final class WeChatScreenReader {
             titleRejectedAsSentenceCount: titleSelection.rejectedAsSentenceCount,
             messageObservations: messageObservations.count,
             messageBounds: Array(messageBounds.suffix(50)),
-            rejectedMessageBounds: rejectedMessageBounds
+            rejectedMessageBounds: rejectedMessageBounds,
+            visionDurationMilliseconds: Int(Date().timeIntervalSince(visionStarted) * 1000)
         ), capturedWindow)
     }
 
-    private func screenCaptureKitWindow(pid: pid_t, matching frame: CGRect) -> CapturedWindow? {
-        let contentResult = CallbackResult<SCShareableContent>()
-        let contentSemaphore = DispatchSemaphore(value: 0)
-        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
-            contentResult.set(content)
-            contentSemaphore.signal()
+    private func screenCaptureKitWindow(pid: pid_t, matching frame: CGRect, scale: CGFloat) -> CapturedWindow? {
+        let maxFrameDrift = max(140, frame.width * 0.12)
+        var window = cachedSCWindow
+        var discoveryMilliseconds = 0
+        if cachedSCWindowPID != pid || cachedSCWindowFrame.map({ frameDistance($0, frame) > maxFrameDrift }) != false ||
+            window?.isOnScreen != true || window?.owningApplication?.processID != pid {
+            window = nil
+            cachedSCWindow = nil
+            cachedSCWindowPID = nil
+            cachedSCWindowFrame = nil
         }
-        guard contentSemaphore.wait(timeout: .now() + 3) == .success,
-              let content = contentResult.get() else {
-            return nil
-        }
-        let candidates = content.windows.filter {
-            $0.owningApplication?.processID == pid && $0.isOnScreen &&
-                $0.frame.width >= 400 && $0.frame.height >= 300
-        }
-        guard let window = candidates.min(by: { frameDistance($0.frame, frame) < frameDistance($1.frame, frame) }) else {
-            return nil
-        }
-        guard window.owningApplication?.processID == pid,
-              window.isOnScreen,
-              frameSizeIsPlausible(window.frame, relativeTo: frame) else { return nil }
 
+        if window == nil {
+            let discoveryStarted = Date()
+            let contentResult = CallbackResult<SCShareableContent>()
+            let contentSemaphore = DispatchSemaphore(value: 0)
+            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+                contentResult.set(content)
+                contentSemaphore.signal()
+            }
+            guard contentSemaphore.wait(timeout: .now() + 1.0) == .success,
+                  let content = contentResult.get() else { return nil }
+            discoveryMilliseconds = Int(Date().timeIntervalSince(discoveryStarted) * 1000)
+            let candidates = content.windows.filter {
+                $0.owningApplication?.processID == pid && $0.isOnScreen &&
+                    $0.frame.width >= 400 && $0.frame.height >= 300
+            }
+            guard let selected = candidates.min(by: { frameDistance($0.frame, frame) < frameDistance($1.frame, frame) }),
+                  selected.owningApplication?.processID == pid,
+                  selected.isOnScreen,
+                  frameSizeIsPlausible(selected.frame, relativeTo: frame) else { return nil }
+            window = selected
+            cachedSCWindow = selected
+            cachedSCWindowPID = pid
+            cachedSCWindowFrame = selected.frame
+        }
+
+        guard let window else { return nil }
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int((window.frame.width * 2).rounded()))
-        configuration.height = max(1, Int((window.frame.height * 2).rounded()))
+        configuration.width = max(1, Int((window.frame.width * scale).rounded()))
+        configuration.height = max(1, Int((window.frame.height * scale).rounded()))
         let imageResult = CallbackResult<CGImage>()
         let imageSemaphore = DispatchSemaphore(value: 0)
+        let screenshotStarted = Date()
         SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, _ in
             imageResult.set(image)
             imageSemaphore.signal()
         }
-        guard imageSemaphore.wait(timeout: .now() + 3) == .success,
-              let image = imageResult.get() else { return nil }
+        guard imageSemaphore.wait(timeout: .now() + 1.2) == .success,
+              let image = imageResult.get() else {
+            cachedSCWindow = nil
+            cachedSCWindowPID = nil
+            cachedSCWindowFrame = nil
+            return nil
+        }
         return CapturedWindow(image: image, pid: window.owningApplication?.processID,
                               frame: window.frame, onScreen: window.isOnScreen,
-                              distance: frameDistance(window.frame, frame))
+                              distance: frameDistance(window.frame, frame),
+                              captureDurationMilliseconds: Int(Date().timeIntervalSince(screenshotStarted) * 1000),
+                              discoveryDurationMilliseconds: discoveryMilliseconds)
     }
 
     private func legacyWindowCapture(pid: pid_t, matching frame: CGRect) -> CapturedWindow? {
+        let captureStarted = Date()
         guard let candidate = visibleWindow(pid: pid, matching: frame),
               candidate.pid == pid, candidate.frame.width >= 400, candidate.frame.height >= 300,
               frameSizeIsPlausible(candidate.frame, relativeTo: frame),
@@ -296,7 +382,9 @@ final class WeChatScreenReader {
             return nil
         }
         return CapturedWindow(image: image, pid: candidate.pid, frame: candidate.frame,
-                              onScreen: true, distance: frameDistance(candidate.frame, frame))
+                              onScreen: true, distance: frameDistance(candidate.frame, frame),
+                              captureDurationMilliseconds: Int(Date().timeIntervalSince(captureStarted) * 1000),
+                              discoveryDurationMilliseconds: 0)
     }
 
     private func visibleWindow(pid: pid_t, matching frame: CGRect) -> LegacyWindow? {
@@ -323,6 +411,26 @@ final class WeChatScreenReader {
             abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
     }
 
+    private func crop(_ image: CGImage, to normalizedRect: CGRect) -> CGImage? {
+        let rect = CGRect(
+            x: floor(normalizedRect.minX * CGFloat(image.width)),
+            y: floor((1 - normalizedRect.maxY) * CGFloat(image.height)),
+            width: ceil(normalizedRect.width * CGFloat(image.width)),
+            height: ceil(normalizedRect.height * CGFloat(image.height))
+        ).integral.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        guard !rect.isNull, !rect.isEmpty else { return nil }
+        return image.cropping(to: rect)
+    }
+
+    private func mapBounds(_ bounds: CGRect, from normalizedRegion: CGRect) -> CGRect {
+        CGRect(
+            x: normalizedRegion.minX + bounds.minX * normalizedRegion.width,
+            y: normalizedRegion.minY + bounds.minY * normalizedRegion.height,
+            width: bounds.width * normalizedRegion.width,
+            height: bounds.height * normalizedRegion.height
+        )
+    }
+
     private func frameSizeIsPlausible(_ candidate: CGRect, relativeTo expected: CGRect) -> Bool {
         guard expected.width > 0, expected.height > 0 else { return false }
         let widthRatio = candidate.width / expected.width
@@ -335,6 +443,8 @@ final class WeChatScreenReader {
             title: nil, messages: [], captureState: state, captureSucceeded: false,
             capturedSize: nil, conversationCrop: crop, targetPID: pid, selectedWindowPID: nil,
             selectedWindowFrame: nil, selectedWindowOnScreen: false, windowFrameDistance: nil,
+            windowDiscoveryDurationMilliseconds: 0, captureDurationMilliseconds: 0,
+            visionDurationMilliseconds: 0,
             ocrObservationCount: 0, headerObservationCount: 0, headerCandidates: [],
             acceptedTitleBounds: nil, acceptedTitleConfidence: nil,
             titleIdentity: nil, titleRejectedAsMessageCount: 0, titleRejectedAsSentenceCount: 0,
@@ -348,7 +458,8 @@ final class WeChatScreenReader {
         headerCandidates: [VisionHeaderCandidate], acceptedTitleBounds: CGRect?, acceptedTitleConfidence: Float?,
         titleIdentity: VisionConversationIdentity?, titleRejectedAsMessageCount: Int,
         titleRejectedAsSentenceCount: Int,
-        messageObservations: Int, messageBounds: [CGRect], rejectedMessageBounds: [CGRect]
+        messageObservations: Int, messageBounds: [CGRect], rejectedMessageBounds: [CGRect],
+        visionDurationMilliseconds: Int = 0
     ) -> VisibleWeChatSnapshot {
         VisibleWeChatSnapshot(
             title: title, messages: messages, captureState: state, captureSucceeded: true,
@@ -356,6 +467,9 @@ final class WeChatScreenReader {
             conversationCrop: conversationCropRatio,
             targetPID: pid, selectedWindowPID: target.pid, selectedWindowFrame: target.frame,
             selectedWindowOnScreen: target.onScreen, windowFrameDistance: target.distance,
+            windowDiscoveryDurationMilliseconds: target.discoveryDurationMilliseconds,
+            captureDurationMilliseconds: target.captureDurationMilliseconds,
+            visionDurationMilliseconds: visionDurationMilliseconds,
             ocrObservationCount: headerObservations + messageObservations,
             headerObservationCount: headerObservations, headerCandidates: headerCandidates,
             acceptedTitleBounds: acceptedTitleBounds, acceptedTitleConfidence: acceptedTitleConfidence,
@@ -366,23 +480,23 @@ final class WeChatScreenReader {
         )
     }
 
-    private func rankHeaderCandidates(_ observations: [VNRecognizedTextObservation]) -> [RankedHeaderCandidate] {
+    private func rankHeaderCandidates(_ observations: [VNRecognizedTextObservation], region: CGRect) -> [RankedHeaderCandidate] {
         var candidates: [RankedHeaderCandidate] = []
         for observation in observations {
             guard let textCandidate = observation.topCandidates(1).first else { continue }
             let text = WeChatParsing.normalizeChatTitle(textCandidate.string)
-            let bounds = observation.boundingBox
+            let bounds = mapBounds(observation.boundingBox, from: region)
             // Vision has already limited this request to headerSearchRegion.
             // Avoid a second strict box filter here: it discarded valid titles
             // when glyphs touched the edge of the header or pane.
             guard !text.isEmpty, text.count <= 36 else { continue }
             let generic = isHeaderControl(text)
-            let expectedY = headerSearchRegion.minY + headerSearchRegion.height * 0.64
+            let expectedY = region.minY + region.height * 0.64
             let compact = text.count <= 24 && bounds.width <= 0.48 && bounds.minX <= 0.48 &&
                 bounds.height >= 0.008 && bounds.height <= 0.075 &&
-                bounds.midY >= headerSearchRegion.minY + headerSearchRegion.height * 0.35
+                bounds.midY >= region.minY + region.height * 0.35
             let plausible = textCandidate.confidence >= 0.35 && compact && !generic
-            let yScore = 1 - min(1, abs(bounds.midY - expectedY) / max(0.025, headerSearchRegion.height * 0.58))
+            let yScore = 1 - min(1, abs(bounds.midY - expectedY) / max(0.025, region.height * 0.58))
             let xScore = 1 - min(1, abs(bounds.minX - 0.06) / 0.40)
             let compactnessScore = 1 - min(1, bounds.width / 0.48)
             let sentenceLike = isLikelySentenceLikeTitle(text, bounds: bounds)
@@ -465,6 +579,9 @@ final class WeChatScreenReader {
             "Window dimensions realistic: \(snapshot.selectedWindowFrame.map { $0.width >= 400 && $0.height >= 300 } ?? false)",
             "Window frame distance from AX: \(snapshot.windowFrameDistance.map { String(format: "%.1f", $0) } ?? "unavailable")",
             "Window capture: \(snapshot.captureSucceeded ? "success" : snapshot.captureState.rawValue)",
+            "Window discovery stage ms: \(snapshot.windowDiscoveryDurationMilliseconds)",
+            "Screenshot stage ms: \(snapshot.captureDurationMilliseconds)",
+            "Vision stage ms: \(snapshot.visionDurationMilliseconds)",
             "Captured size: \(size)",
             "Conversation crop ratio: x=\(ratio(crop.minX)) y=\(ratio(crop.minY)) width=\(ratio(crop.width)) height=\(ratio(crop.height))",
             "Header search ratio: x=\(ratio(headerSearchRegion.minX)) y=\(ratio(headerSearchRegion.minY)) width=\(ratio(headerSearchRegion.width)) height=\(ratio(headerSearchRegion.height))",
@@ -500,7 +617,7 @@ final class WeChatScreenReader {
     func annotatedPreview(pid: pid_t, windowFrame: CGRect) -> NSImage? {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
         lock.lock()
-        let result = capture(pid: pid, windowFrame: windowFrame)
+        let result = capture(pid: pid, windowFrame: windowFrame, mode: .full, forceFresh: true)
         cachedKey = key
         cachedSnapshot = result.snapshot
         cachedAt = Date()
@@ -651,6 +768,22 @@ private struct CapturedWindow {
     let frame: CGRect
     let onScreen: Bool
     let distance: CGFloat
+    let captureDurationMilliseconds: Int
+    let discoveryDurationMilliseconds: Int
+}
+
+private enum VisionReadMode: Equatable {
+    case titleOnly
+    case messagesFast
+    case messagesAccurate
+    case full
+
+    var readsTitle: Bool { self == .titleOnly || self == .full }
+    var readsMessages: Bool { self != .titleOnly }
+    var messageRecognitionLevel: VNRequestTextRecognitionLevel {
+        self == .messagesFast ? .fast : .accurate
+    }
+    var captureScale: CGFloat { self == .messagesFast ? 1.25 : 1.5 }
 }
 
 private struct LegacyWindow {
