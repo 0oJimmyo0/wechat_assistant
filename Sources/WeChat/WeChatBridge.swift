@@ -74,12 +74,42 @@ final class WeChatBridge: @unchecked Sendable {
         (value(appElement, "AXWindows") as? [AXUIElement]) ?? []
     }
 
+    private func windowElement(_ appElement: AXUIElement, attribute: String) -> AXUIElement? {
+        guard let raw = value(appElement, attribute) else { return nil }
+        guard CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
+        return (raw as! AXUIElement)
+    }
+
+    private func windowCandidates(in appElement: AXUIElement) -> [AXUIElement] {
+        var result = windows(in: appElement)
+        for attribute in ["AXFocusedWindow", "AXMainWindow"] {
+            guard let candidate = windowElement(appElement, attribute: attribute),
+                  string(candidate, "AXRole") == "AXWindow",
+                  !result.contains(where: { CFEqual($0, candidate) }) else { continue }
+            result.append(candidate)
+        }
+        return result
+    }
+
+    private func diagnosticAttributeState(_ element: AXUIElement, attribute: String) -> String {
+        AXUIElementSetMessagingTimeout(element, 1.0)
+        var raw: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
+        guard error == .success, let raw else { return "unavailable (AXError \(error.rawValue))" }
+        if let elements = raw as? [AXUIElement] { return "available (\(elements.count))" }
+        if CFGetTypeID(raw) == AXUIElementGetTypeID() {
+            let element = raw as! AXUIElement
+            return "available (\(string(element, "AXRole") ?? "element"))"
+        }
+        return "available"
+    }
+
     /// Select a visible, standard WeChat window. Focused/main windows win over
     /// other standard windows; popovers, dialogs, minimized and settings/login
     /// windows are excluded.
     private func mainWindow() -> AXUIElement? {
         guard let app = applicationElement() else { return nil }
-        let allWindows = windows(in: app)
+        let allWindows = windowCandidates(in: app)
         let candidates = allWindows.filter { window in
             guard string(window, "AXRole") == "AXWindow" else { return false }
             let subrole = string(window, "AXSubrole") ?? ""
@@ -91,8 +121,7 @@ final class WeChatBridge: @unchecked Sendable {
         }
         guard !candidates.isEmpty else { return nil }
 
-        if let focusedValue = value(app, "AXFocusedWindow") {
-            let focused = focusedValue as! AXUIElement
+        if let focused = windowElement(app, attribute: "AXFocusedWindow") {
             if let match = candidates.first(where: { CFEqual($0, focused) }) { return match }
         }
         if let main = candidates.first(where: { bool($0, "AXMain") }) { return main }
@@ -237,6 +266,10 @@ final class WeChatBridge: @unchecked Sendable {
             "Helper excluded: \(runningApp.processIdentifier != ProcessInfo.processInfo.processIdentifier && runningApp.bundleIdentifier != helperBundleID)",
             "Windows: \(appWindows.count)"
         ]
+        lines.append("AXWindows attribute: \(diagnosticAttributeState(appElement, attribute: "AXWindows"))")
+        lines.append("AXFocusedWindow attribute: \(diagnosticAttributeState(appElement, attribute: "AXFocusedWindow"))")
+        lines.append("AXMainWindow attribute: \(diagnosticAttributeState(appElement, attribute: "AXMainWindow"))")
+        lines.append("AXChildren attribute: \(diagnosticAttributeState(appElement, attribute: "AXChildren"))")
 
         for (index, window) in appWindows.enumerated() {
             let role = string(window, "AXRole") ?? "<unavailable>"
