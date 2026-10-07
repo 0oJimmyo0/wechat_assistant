@@ -14,18 +14,14 @@ struct ReplySidebarView: View {
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
 
-    private var latestIncoming: String { monitor.messages.last(where: { !$0.senderIdentified || !$0.isFromMe })?.text ?? "等待对方的新消息" }
-
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    sectionLabel("LATEST MESSAGE")
-                    Text(latestIncoming).font(.system(size: 14)).fixedSize(horizontal: false, vertical: true)
-                        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                    currentConversationCard
+                    recentMessagesSection
 
                     if let suggestion {
                         sectionLabel("SITUATION")
@@ -49,6 +45,10 @@ struct ReplySidebarView: View {
                         TextField("e.g. keep it light", text: $instruction, axis: .vertical).lineLimit(1...3).textFieldStyle(.roundedBorder)
                     }
                     Toggle("Automatically analyze identified messages", isOn: $autoAnalyze).font(.caption)
+                    Text(autoAnalyze
+                         ? "Clearly identified incoming messages may be sent to OpenAI after the conversation pauses."
+                         : "Messages stay on this Mac until you choose Analyze.")
+                        .font(.caption2).foregroundStyle(.secondary)
                     Button { generate(context: monitor.messages, model: auth.everydayModel) } label: {
                         Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
@@ -96,12 +96,75 @@ struct ReplySidebarView: View {
         HStack(spacing: 10) {
             Image(systemName: "bubble.left.and.text.bubble.right.fill").font(.title3).foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text(monitor.contactName ?? "WeChat Reply Copilot").font(.headline).lineLimit(1)
-                Text(monitor.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text("WeChat Reply Copilot").font(.headline).lineLimit(1)
+                Text(monitor.isRunning ? "Monitoring is on" : "Monitoring is off").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             Button { showSettings = true } label: { Image(systemName: "gearshape") }.buttonStyle(.plain).help("Settings")
         }.padding(14)
+    }
+
+    private var currentConversationCard: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.crop.circle.fill")
+                .font(.system(size: 28))
+                .foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading, spacing: 3) {
+                sectionLabel("CURRENT CHAT")
+                Text(monitor.contactName ?? "No conversation selected")
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(monitor.status)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var recentMessagesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("RECENT MESSAGES · LAST 5")
+            if monitor.messages.isEmpty {
+                Text("No chat message text is available from this WeChat view yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            } else {
+                ForEach(Array(monitor.messages.suffix(5).enumerated()), id: \.offset) { item in
+                    recentMessageRow(item.element)
+                }
+            }
+        }
+    }
+
+    private func recentMessageRow(_ message: ChatMessage) -> some View {
+        let isMe = message.senderIdentified && message.isFromMe
+        let sender = isMe ? "You" : (message.senderIdentified ? (monitor.contactName ?? "Contact") : "Sender unclear")
+        return HStack {
+            if isMe { Spacer(minLength: 36) }
+            VStack(alignment: isMe ? .trailing : .leading, spacing: 3) {
+                Text(sender)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(message.text)
+                    .font(.system(size: 13))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: isMe ? .trailing : .leading)
+                    .background(isMe ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            }
+            if !isMe { Spacer(minLength: 36) }
+        }
     }
 
     private var footer: some View {
@@ -128,7 +191,9 @@ struct ReplySidebarView: View {
                 }
                     .buttonStyle(.bordered).controlSize(.small)
             }
-            Text(monitor.isRunning ? (autoAnalyze ? "Identified incoming bursts may be sent to OpenAI automatically." : "Messages stay local until you choose Analyze.") : "Paused. No new chat is monitored or sent.")
+            Text(monitor.isRunning
+                 ? (autoAnalyze ? "Identified incoming bursts may be sent to OpenAI automatically." : "Messages stay local until you choose Analyze.")
+                 : (monitor.status == "Paused" ? "Paused. No new chat is monitored or sent." : monitor.status))
                 .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(12)
     }

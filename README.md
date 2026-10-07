@@ -25,7 +25,11 @@ bash build.sh --install
 open /Applications/WeChatReplyCopilot.app
 ```
 
-The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuilding can require granting Accessibility permission again. The app bundle name is `WeChatReplyCopilot.app`.
+The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature unless a stable local signing identity is installed. Ad-hoc builds can require granting Accessibility permission again after each rebuild. The app bundle name is `WeChatReplyCopilot.app`.
+
+### Keep Accessibility approval across rebuilds
+
+For a personal local build, create a self-signed code-signing identity in **Keychain Access → Certificate Assistant → Create a Certificate**. Name it `WeChat Reply Copilot Local Signing`, choose **Self Signed Root** as the identity type and **Code Signing** as the certificate type. Then run `bash build.sh --install`. The build script detects that identity and uses it for subsequent builds, giving macOS a stable app identity. After the first stable-signed install, grant Accessibility to `/Applications/WeChatReplyCopilot.app` once. A self-signed certificate identifies your local builds to your Mac; it does not establish a publicly verified developer identity.
 
 ## First run
 
@@ -43,7 +47,7 @@ The build targets `arm64-apple-macos14.0` and uses an ad-hoc signature. Rebuildi
 - `store: false` prevents Responses application-state storage; it is not a zero-retention guarantee. OpenAI's current API data controls say abuse-monitoring logs may contain prompts and responses and are generally retained for up to 30 days. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
 - Access, refresh, and ID tokens are stored in macOS Keychain. The generated host identifier and UI preferences are local app preferences.
 - Relationship profile details are stored in local app preferences and are not encrypted separately by the app. Raw chat text and credentials are not written to logs.
-- Monitoring is locked to the conversation active at activation. Switching conversations stops monitoring, clears the in-memory snapshot and suggestions, and requires activation again. Automatic analysis is off by default; when enabled, only bursts with identified senders can trigger requests. Generic Accessibility text fallback is available for manual analysis only. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
+- Monitoring is locked to the conversation active at activation. Switching conversations stops monitoring, clears the in-memory snapshot and suggestions, and requires activation again. Automatic analysis is off by default; when enabled, only bursts with identified senders can trigger requests. Text outside a recognized WeChat message list is ignored, including contact details and notes; if WeChat does not expose its message list, analysis remains unavailable. A request already received by OpenAI cannot be recalled. Closing the sidebar also deactivates monitoring.
 - The model prompt uses speaker labels such as “我”, “对方”, or “说话方不确定”; it does not include the contact's display name. Analysis still sends up to 20 visible messages and the configured local relationship profile.
 - Everyday and Careful model choices come from the signed-in account's live model catalog. A usage-limit response stops monitoring and disables automatic analysis until you reactivate.
 - Sign out attempts to revoke the refresh token and always removes local credentials. Keychain credentials are available only while the device is unlocked.
@@ -61,7 +65,7 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor reads the currently selected WeChat window. It does not read WeChat's local database, access chat history outside the visible/retrievable Accessibility tree, or automatically scroll older messages.
+The monitor reads the currently selected WeChat window's recognized message list. It does not read WeChat's local database, infer chat content from arbitrary visible text, access chat history outside the visible/retrievable Accessibility tree, or automatically scroll older messages.
 
 ## Manual acceptance checklist
 
@@ -73,7 +77,7 @@ The monitor reads the currently selected WeChat window. It does not read WeChat'
 - [ ] Copy each candidate and verify the clipboard contains its text.
 - [ ] Use Analyze, Regenerate carefully, and a special instruction.
 - [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
-- [ ] Confirm generic static-text fallback never automatically triggers inference.
+- [ ] Confirm text outside the recognized message list is ignored and is never sent for analysis.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 

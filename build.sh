@@ -7,6 +7,7 @@ BUILD_DIR="$PROJECT_DIR/.build"
 MACOS_DIR="$BUILD_DIR/$APP_NAME.app/Contents/MacOS"
 RESOURCES_DIR="$BUILD_DIR/$APP_NAME.app/Contents/Resources"
 HASH_FILE="$BUILD_DIR/.source_hash"
+SIGNING_IDENTITY="${WECHAT_REPLY_SIGNING_IDENTITY:-WeChat Reply Copilot Local Signing}"
 
 echo "=== Building $APP_NAME ==="
 
@@ -72,15 +73,16 @@ fi
 # Create PkgInfo
 echo "APPL????" > "$BUILD_DIR/$APP_NAME.app/Contents/PkgInfo"
 
-# Code signing — only force re-sign if source actually changed
+# Use a stable local signing identity when one is available. Ad-hoc signatures
+# identify a single binary hash, so Accessibility approval will not carry across rebuilds.
 echo ""
-if [ "$CURRENT_HASH" = "$PREV_HASH" ] && [ -n "$PREV_HASH" ]; then
-    echo "Source unchanged → preserving existing signature (accessibility permission safe)"
-    # Still need to sign the new binary, but do it lightly
-    codesign --deep --sign - "$BUILD_DIR/$APP_NAME.app" 2>/dev/null || \
-    codesign --force --deep --sign - "$BUILD_DIR/$APP_NAME.app"
+SIGNING_IDENTITIES="$(security find-identity -p codesigning 2>/dev/null || true)"
+if [[ "$SIGNING_IDENTITIES" == *"$SIGNING_IDENTITY"* ]]; then
+    echo "Signing with stable identity: $SIGNING_IDENTITY"
+    codesign --force --deep --timestamp=none --sign "$SIGNING_IDENTITY" "$BUILD_DIR/$APP_NAME.app"
 else
-    echo "Source changed → re-signing (may need to re-grant accessibility permission)"
+    echo "Stable identity '$SIGNING_IDENTITY' not found; using ad-hoc signing."
+    echo "Accessibility consent may need to be granted again after this or any rebuild."
     codesign --force --deep --sign - "$BUILD_DIR/$APP_NAME.app"
 fi
 
@@ -99,20 +101,8 @@ if [[ "${1:-}" == "--install" ]]; then
     cp -R "$BUILD_DIR/$APP_NAME.app" "/Applications/"
     echo "Installed to /Applications/$APP_NAME.app"
     
-    # Set custom icon (survives rebuilds since it's in resource fork)
-    if [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
-        ICON_PATH="$PROJECT_DIR/Resources/AppIcon.icns"
-    elif [ -f "/Users/junxibao/Desktop/Subject.png" ]; then
-        ICON_PATH=""
-    fi
-    if [ -n "${ICON_PATH:-}" ]; then
-        swift -e "import Cocoa; NSWorkspace.shared.setIcon(NSImage(contentsOfFile: \"$ICON_PATH\")!, forFile: \"/Applications/$APP_NAME.app\", options: [])" 2>/dev/null
-        echo "Icon set from $ICON_PATH"
-    fi
-    
-    if [ "$CURRENT_HASH" != "$PREV_HASH" ] || [ -z "$PREV_HASH" ]; then
+    if [[ "$SIGNING_IDENTITIES" != *"$SIGNING_IDENTITY"* ]]; then
         echo ""
-        echo "⚠️  Source changed — if you already granted permission, it should survive."
-        echo "   If not: System Settings → Privacy & Security → Accessibility → WeChat Reply Copilot"
+        echo "⚠️  Ad-hoc signature used. Grant Accessibility to this exact installed build."
     fi
 fi

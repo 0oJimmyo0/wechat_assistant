@@ -1,12 +1,23 @@
 import SwiftUI
 
 struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject var profileStore: RelationshipProfileStore
     @ObservedObject private var auth = ChatGPTAuthManager.shared
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
 
     var body: some View {
-        Form {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Settings").font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            Divider()
+            Form {
             Section("ChatGPT") {
                 LabeledContent("Account", value: auth.accountLabel)
                 if auth.isSignedIn {
@@ -47,8 +58,9 @@ struct SettingsView: View {
                 Link("OpenAI data controls", destination: URL(string: "https://developers.openai.com/api/docs/guides/your-data")!)
                     .font(.caption)
             }
+            }
+            .formStyle(.grouped)
+            .padding(8)
         }
-        .formStyle(.grouped)
-        .padding(8)
     }
 }

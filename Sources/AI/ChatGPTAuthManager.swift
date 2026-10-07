@@ -1,5 +1,4 @@
 import Foundation
-import Network
 import Security
 import AppKit
 import Combine
@@ -151,23 +150,10 @@ final class ChatGPTAuthManager: ObservableObject {
         if let existing = UserDefaults.standard.string(forKey: hostKey) { hostID = existing }
         else { hostID = "urn:uuid:\(UUID().uuidString.lowercased())"; UserDefaults.standard.set(hostID, forKey: hostKey) }
 
-        let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
-        let listener = try NWListener(using: parameters)
-        defer { listener.cancel() }
-        let port = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NWEndpoint.Port, Error>) in
-            listener.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if let port = listener.port { continuation.resume(returning: port) }
-                    else { continuation.resume(throwing: CopilotError.service("Could not start the local sign-in callback.")) }
-                case .failed(let error): continuation.resume(throwing: error)
-                default: break
-                }
-            }
-            listener.start(queue: .main)
-        }
-        let redirect = "http://127.0.0.1:\(port.rawValue)/auth/callback"
+        let callbackServer: LoopbackCallbackServer
+        do { callbackServer = try LoopbackCallbackServer() }
+        catch { throw CopilotError.service("Could not open the local ChatGPT sign-in callback: \(error.localizedDescription)") }
+        let redirect = "http://127.0.0.1:\(callbackServer.port)/auth/callback"
         let old = credentials
         let requestedClient = old?.clientID ?? "dynamic_agent_client"
         var items = [URLQueryItem(name: "client_id", value: requestedClient),
@@ -180,41 +166,9 @@ final class ChatGPTAuthManager: ObservableObject {
         if old == nil { items.append(URLQueryItem(name: "agent_name_hint", value: "WeChat Reply Copilot")) }
         var components = URLComponents(url: discovery.authorization_endpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = items
-        guard let url = components.url else { listener.cancel(); throw CopilotError.service("Could not start ChatGPT sign-in.") }
-        let result: [String: String] = try await withCheckedThrowingContinuation { continuation in
-            listener.newConnectionHandler = { connection in
-                connection.start(queue: .main)
-                connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
-                    listener.newConnectionHandler = nil
-                    guard let data, error == nil, let requestText = String(data: data, encoding: .utf8),
-                          let line = requestText.components(separatedBy: "\r\n").first,
-                          line.hasPrefix("GET "),
-                          let path = line.split(separator: " ").dropFirst().first,
-                          let callback = URLComponents(string: "http://127.0.0.1\(path)"),
-                          callback.path == "/auth/callback" else {
-                        continuation.resume(throwing: CopilotError.service("Invalid local sign-in callback.")); listener.cancel(); return
-                    }
-                    let values = Dictionary((callback.queryItems ?? []).compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { _, latest in latest })
-                    guard values["state"] == state else {
-                        let body = Data("Invalid sign-in callback".utf8)
-                        var response = Data("HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
-                        response.append(body)
-                        connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
-                        continuation.resume(throwing: CopilotError.service("ChatGPT sign-in state check failed."))
-                        listener.cancel()
-                        return
-                    }
-                    let html = "<html><head><meta name=\"referrer\" content=\"no-referrer\"></head><body><h2>WeChat Reply Copilot</h2><p>You can return to the app.</p><script>history.replaceState(null, \"\", \"/auth/callback\")</script></body></html>"
-                    let body = Data(html.utf8)
-                    var response = Data("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
-                    response.append(body)
-                    connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
-                    continuation.resume(returning: values)
-                }
-            }
-            NSWorkspace.shared.open(url)
-        }
-        listener.cancel()
+        guard let url = components.url else { throw CopilotError.service("Could not start ChatGPT sign-in.") }
+        NSWorkspace.shared.open(url)
+        let result = try await callbackServer.receiveCallback(expectedState: state)
         guard result["state"] == state else { throw CopilotError.service("ChatGPT sign-in state check failed.") }
         if let error = result["error"] { throw CopilotError.service("ChatGPT sign-in was not completed (\(error)).") }
         guard let code = result["code"] else { throw CopilotError.service("ChatGPT did not return an authorization code.") }

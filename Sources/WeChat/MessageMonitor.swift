@@ -12,30 +12,53 @@ final class MessageMonitor: ObservableObject {
     var onDeactivated: (() -> Void)?
 
     private let bridge = WeChatBridge.shared
+    private let accessibilityQueue = DispatchQueue(label: "com.wechatreplycopilot.accessibility")
     private var timer: Timer?
     private var debounce: Task<Void, Never>?
     private var lastIDs: [String] = []
     private var lockedContact: String?
     private var generation = 0
+    private var isCheckingConversation = false
+    private var isPolling = false
 
     func start() {
-        guard !isRunning else { return }
+        guard !isRunning, !isCheckingConversation else { return }
         guard bridge.hasAccessibilityPermission else { status = "Accessibility permission required"; bridge.requestAccessibilityPermission(); return }
         guard bridge.isWeChatRunning else { status = "Open WeChat to start monitoring"; return }
-        guard let contact = bridge.currentContact(), !contact.isEmpty else { status = "Open a conversation before activating"; return }
-        contactName = contact
-        messages = bridge.recentMessages()
-        lockedContact = contact
-        lastIDs = messages.map(\.id)
-        isRunning = true
-        status = messages.contains(where: { !$0.senderIdentified }) ? "Manual analysis only · sender unclear" : "Monitoring this conversation"
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.poll() }
+        isCheckingConversation = true
+        status = "Checking the open WeChat conversation…"
+        generation += 1
+        let token = generation
+        let bridge = self.bridge
+        accessibilityQueue.async { [weak self] in
+            let contact = bridge.currentContact()
+            let snapshot = contact == nil ? [] : bridge.recentMessages()
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == token else { return }
+                self.isCheckingConversation = false
+                guard let contact, !contact.isEmpty else {
+                    self.status = "Open a conversation before activating"
+                    return
+                }
+                self.contactName = contact
+                self.messages = snapshot
+                self.lockedContact = contact
+                self.lastIDs = snapshot.map(\.id)
+                self.isRunning = true
+                self.status = snapshot.isEmpty
+                    ? "Chat opened · WeChat exposed no message text"
+                    : (snapshot.contains(where: { !$0.senderIdentified }) ? "Manual analysis only · sender unclear" : "Monitoring this conversation")
+                self.timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                    Task { @MainActor in self?.poll() }
+                }
+            }
         }
     }
 
     func stop() {
         isRunning = false
+        isCheckingConversation = false
+        isPolling = false
         timer?.invalidate(); timer = nil
         debounce?.cancel(); debounce = nil
         generation += 1
@@ -50,20 +73,35 @@ final class MessageMonitor: ObservableObject {
     func pollNow() { poll() }
 
     private func poll() {
-        guard isRunning else { return }
-        guard bridge.isWeChatRunning else {
-            stop()
-            status = "WeChat is not running — activate again when it is open."
-            return
+        guard isRunning, !isPolling else { return }
+        isPolling = true
+        let token = generation
+        let bridge = self.bridge
+        accessibilityQueue.async { [weak self] in
+            let contact = bridge.currentContact()
+            let snapshot = contact == nil ? [] : bridge.recentMessages(limit: 20)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPolling = false
+                guard self.isRunning, self.generation == token else { return }
+                guard let contact, contact == self.lockedContact else {
+                    self.stop()
+                    self.status = "Conversation changed or WeChat did not respond — activate again when the chat is open."
+                    return
+                }
+                self.processSnapshot(snapshot, contact: contact)
+            }
         }
-        guard let contact = bridge.currentContact(), contact == lockedContact else {
-            stop()
-            status = "Conversation changed — activate again to monitor this chat."
-            return
-        }
-        let snapshot = bridge.recentMessages(limit: 20)
+    }
+
+    private func processSnapshot(_ snapshot: [ChatMessage], contact: String) {
         contactName = contact
         messages = snapshot
+        if snapshot.isEmpty {
+            lastIDs = []
+            status = "Chat opened · WeChat exposed no message text"
+            return
+        }
         let ids = snapshot.map(\.id)
         guard ids != lastIDs else { return }
         let added = newMessages(snapshot, old: lastIDs)
