@@ -16,6 +16,7 @@ struct WeChatSnapshot: Sendable {
     let messageRowCount: Int
     let identitySource: ConversationCaptureSource
     let messageSource: ConversationCaptureSource
+    let messageExtractionTrustworthy: Bool
     let visionIdentity: VisionConversationIdentity?
     let paneGeometry: ConversationPaneGeometry
     let messageFingerprint: String?
@@ -24,6 +25,11 @@ struct WeChatSnapshot: Sendable {
     let messagesUnchanged: Bool
     let headerUnchanged: Bool
     let captureTimingDiagnostic: String
+
+    var hasTrustworthyTranscript: Bool {
+        paneGeometry.isValidated && messageExtractionTrustworthy && !messages.isEmpty &&
+            messages.allSatisfy { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
 }
 
 /// A local observation that can be retained while conversation identity is
@@ -728,7 +734,11 @@ final class WeChatBridge: @unchecked Sendable {
         }
         let hasValidatedAXMessages = capturedAXMessages != nil
 
-        let usesVision = capturePlan.identity == .vision || capturePlan.messages == .vision
+        // If AX supplied text but not a usable transcript frame, require
+        // screenshot geometry evidence before any of that text is trusted.
+        let needsVisualGeometryEvidence = !resolvedGeometry.isValidated
+        let usesVision = capturePlan.identity == .vision || capturePlan.messages == .vision ||
+            needsVisualGeometryEvidence
         if usesVision && !WeChatScreenReader.hasScreenCapturePermission {
             WeChatScreenReader.requestScreenCapturePermissionOnce()
             updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
@@ -747,8 +757,8 @@ final class WeChatBridge: @unchecked Sendable {
             let observation = WeChatScreenReader.shared.readConversationObservation(
                 pid: app.processIdentifier,
                 windowFrame: windowFrame,
-                includeTitle: capturePlan.identity == .vision,
-                includeMessages: capturePlan.messages == .vision,
+                includeTitle: capturePlan.identity == .vision || needsVisualGeometryEvidence,
+                includeMessages: capturePlan.messages == .vision || needsVisualGeometryEvidence,
                 forceFresh: forceFresh,
                 accurateMessages: accurateVision,
                 previousHeaderFingerprint: previousHeaderFingerprint,
@@ -816,7 +826,30 @@ final class WeChatBridge: @unchecked Sendable {
         }
 
         let totalMilliseconds = Int(Date().timeIntervalSince(totalStarted) * 1000)
-        let capturedGeometry = visionObservation?.paneGeometry ?? resolvedGeometry
+        var capturedGeometry = visionObservation?.paneGeometry ?? resolvedGeometry
+        var visualTitleMatchesAXIdentity: Bool?
+        if capturePlan.identity == .accessibility,
+           capturedGeometry.source == .visualDivider,
+           let observedTitle = visionObservation?.title {
+            let matches = WeChatParsing.conversationIdentityKey(observedTitle) ==
+                WeChatParsing.conversationIdentityKey(contact)
+            visualTitleMatchesAXIdentity = matches
+            if !matches {
+                capturedGeometry = VisionLayoutRegions.geometry(
+                    leftX: capturedGeometry.leftX,
+                    headerBottomY: capturedGeometry.headerRegion.minY,
+                    composerTopY: capturedGeometry.messageRegion.minY,
+                    source: .visualDividerCandidate, confidence: 0.55
+                )
+            }
+        }
+        let extractionTrustworthy: Bool
+        if capturePlan.messages == .accessibility {
+            extractionTrustworthy = hasValidatedAXMessages && !messages.isEmpty &&
+                messages.allSatisfy { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        } else {
+            extractionTrustworthy = visionObservation?.messageExtractionTrustworthy == true
+        }
         let timing = [
             "Capture total: \(totalMilliseconds) ms",
             "AX capability probe: \(capability.probeMilliseconds) ms",
@@ -825,8 +858,9 @@ final class WeChatBridge: @unchecked Sendable {
             "AX identity/list resolution: \(axResolutionMilliseconds) ms",
             "AX message read: \(axMessageReadMilliseconds) ms",
             "Capture plan: \(capturePlan.identity.rawValue) / \(capturePlan.messages.rawValue)",
+            "Visual title matches AX identity: \(visualTitleMatchesAXIdentity.map { $0 ? "yes" : "no" } ?? "not checked")",
             visionObservation.map {
-                visionTimingDiagnostic($0, titleFound: $0.title != nil)
+                visionTimingDiagnostic($0, titleFound: $0.title != nil, geometry: capturedGeometry)
             } ?? "Vision: not used"
         ].joined(separator: "\n")
         updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil,
@@ -835,7 +869,9 @@ final class WeChatBridge: @unchecked Sendable {
         cacheActivePlan(capturePlan, pid: app.processIdentifier, window: window)
         return .success(WeChatSnapshot(contact: contact, messages: messages, capturedAt: Date(),
                               messageRowCount: rowCount, identitySource: capturePlan.identity,
-                              messageSource: capturePlan.messages, visionIdentity: visionIdentity,
+                              messageSource: capturePlan.messages,
+                              messageExtractionTrustworthy: extractionTrustworthy,
+                              visionIdentity: visionIdentity,
                               paneGeometry: capturedGeometry,
                               messageFingerprint: visionObservation?.messageFingerprint,
                               headerFingerprint: visionObservation?.headerFingerprint,
@@ -851,14 +887,16 @@ final class WeChatBridge: @unchecked Sendable {
         "AX fallback: attempted \(fallbackAttempted ? "yes" : "no"), identity \(resolvedProbe?.hasAXIdentity == true ? "found" : "missing"), list \(resolvedProbe?.hasAXMessageList == true ? "found" : "missing"), duration \(fallbackMilliseconds) ms"
     }
 
-    private func visionTimingDiagnostic(_ observation: VisibleWeChatSnapshot, titleFound: Bool) -> String {
-        let titleROI = observation.paneGeometry.headerRegion
+    private func visionTimingDiagnostic(_ observation: VisibleWeChatSnapshot, titleFound: Bool,
+                                        geometry: ConversationPaneGeometry? = nil) -> String {
+        let geometry = geometry ?? observation.paneGeometry
+        let titleROI = geometry.headerRegion
         return "Vision: window capture \(observation.captureSucceeded ? "success" : "failed") " +
         "(discovery \(observation.windowDiscoveryDurationMilliseconds) ms, screenshot \(observation.captureDurationMilliseconds) ms), " +
         "title OCR \(observation.headerOCRDurationMilliseconds) ms, message OCR \(observation.messageOCRDurationMilliseconds) ms, " +
         "title found \(titleFound ? "yes" : "no"), visible messages \(observation.messages.count)\n" +
-        "Geometry: \(observation.paneGeometry.source.rawValue), confidence \(String(format: "%.2f", observation.paneGeometry.confidence)), pane left \(String(format: "%.3f", observation.paneGeometry.leftX)), " +
-        "scroll target x/y \(String(format: "%.3f", observation.paneGeometry.messageRegion.midX))/\(String(format: "%.3f", 1 - observation.paneGeometry.messageRegion.midY))\n" +
+        "Geometry: \(geometry.source.rawValue), confidence \(String(format: "%.2f", geometry.confidence)), validated \(geometry.isValidated), pane left \(String(format: "%.3f", geometry.leftX)), " +
+        "scroll target x/y \(String(format: "%.3f", geometry.messageRegion.midX))/\(String(format: "%.3f", 1 - geometry.messageRegion.midY))\n" +
         "Identity: title ROI inside pane \(String(format: "%.3f,%.3f,%.3f,%.3f", titleROI.minX, titleROI.minY, titleROI.width, titleROI.height)), " +
         "observations \(observation.headerObservationCount), candidates \(observation.headerCandidates.count), " +
         "selected \(observation.titleIdentity == nil ? "no" : "yes"), " +
@@ -1172,7 +1210,7 @@ final class WeChatBridge: @unchecked Sendable {
         let geometry = paneGeometry ?? accessibilityPaneGeometry(in: window, windowFrame: windowFrame) ?? configuredPaneGeometry()
         let location = geometry.scrollTarget(in: windowFrame)
         guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
-        let amount = Int32(min(500, max(120, windowFrame.height * 0.45)))
+        let amount = Int32(min(240, max(60, windowFrame.height * 0.18)))
         let signedAmount = direction == .older ? amount : -amount
         guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
                                   wheel1: signedAmount, wheel2: 0, wheel3: 0) else { return .scrollUnavailable }
@@ -1217,7 +1255,8 @@ final class WeChatBridge: @unchecked Sendable {
         guard canvasHeight > 0.1 else { return .scrollUnavailable }
         let location = geometry.scrollTarget(in: windowFrame)
         guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
-        let amount = Int32(min(500, max(120, windowFrame.height * canvasHeight * min(0.60, max(0.40, fraction)))))
+        let stepFraction = min(0.28, max(0.12, fraction))
+        let amount = Int32(min(240, max(60, windowFrame.height * canvasHeight * stepFraction)))
         // Positive vertical wheel delta scrolls toward older transcript rows;
         // negative delta returns toward the newest rows. Posting to the WeChat
         // PID targets its window without clicking or changing the selection.

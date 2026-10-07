@@ -8,6 +8,7 @@ mkdir -p "$PROJECT_DIR/.build"
 swiftc \
     -o "$TEST_BINARY" \
     "$PROJECT_DIR/Sources/WeChat/ChatMessage.swift" \
+    "$PROJECT_DIR/Sources/WeChat/ConversationCapturePlan.swift" \
     "$PROJECT_DIR/Sources/WeChat/ChatHistoryMerger.swift" \
     "$PROJECT_DIR/Sources/WeChat/WeChatParsing.swift" \
     "$PROJECT_DIR/Sources/WeChat/VisionConversationIdentity.swift" \
@@ -19,6 +20,7 @@ STORE_TEST_BINARY="$PROJECT_DIR/.build/ConversationStoreTests"
 swiftc \
     -o "$STORE_TEST_BINARY" \
     "$PROJECT_DIR/Sources/WeChat/ChatMessage.swift" \
+    "$PROJECT_DIR/Sources/WeChat/ConversationCapturePlan.swift" \
     "$PROJECT_DIR/Sources/WeChat/ChatHistoryMerger.swift" \
     "$PROJECT_DIR/Sources/WeChat/WeChatParsing.swift" \
     "$PROJECT_DIR/Sources/WeChat/ConversationStore.swift" \

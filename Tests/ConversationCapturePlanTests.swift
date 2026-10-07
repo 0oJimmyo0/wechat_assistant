@@ -38,6 +38,24 @@ enum ConversationCapturePlanTests {
         )
         expect(!configuredGeometry.isValidated && mainWindowGeometry.isValidated,
                "only strong AX or visual geometry is cached for a monitoring session")
+        let dividerCandidate = VisionLayoutRegions.geometry(
+            leftX: 0.30, headerBottomY: 0.90, composerTopY: 0.18,
+            source: .visualDividerCandidate, confidence: 0.55
+        )
+        let acceptedTitle = CGRect(x: 0.34, y: 0.93, width: 0.16, height: 0.025)
+        let incomingBubble = CGRect(x: 0.32, y: 0.54, width: 0.22, height: 0.035)
+        let outgoingBubble = CGRect(x: 0.72, y: 0.38, width: 0.20, height: 0.035)
+        expect(!dividerCandidate.validatingVisualEvidence(titleBounds: nil,
+                                                          messageBounds: [incomingBubble, outgoingBubble]).isValidated,
+               "a strong-looking vertical line alone does not validate pane geometry")
+        expect(!dividerCandidate.validatingVisualEvidence(titleBounds: acceptedTitle,
+                                                          messageBounds: [CGRect(x: 0.56, y: 0.45, width: 0.10, height: 0.03)]).isValidated,
+               "pane validation rejects text that does not align like a bubble")
+        let validatedDivider = dividerCandidate.validatingVisualEvidence(
+            titleBounds: acceptedTitle, messageBounds: [incomingBubble, outgoingBubble]
+        )
+        expect(validatedDivider.isValidated && validatedDivider.source == .visualDivider,
+               "visual pane validation requires both an in-pane title and aligned transcript bubbles")
         let scroll = mainWindowGeometry.scrollTarget(in: CGRect(x: 100, y: 50, width: 1000, height: 800))
         expect(abs(scroll.x - (100 + 1000 * mainWindowGeometry.messageRegion.midX)) < 0.01,
                "scroll target uses the resolved pane center")
@@ -52,31 +70,61 @@ enum ConversationCapturePlanTests {
         expect(narrowPane.minX >= 0.68,
                "narrow-pane geometry never clamps leftward into the conversation list")
 
-        expect(ConversationAcquisitionState.resolve(identityConfirmed: true, hasMessages: true) == .ready,
-               "confirmed identity plus captured messages is ready")
-        expect(ConversationAcquisitionState.resolve(identityConfirmed: true, hasMessages: false) == .identityConfirmed,
+        expect(ConversationAcquisitionState.resolve(identityConfirmed: true, transcriptGeometryValidated: true,
+                                                   trustworthyMessages: true) == .ready,
+               "ready requires identity, validated geometry, and trustworthy messages")
+        let unverifiedGeometryState = ConversationAcquisitionState.resolve(
+            identityConfirmed: true, transcriptGeometryValidated: false, trustworthyMessages: true
+        )
+        expect(unverifiedGeometryState == .geometryUnverified && !unverifiedGeometryState.permitsAutomaticAnalysis,
+               "identity-confirmed messages with unvalidated pane geometry cannot become ready")
+        expect(HistoricalCaptureObservation.resolve(geometryValidated: true, viewportChanged: false,
+                                                    recognizedRowCount: 0, sequenceOverlap: false,
+                                                    olderRowsAdded: false) == .noVisualMovement,
+               "history loader distinguishes a scroll that did not move the viewport")
+        expect(HistoricalCaptureObservation.resolve(geometryValidated: true, viewportChanged: true,
+                                                    recognizedRowCount: 0, sequenceOverlap: false,
+                                                    olderRowsAdded: false) == .rowsUnrecognized,
+               "history loader distinguishes movement with unreadable rows")
+        expect(HistoricalCaptureObservation.resolve(geometryValidated: true, viewportChanged: true,
+                                                    recognizedRowCount: 4, sequenceOverlap: false,
+                                                    olderRowsAdded: false) == .noSequenceOverlap,
+               "history loader distinguishes recognized rows without an overlap anchor")
+        expect(ConversationAcquisitionState.resolve(identityConfirmed: true, transcriptGeometryValidated: true,
+                                                   trustworthyMessages: false) == .identityConfirmed,
                "identity remains confirmed while message capture retries")
-        expect(ConversationAcquisitionState.resolve(identityConfirmed: false, hasMessages: true) == .messagesPending,
+        expect(ConversationAcquisitionState.resolve(identityConfirmed: false, transcriptGeometryValidated: true,
+                                                   trustworthyMessages: true) == .messagesPending,
                "messages remain locally available while identity retries")
-        let pendingState = ConversationAcquisitionState.resolve(identityConfirmed: false, hasMessages: true)
+        let pendingState = ConversationAcquisitionState.resolve(identityConfirmed: false,
+                                                                  transcriptGeometryValidated: true,
+                                                                  trustworthyMessages: true)
         expect(!pendingState.permitsAutomaticAnalysis,
                "automatic analysis is disabled until identity is confirmed")
-        expect(!ConversationAcquisitionState.resolve(identityConfirmed: false, hasMessages: false)
+        expect(!ConversationAcquisitionState.resolve(identityConfirmed: false, transcriptGeometryValidated: false,
+                                                      trustworthyMessages: false)
                     .permitsAutomaticAnalysis,
                "no identity or messages cannot enter automatic analysis")
 
         var baseline = VisionMessageBaseline()
-        baseline.record(source: .vision, hasMessages: false, fingerprint: "empty-frame", frameUnchanged: false)
+        baseline.record(source: .vision, hasMessages: false, fingerprint: "empty-frame", frameUnchanged: false,
+                        geometryValidated: true, extractionTrustworthy: false)
         expect(!baseline.isValid && !baseline.shouldSkipOCR(frameUnchanged: true),
                "empty initial OCR cannot establish an unchanged baseline")
-        baseline.record(source: .vision, hasMessages: true, fingerprint: "message-frame", frameUnchanged: false)
+        baseline.record(source: .vision, hasMessages: true, fingerprint: "message-frame", frameUnchanged: false,
+                        geometryValidated: true, extractionTrustworthy: true)
         expect(baseline.isValid && baseline.shouldSkipOCR(frameUnchanged: true),
                "a successful message capture enables unchanged-frame skipping")
-        baseline.record(source: .vision, hasMessages: false, fingerprint: "new-empty-frame", frameUnchanged: false)
-        expect(!baseline.isValid && !baseline.shouldSkipOCR(frameUnchanged: true),
-               "an empty changed OCR frame invalidates the previous baseline")
-        baseline.record(source: .vision, hasMessages: true, fingerprint: "message-frame", frameUnchanged: false)
-        baseline.record(source: .accessibility, hasMessages: true, fingerprint: nil, frameUnchanged: false)
+        baseline.record(source: .vision, hasMessages: true, fingerprint: "unverified-frame", frameUnchanged: false,
+                        geometryValidated: false, extractionTrustworthy: true)
+        expect(baseline.fingerprint == "message-frame" && baseline.shouldSkipOCR(frameUnchanged: true),
+               "invalid geometry cannot replace a trusted message fingerprint")
+        baseline.record(source: .vision, hasMessages: false, fingerprint: "new-empty-frame", frameUnchanged: false,
+                        geometryValidated: true, extractionTrustworthy: false)
+        expect(baseline.fingerprint == "message-frame",
+               "unrecognized message rows do not replace the trusted fingerprint")
+        baseline.record(source: .accessibility, hasMessages: true, fingerprint: nil, frameUnchanged: false,
+                        geometryValidated: true, extractionTrustworthy: true)
         expect(!baseline.isValid, "AX message capture does not reuse a Vision fingerprint")
         print("All conversation capture source-selection checks passed.")
     }

@@ -21,7 +21,10 @@ final class ConversationStore {
         messages.removeAll(keepingCapacity: true)
     }
 
-    func merge(_ snapshot: [ChatMessage]) -> ConversationMergeResult {
+    func merge(_ snapshot: [ChatMessage], trust: ConversationCaptureTrust) -> ConversationMergeResult {
+        guard trust.mayEnterTrustedStore else {
+            return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
+        }
         guard !snapshot.isEmpty else {
             return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
         }

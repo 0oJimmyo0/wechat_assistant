@@ -27,6 +27,10 @@ enum WeChatParsingTests {
         expect(WeChatParsing.sender(from: "received message") == .other, "recognizes received description")
         expect(WeChatParsing.sender(from: "敏感信息") == .unknown, "does not misclassify arbitrary English prefixes")
         expect(WeChatParsing.sender(from: "") == .unknown, "leaves absent sender metadata unknown")
+        expect(WeChatParsing.isInterfaceMessageText("Q Search") &&
+               WeChatParsing.isInterfaceMessageText("按住说话") &&
+               !WeChatParsing.isInterfaceMessageText("今晚一起吃饭"),
+               "message parser filters known WeChat controls while keeping ordinary chat text")
 
         let pane = CGRect(x: 0.42, y: 0.18, width: 0.57, height: 0.70)
         expect(WeChatParsing.messageSide(CGRect(x: 0.44, y: 0.45, width: 0.20, height: 0.04), in: pane) == .other,
@@ -35,6 +39,10 @@ enum WeChatParsingTests {
                "right-aligned full-window bubbles map to self inside the resolved pane")
         expect(WeChatParsing.messageSide(CGRect(x: 0.10, y: 0.45, width: 0.20, height: 0.04), in: pane) == .unknown,
                "sidebar text outside the resolved message pane cannot acquire a sender")
+        expect(WeChatParsing.isPlausibleMessageBubble(CGRect(x: 0.44, y: 0.45, width: 0.20, height: 0.04), in: pane),
+               "left-aligned transcript text matches bubble geometry")
+        expect(!WeChatParsing.isPlausibleMessageBubble(CGRect(x: 0.68, y: 0.45, width: 0.05, height: 0.04), in: pane),
+               "centered narrow UI labels do not match incoming or outgoing bubble geometry")
 
         expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "preferred", value: "fallback") == "preferred", "prefers AXTitle")
         expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "  ", value: "fallback") == "fallback", "uses AXValue when title is empty")

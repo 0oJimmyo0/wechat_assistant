@@ -6,6 +6,7 @@ import Vision
 struct VisibleWeChatSnapshot: Sendable {
     let title: String?
     let messages: [ChatMessage]
+    let messageExtractionTrustworthy: Bool
     let captureState: VisionCaptureState
     let captureSucceeded: Bool
     let capturedSize: CGSize?
@@ -265,8 +266,8 @@ final class WeChatScreenReader {
                 leftX: visualLeftX,
                 headerBottomY: calibration.headerBottomY,
                 composerTopY: calibration.composerTopY,
-                source: .visualDivider,
-                confidence: 0.74
+                source: .visualDividerCandidate,
+                confidence: 0.55
             )
         }
         let titleRegion = geometry.headerRegion
@@ -405,6 +406,9 @@ final class WeChatScreenReader {
                 confidence: candidate.diagnostic.confidence
             )
         }
+        let resolvedGeometry = geometry.validatingVisualEvidence(
+            titleBounds: accepted?.diagnostic.bounds, messageBounds: messageBounds
+        )
 
         return (makeSnapshot(
             title: title,
@@ -415,7 +419,7 @@ final class WeChatScreenReader {
             target: target,
             conversationCrop: conversationCropRatio(leftX: usedLeftX),
             messageCrop: effectiveMessageRegion,
-            paneGeometry: geometry,
+            paneGeometry: resolvedGeometry,
             headerObservations: headerObservations.count,
             headerCandidates: selectedCandidates.map(\.diagnostic),
             acceptedTitleBounds: accepted?.diagnostic.bounds,
@@ -426,6 +430,8 @@ final class WeChatScreenReader {
             messageObservations: messageObservations.count,
             messageBounds: Array(messageBounds.suffix(50)),
             rejectedMessageBounds: rejectedMessageBounds,
+            messageExtractionTrustworthy: !messages.isEmpty && messageBounds.count == messages.count &&
+                messages.allSatisfy { $0.source == .vision && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.confidence >= 0.45 },
             messageFingerprint: messageFingerprint,
             messageFrameUnchanged: messageFrameUnchanged,
             headerFingerprint: headerFingerprint,
@@ -572,7 +578,8 @@ final class WeChatScreenReader {
 
     private func emptySnapshot(pid: pid_t, crop: CGRect, state: VisionCaptureState) -> VisibleWeChatSnapshot {
         return VisibleWeChatSnapshot(
-            title: nil, messages: [], captureState: state, captureSucceeded: false,
+            title: nil, messages: [], messageExtractionTrustworthy: false,
+            captureState: state, captureSucceeded: false,
             capturedSize: nil, conversationCrop: crop,
             paneGeometry: VisionLayoutRegions.geometry(
                 leftX: crop.minX, headerBottomY: VisionLayoutCalibration.current.headerBottomY,
@@ -611,6 +618,7 @@ final class WeChatScreenReader {
         titleIdentity: VisionConversationIdentity?, titleRejectedAsMessageCount: Int,
         titleRejectedAsSentenceCount: Int,
         messageObservations: Int, messageBounds: [CGRect], rejectedMessageBounds: [CGRect],
+        messageExtractionTrustworthy: Bool = false,
         messageFingerprint: String? = nil, messageFrameUnchanged: Bool = false,
         headerFingerprint: String? = nil, headerFrameUnchanged: Bool = false,
         headerOCRDurationMilliseconds: Int = 0, messageOCRDurationMilliseconds: Int = 0,
@@ -634,7 +642,8 @@ final class WeChatScreenReader {
             source: .configuredFallback, confidence: 0.40
         )
         return VisibleWeChatSnapshot(
-            title: title, messages: messages, captureState: state, captureSucceeded: true,
+            title: title, messages: messages, messageExtractionTrustworthy: messageExtractionTrustworthy,
+            captureState: state, captureSucceeded: true,
             capturedSize: CGSize(width: image.width, height: image.height),
             conversationCrop: conversationCrop ?? self.conversationCropRatio(leftX: resolvedGeometry.leftX),
             paneGeometry: resolvedGeometry,
@@ -812,6 +821,7 @@ final class WeChatScreenReader {
             "Captured size: \(size)",
             "Conversation crop ratio: x=\(ratio(crop.minX)) y=\(ratio(crop.minY)) width=\(ratio(crop.width)) height=\(ratio(crop.height))",
             "Pane geometry: source=\(snapshot.paneGeometry.source.rawValue) confidence=\(String(format: "%.2f", snapshot.paneGeometry.confidence)) leftX=\(ratio(snapshot.paneGeometry.leftX))",
+            "Pane geometry validated: \(snapshot.paneGeometry.isValidated)",
             "Header search ratio: x=\(ratio(headerRegion.minX)) y=\(ratio(headerRegion.minY)) width=\(ratio(headerRegion.width)) height=\(ratio(headerRegion.height))",
             "Message region ratio: x=\(ratio(messageRegion.minX)) y=\(ratio(messageRegion.minY)) width=\(ratio(messageRegion.width)) height=\(ratio(messageRegion.height))",
             "Message OCR accepted inside pane: \(snapshot.messages.count)",
@@ -837,6 +847,7 @@ final class WeChatScreenReader {
             "Accepted title: \(snapshot.title == nil ? "no" : "yes")",
             "Raw OCR line count: \(snapshot.messageObservationCount)",
             "Grouped message blocks: \(snapshot.messages.count)",
+            "Message extraction trustworthy: \(snapshot.messageExtractionTrustworthy)",
             "Rejected message candidates: \(snapshot.rejectedMessageBounds.count)",
             "Grouped senders: me=\(snapshot.messages.filter { $0.sender == .me }.count) target=\(snapshot.messages.filter { $0.sender == .other }.count) unknown=\(snapshot.messages.filter { $0.sender == .unknown }.count)",
             "Header/message ROI overlap: \(!headerRegion.intersection(messageRegion).isNull && !headerRegion.intersection(messageRegion).isEmpty)",
@@ -931,13 +942,7 @@ final class WeChatScreenReader {
     }
 
     private func plausibleMessageGeometry(_ bounds: CGRect, in region: CGRect) -> Bool {
-        guard bounds.width >= 0.008, bounds.width <= 0.88,
-              bounds.height >= 0.006, bounds.height <= 0.10 else { return false }
-        let leftMargin = bounds.minX - region.minX
-        let rightMargin = region.maxX - bounds.maxX
-        let leftAnchored = leftMargin <= 0.25 && bounds.midX < region.midX + 0.06
-        let rightAnchored = rightMargin <= 0.25 && bounds.midX > region.midX - 0.06
-        return leftAnchored || rightAnchored
+        WeChatParsing.isPlausibleMessageBubble(bounds, in: region)
     }
 
     private func parseMessageObservations(_ observations: [VNRecognizedTextObservation],
@@ -966,7 +971,7 @@ final class WeChatScreenReader {
                 rejectedBounds.append(bounds)
                 continue
             }
-            guard !looksLikeTimestampOrControl(text) else {
+            guard !looksLikeTimestampOrControl(text), !WeChatParsing.isInterfaceMessageText(text) else {
                 timestampControlRejectedCount += 1
                 rejectedBounds.append(bounds)
                 continue

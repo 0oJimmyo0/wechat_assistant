@@ -46,7 +46,8 @@ final class MessageMonitor: ObservableObject {
 
     private let bridge = WeChatBridge.shared
     private let conversationStore = ConversationStore()
-    private let pendingIdentityStore = ConversationStore(maximumMessages: 50)
+    private var pendingIdentityMessages: [ChatMessage] = []
+    private var unverifiedCaptureMessages: [ChatMessage] = []
     private let accessibilityObserver = AccessibilityObserver()
     private let accessibilityQueue = DispatchQueue(label: "com.wechatreplycopilot.accessibility")
     private var timer: Timer?
@@ -75,6 +76,7 @@ final class MessageMonitor: ObservableObject {
     private var latestTailOverlap = 0
     private var latestHistoricalOverlap = 0
     private var lastOlderContextDiagnostic = "Older-context load: not run"
+    private var lastHistoricalCaptureObservation: HistoricalCaptureObservation = .notObserved
     private let historyLimit = 200
     private let analysisContextLimit = 20
     private let watchdogInterval: TimeInterval = 3
@@ -108,6 +110,7 @@ final class MessageMonitor: ObservableObject {
             "Active pane geometry: \(activePaneGeometry.map { "\($0.source.rawValue), confidence \(String(format: "%.2f", $0.confidence)), leftX \(String(format: "%.3f", $0.leftX)), scroll target x/y \(String(format: "%.3f", $0.messageRegion.midX))/\(String(format: "%.3f", 1 - $0.messageRegion.midY))" } ?? "unresolved")",
             "Latest observed rows: \(latestSnapshotBlockCount)",
             "Stored context size: \(conversationStore.messages.count)",
+            "Unverified local observations: \(unverifiedCaptureMessages.count) messages (never sent to analysis)",
             "Tail overlap: \(latestTailOverlap)",
             "Historical overlap: \(latestHistoricalOverlap)",
             "Last successful identity validation age: \(age)",
@@ -178,14 +181,20 @@ final class MessageMonitor: ObservableObject {
                 self.contactName = snapshot.contact
                 self.conversationIdentityState = .confirmed
                 self.acquisitionState = ConversationAcquisitionState.resolve(
-                    identityConfirmed: true, hasMessages: !snapshot.messages.isEmpty
+                    identityConfirmed: true,
+                    transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+                    trustworthyMessages: snapshot.hasTrustworthyTranscript
                 )
                 self.lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
                 self.isRunning = true
                 self.applySnapshot(snapshot, purpose: .live, allowAutomaticAnalysis: false)
-                self.status = snapshot.messages.isEmpty
-                    ? "Conversation identified, but visible messages could not be read · retrying"
-                    : "Monitoring this conversation · \(self.messages.count) messages in context"
+                if self.acquisitionState == .geometryUnverified {
+                    self.status = "Conversation identified · transcript geometry is unverified; messages held locally"
+                } else if !snapshot.hasTrustworthyTranscript {
+                    self.status = "Conversation identified, but trusted message rows are not available · retrying"
+                } else {
+                    self.status = "Monitoring this conversation · \(self.messages.count) messages in context"
+                }
                 self.startAXObserver()
                 self.startWatchdog()
             }
@@ -197,7 +206,8 @@ final class MessageMonitor: ObservableObject {
         burstDebounce?.cancel(); burstDebounce = nil
         observerDebounce?.cancel(); observerDebounce = nil
         conversationStore.clear()
-        pendingIdentityStore.clear()
+        pendingIdentityMessages.removeAll()
+        unverifiedCaptureMessages.removeAll()
         pendingVisionIdentity = nil
         pendingHeaderFingerprint = nil
         messages = []
@@ -248,7 +258,8 @@ final class MessageMonitor: ObservableObject {
         observerDebounce?.cancel(); observerDebounce = nil
         generation += 1
         conversationStore.clear()
-        pendingIdentityStore.clear()
+        pendingIdentityMessages.removeAll()
+        unverifiedCaptureMessages.removeAll()
         pendingVisionIdentity = nil
         pendingHeaderFingerprint = nil
         messages = []
@@ -365,17 +376,18 @@ final class MessageMonitor: ObservableObject {
             let started = ProcessInfo.processInfo.systemUptime
             var attempts = 0
             var noProgress = 0
+            var noMovementAttempts = 0
             var identityFailed = false
             var reachedTop = false
+            var stopReason: String?
             while self.isRunning, self.generation == token, self.messages.count < targetCount,
                   attempts < self.maxScrollAttempts, noProgress < self.maxNoProgressAttempts {
-                let before = self.messages.count
                 let identity = self.lockedVisionIdentity
                 let paneGeometry = self.activePaneGeometry
                 let workCancellation = self.sessionCancellation
                 let scroll = await self.performAccessibilityOperation {
                     self.bridge.scrollMessagePaneUpwardIfConversationMatches(
-                        contact: contact, identity: identity, fraction: 0.5,
+                        contact: contact, identity: identity, fraction: 0.18,
                         paneGeometry: paneGeometry,
                         cancellation: workCancellation
                     )
@@ -385,26 +397,66 @@ final class MessageMonitor: ObservableObject {
                 case .conversationChanged:
                     identityFailed = true
                     break
-                case .identityUncertain, .windowUnavailable, .scrollUnavailable:
-                    reachedTop = true
+                case .identityUncertain:
+                    stopReason = "Conversation identity could not be verified before scrolling"
+                    break
+                case .windowUnavailable:
+                    stopReason = "WeChat window became unavailable"
+                    break
+                case .scrollUnavailable:
+                    stopReason = "Scroll target unavailable; viewport was not changed"
                     break
                 case .cancelled:
                     return
                 case .scrolled:
                     attempts += 1
                 }
-                if identityFailed || reachedTop { break }
+                if identityFailed || reachedTop || stopReason != nil { break }
                 try? await Task.sleep(nanoseconds: self.rowMaterializationDelay)
                 guard self.isRunning, self.generation == token else { return }
                 let result = await self.captureAndMerge(contact: contact, purpose: .historical,
                                                         cancellation: cancellation, generation: token)
                 guard self.isRunning, self.generation == token else { return }
                 if case .conversationChanged = result { identityFailed = true; break }
-                noProgress = self.messages.count > before ? 0 : noProgress + 1
+                switch self.lastHistoricalCaptureObservation {
+                case .olderRowsAdded:
+                    noProgress = 0
+                    noMovementAttempts = 0
+                case .noVisualMovement:
+                    noProgress += 1
+                    noMovementAttempts += 1
+                    if noMovementAttempts >= self.maxNoProgressAttempts {
+                        reachedTop = true
+                        stopReason = "No visual movement after repeated scrolls; likely at history boundary"
+                    }
+                case .rowsUnrecognized:
+                    noProgress += 1
+                    if noProgress >= self.maxNoProgressAttempts {
+                        stopReason = "Viewport changed, but message rows could not be recognized"
+                    }
+                case .geometryUnverified:
+                    noProgress += 1
+                    stopReason = "Transcript geometry became unverified"
+                case .noSequenceOverlap:
+                    noProgress += 1
+                    if noProgress >= self.maxNoProgressAttempts {
+                        stopReason = "Rows were recognized, but no history sequence overlap was found"
+                    }
+                case .overlapWithoutOlderRows:
+                    noProgress += 1
+                    if noProgress >= self.maxNoProgressAttempts {
+                        stopReason = "History overlap found, but no unseen older rows were added"
+                    }
+                case .notObserved:
+                    noProgress += 1
+                    stopReason = "No historical capture result was recorded"
+                }
                 self.olderContextProgress = "\(self.messages.count) / \(targetCount)"
+                if stopReason != nil { break }
             }
 
             guard self.isRunning, self.generation == token else { return }
+            let loopObservation = self.lastHistoricalCaptureObservation
             self.isReturningToLatest = true
             let latest = await self.scrollToLatest(contact: contact, cancellation: cancellation,
                                                    generation: token)
@@ -412,13 +464,15 @@ final class MessageMonitor: ObservableObject {
             self.isReturningToLatest = false
             self.isLoadingOlderContext = false
             self.olderContextProgress = nil
-            if !identityFailed && (reachedTop || noProgress >= self.maxNoProgressAttempts) {
+            if !identityFailed && reachedTop {
                 self.canLoadOlderContext = false
             }
             if identityFailed {
                 self.olderContextStatus = "Conversation could not be verified; older loading stopped"
                 self.stop()
                 self.status = "Conversation changed. Activate again in the chat you want to monitor."
+            } else if let stopReason {
+                self.olderContextStatus = "\(stopReason) · \(latest.reached ? "latest messages restored" : "live tracking paused")"
             } else if latest.reached {
                 self.olderContextStatus = "Context: \(self.messages.count) / \(targetCount) · latest messages restored"
             } else {
@@ -427,6 +481,8 @@ final class MessageMonitor: ObservableObject {
             self.lastOlderContextDiagnostic = [
                 "Older-context load:", "scroll attempts: \(attempts)",
                 "no-progress attempts: \(noProgress)", "top reached: \(reachedTop)",
+                "last capture result: \(loopObservation.rawValue)",
+                "stop reason: \(stopReason ?? "target count reached or attempts exhausted")",
                 "stored count: \(self.messages.count)",
                 "elapsed ms: \(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))"
             ].joined(separator: "\n")
@@ -444,11 +500,13 @@ final class MessageMonitor: ObservableObject {
 
     private func captureAndMerge(contact: String, purpose: SnapshotPurpose,
                                  cancellation: MonitorWorkCancellation?, generation token: Int) async -> CaptureMergeOutcome {
+        if purpose == .historical { lastHistoricalCaptureObservation = .notObserved }
         let bridge = self.bridge
         let identity = lockedVisionIdentity
         let previousHeaderFingerprint = lastHeaderFingerprint
         let previousMessageFingerprint = visionMessageBaseline.fingerprint
         let preferredPaneGeometry = activePaneGeometry
+        var historicalViewportChanged = true
         let captured: OlderContextReadResult? = await performAccessibilityOperation {
             if purpose == .historical {
                 return bridge.readMessagesIfConversationMatches(contact: contact, identity: identity,
@@ -475,6 +533,7 @@ final class MessageMonitor: ObservableObject {
         case .identityUncertain, .captureUnavailable, .cancelled, .none: snapshot = nil
         }
         guard let snapshot else {
+            if purpose == .historical { lastHistoricalCaptureObservation = .rowsUnrecognized }
             noteCaptureFailure()
             status = "Conversation capture unavailable · keeping stored context"
             conversationIdentityState = .temporarilyUncertain
@@ -487,8 +546,41 @@ final class MessageMonitor: ObservableObject {
         case .candidate: return .identityUncertain
         case .changed: return .conversationChanged
         }
+        if purpose == .historical {
+            let sameFingerprint = snapshot.messageSource == .vision &&
+                snapshot.messageFingerprint != nil && snapshot.messageFingerprint == previousMessageFingerprint
+            let sameRows = snapshot.messageSource == .accessibility &&
+                snapshot.messages.map(ChatHistoryMerger.key(for:)) == lastObservedSnapshot
+            historicalViewportChanged = !(snapshot.messagesUnchanged || sameFingerprint || sameRows)
+            lastHistoricalCaptureObservation = HistoricalCaptureObservation.resolve(
+                geometryValidated: snapshot.paneGeometry.isValidated,
+                viewportChanged: historicalViewportChanged,
+                recognizedRowCount: snapshot.messages.count,
+                sequenceOverlap: false, olderRowsAdded: false
+            )
+        }
         lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
         refreshReaderIfAXSnapshotUnexpectedlyEmpty(snapshot)
+        guard isTrustworthyForSession(snapshot) else {
+            retainUnverifiedCapture(snapshot)
+            acquisitionState = ConversationAcquisitionState.resolve(
+                identityConfirmed: true,
+                transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+                trustworthyMessages: false
+            )
+            hasUnverifiedMessageChanges = true
+            if purpose == .historical {
+                lastHistoricalCaptureObservation = HistoricalCaptureObservation.resolve(
+                    geometryValidated: snapshot.paneGeometry.isValidated,
+                    viewportChanged: historicalViewportChanged,
+                    recognizedRowCount: 0, sequenceOverlap: false, olderRowsAdded: false
+                )
+            }
+            status = snapshot.paneGeometry.isValidated
+                ? "Message extraction is unverified · keeping it local"
+                : "Transcript geometry is unverified · keeping messages local"
+            return .merged(ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain))
+        }
         recordCaptureFingerprints(snapshot)
         if visionMessageBaseline.shouldSkipOCR(frameUnchanged: snapshot.messagesUnchanged) {
             status = "Monitoring · no visible message changes"
@@ -496,16 +588,44 @@ final class MessageMonitor: ObservableObject {
             return .merged(result)
         }
         guard !snapshot.messages.isEmpty else {
+            if purpose == .historical {
+                lastHistoricalCaptureObservation = HistoricalCaptureObservation.resolve(
+                    geometryValidated: snapshot.paneGeometry.isValidated,
+                    viewportChanged: historicalViewportChanged,
+                    recognizedRowCount: 0, sequenceOverlap: false, olderRowsAdded: false
+                )
+            }
             latestSnapshotBlockCount = 0
             status = "Conversation identified, but visible messages could not be read · retrying"
             return .merged(ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain))
         }
-        return .merged(mergeSnapshot(snapshot, purpose: purpose))
+        let result = mergeSnapshot(snapshot, purpose: purpose)
+        if purpose == .historical {
+            lastHistoricalCaptureObservation = HistoricalCaptureObservation.resolve(
+                geometryValidated: snapshot.paneGeometry.isValidated,
+                viewportChanged: historicalViewportChanged,
+                recognizedRowCount: snapshot.messages.count,
+                sequenceOverlap: result.viewport != .uncertain,
+                olderRowsAdded: !result.prepended.isEmpty
+            )
+        }
+        return .merged(result)
     }
 
     @discardableResult
     private func mergeSnapshot(_ snapshot: WeChatSnapshot, purpose: SnapshotPurpose) -> ConversationMergeResult {
-        let result = conversationStore.merge(snapshot.messages)
+        guard isTrustworthyForSession(snapshot) else {
+            retainUnverifiedCapture(snapshot)
+            acquisitionState = ConversationAcquisitionState.resolve(
+                identityConfirmed: conversationIdentityState == .confirmed,
+                transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+                trustworthyMessages: false
+            )
+            hasUnverifiedMessageChanges = true
+            return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
+        }
+        unverifiedCaptureMessages.removeAll()
+        let result = conversationStore.merge(snapshot.messages, trust: captureTrust(snapshot))
         if lockedVisionIdentity == nil { lockedVisionIdentity = snapshot.visionIdentity }
         recordCaptureFingerprints(snapshot)
         messages = conversationStore.messages
@@ -515,8 +635,12 @@ final class MessageMonitor: ObservableObject {
         latestSnapshotBlockCount = snapshot.messageRowCount
         lastObservedSnapshot = snapshot.messages.map(ChatHistoryMerger.key(for:))
         messageCaptureCount += 1
-        acquisitionState = ConversationAcquisitionState.resolve(identityConfirmed: true,
-                                                                  hasMessages: !messages.isEmpty)
+        acquisitionState = ConversationAcquisitionState.resolve(
+            identityConfirmed: conversationIdentityState == .confirmed,
+            transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+            trustworthyMessages: snapshot.hasTrustworthyTranscript ||
+                (snapshot.messagesUnchanged && visionMessageBaseline.isValid && !messages.isEmpty)
+        )
         hasUnverifiedMessageChanges = result.viewport == .uncertain
         if purpose == .historical || result.viewport == .historical {
             status = "Historical context merged · \(messages.count) messages stored"
@@ -540,7 +664,7 @@ final class MessageMonitor: ObservableObject {
             titleChanged = false
         }
         if headerChanged || titleChanged {
-            pendingIdentityStore.clear()
+            pendingIdentityMessages.removeAll()
             pendingVisionIdentity = nil
         }
         if let identity = observation.visionIdentity { pendingVisionIdentity = identity }
@@ -548,26 +672,19 @@ final class MessageMonitor: ObservableObject {
         if observation.paneGeometry.isValidated && activePaneGeometry == nil {
             activePaneGeometry = observation.paneGeometry
         }
-        _ = pendingIdentityStore.merge(observation.messages)
-        messages = pendingIdentityStore.messages
+        pendingIdentityMessages = Array((pendingIdentityMessages + observation.messages).suffix(50))
+        messages = pendingIdentityMessages
         latestSnapshotBlockCount = observation.messageRowCount
         messageCaptureCount += 1
     }
 
-    private func adoptPendingIdentityMessages(for snapshot: WeChatSnapshot) {
-        let confirmedKey = WeChatParsing.conversationIdentityKey(snapshot.contact)
-        let pendingMatches = pendingVisionIdentity?.normalizedTitle == confirmedKey
-        let geometryMatches = snapshot.visionIdentity.map { identity in
-            pendingVisionIdentity?.isSpatiallyConsistent(with: identity) ?? false
-        } ?? true
-        if pendingMatches && geometryMatches {
-            _ = conversationStore.merge(pendingIdentityStore.messages)
-        } else {
-            conversationStore.clear()
-        }
-        pendingIdentityStore.clear()
+    private func discardPendingIdentityMessages() {
+        // Pending text was captured before identity or pane validation. It
+        // remains outside the trusted store even if the next title matches.
+        pendingIdentityMessages.removeAll()
         pendingVisionIdentity = nil
         pendingHeaderFingerprint = nil
+        unverifiedCaptureMessages.removeAll()
         messages = conversationStore.messages
     }
 
@@ -579,7 +696,9 @@ final class MessageMonitor: ObservableObject {
             contactName = contact
             conversationIdentityState = .confirmed
             acquisitionState = ConversationAcquisitionState.resolve(
-                identityConfirmed: true, hasMessages: !conversationStore.messages.isEmpty
+                identityConfirmed: true,
+                transcriptGeometryValidated: activePaneGeometry?.isValidated == true,
+                trustworthyMessages: !conversationStore.messages.isEmpty
             )
             candidateContact = nil
             candidateContactPolls = 0
@@ -592,7 +711,9 @@ final class MessageMonitor: ObservableObject {
         if detectedKey == lockedKey {
             conversationIdentityState = .confirmed
             acquisitionState = ConversationAcquisitionState.resolve(
-                identityConfirmed: true, hasMessages: !conversationStore.messages.isEmpty
+                identityConfirmed: true,
+                transcriptGeometryValidated: activePaneGeometry?.isValidated == true,
+                trustworthyMessages: !conversationStore.messages.isEmpty
             )
             candidateContact = nil
             candidateContactPolls = 0
@@ -620,11 +741,20 @@ final class MessageMonitor: ObservableObject {
     private func applySnapshot(_ snapshot: WeChatSnapshot, purpose: SnapshotPurpose,
                                allowAutomaticAnalysis: Bool) {
         guard confirmSnapshotContact(snapshot.contact) == .confirmed else { return }
-        recordCaptureFingerprints(snapshot)
-        guard !snapshot.messages.isEmpty else {
-            status = "Conversation identified, but visible messages could not be read · retrying"
+        guard isTrustworthyForSession(snapshot) else {
+            retainUnverifiedCapture(snapshot)
+            acquisitionState = ConversationAcquisitionState.resolve(
+                identityConfirmed: true,
+                transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+                trustworthyMessages: false
+            )
+            status = snapshot.paneGeometry.isValidated
+                ? "Message extraction is unverified · keeping it local"
+                : "Transcript geometry is unverified · keeping messages local"
+            hasUnverifiedMessageChanges = true
             return
         }
+        recordCaptureFingerprints(snapshot)
         let result = mergeSnapshot(snapshot, purpose: purpose)
         if allowAutomaticAnalysis, result.viewport == .liveTail, !result.appended.isEmpty {
             processIncoming(result.appended, contact: snapshot.contact)
@@ -632,6 +762,7 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func processIncoming(_ appended: [ChatMessage], contact: String) {
+        guard acquisitionState == .ready else { return }
         let incoming = appended.filter { $0.senderIdentified && !$0.isFromMe }
         guard !incoming.isEmpty else { return }
         lastProcessedIncomingMessage = incoming.last?.localID
@@ -643,12 +774,14 @@ final class MessageMonitor: ObservableObject {
         generation += 1
         let token = generation
         burstDebounce?.cancel()
-        guard viewportState == .liveTail, conversationIdentityState == .confirmed else { return }
+        guard viewportState == .liveTail, conversationIdentityState == .confirmed,
+              acquisitionState == .ready else { return }
         status = "Waiting for the message burst to finish…"
         burstDebounce = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled, let self, self.isRunning, self.generation == token else { return }
-            guard self.viewportState == .liveTail, self.conversationIdentityState == .confirmed else { return }
+            guard self.viewportState == .liveTail, self.conversationIdentityState == .confirmed,
+                  self.acquisitionState == .ready else { return }
             self.status = "Message ready · Analyze"
             if canAutoAnalyze {
                 self.onBurst?(contact, Array(self.messages.suffix(self.analysisContextLimit)), true)
@@ -699,12 +832,25 @@ final class MessageMonitor: ObservableObject {
                 }
                 self.consecutiveCaptureFailures = 0
                 if self.lockedContact == nil {
-                    self.adoptPendingIdentityMessages(for: snapshot)
+                    self.discardPendingIdentityMessages()
                 }
                 guard self.confirmSnapshotContact(snapshot.contact) == .confirmed else { return }
                 if contact == nil { self.startAXObserver() }
                 self.lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
                 self.refreshReaderIfAXSnapshotUnexpectedlyEmpty(snapshot)
+                if !self.isTrustworthyForSession(snapshot) {
+                    self.retainUnverifiedCapture(snapshot)
+                    self.acquisitionState = ConversationAcquisitionState.resolve(
+                        identityConfirmed: true,
+                        transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+                        trustworthyMessages: false
+                    )
+                    self.hasUnverifiedMessageChanges = true
+                    self.status = snapshot.paneGeometry.isValidated
+                        ? "Message extraction is unverified · keeping it local"
+                        : "Transcript geometry is unverified · keeping messages local"
+                    return
+                }
                 self.recordCaptureFingerprints(snapshot)
                 if self.visionMessageBaseline.shouldSkipOCR(frameUnchanged: snapshot.messagesUnchanged) {
                     self.status = "Monitoring · no visible message changes"
@@ -748,16 +894,40 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func recordCaptureFingerprints(_ snapshot: WeChatSnapshot) {
-        if let fingerprint = snapshot.headerFingerprint { lastHeaderFingerprint = fingerprint }
-        if snapshot.paneGeometry.isValidated && activePaneGeometry == nil { activePaneGeometry = snapshot.paneGeometry }
-        guard snapshot.messageSource == .vision else {
-            visionMessageBaseline.reset()
-            return
+        if snapshot.paneGeometry.isValidated && activePaneGeometry == nil {
+            activePaneGeometry = snapshot.paneGeometry
         }
+        guard isTrustworthyForSession(snapshot) else { return }
+        if let fingerprint = snapshot.headerFingerprint { lastHeaderFingerprint = fingerprint }
+        if snapshot.messageSource != .vision { visionMessageBaseline.reset(); return }
         visionMessageBaseline.record(source: snapshot.messageSource,
-                                     hasMessages: !snapshot.messages.isEmpty,
+                                     hasMessages: snapshot.hasTrustworthyTranscript || visionMessageBaseline.isValid,
                                      fingerprint: snapshot.messageFingerprint,
-                                     frameUnchanged: snapshot.messagesUnchanged)
+                                     frameUnchanged: snapshot.messagesUnchanged,
+                                     geometryValidated: snapshot.paneGeometry.isValidated,
+                                     extractionTrustworthy: true)
+    }
+
+    private func isTrustworthyForSession(_ snapshot: WeChatSnapshot) -> Bool {
+        if snapshot.hasTrustworthyTranscript { return true }
+        return snapshot.messageSource == .vision && snapshot.paneGeometry.isValidated &&
+            snapshot.messagesUnchanged && visionMessageBaseline.isValid && !conversationStore.messages.isEmpty
+    }
+
+    private func captureTrust(_ snapshot: WeChatSnapshot) -> ConversationCaptureTrust {
+        ConversationCaptureTrust(
+            identityConfirmed: conversationIdentityState == .confirmed,
+            transcriptGeometryValidated: snapshot.paneGeometry.isValidated,
+            messagesTrustworthy: isTrustworthyForSession(snapshot)
+        )
+    }
+
+    private func retainUnverifiedCapture(_ snapshot: WeChatSnapshot) {
+        if snapshot.paneGeometry.isValidated && activePaneGeometry == nil {
+            activePaneGeometry = snapshot.paneGeometry
+        }
+        guard !snapshot.messages.isEmpty else { return }
+        unverifiedCaptureMessages = Array((unverifiedCaptureMessages + snapshot.messages).suffix(50))
     }
 
     private func noteCaptureFailure() {
@@ -808,7 +978,7 @@ final class MessageMonitor: ObservableObject {
             let scroll = await performAccessibilityOperation {
                 bridge.scrollMessagePaneDownwardIfConversationMatches(
                     contact: contact, identity: identity,
-                    fraction: 0.5, paneGeometry: paneGeometry,
+                    fraction: 0.28, paneGeometry: paneGeometry,
                     cancellation: cancellation
                 )
             }

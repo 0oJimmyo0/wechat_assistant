@@ -17,6 +17,32 @@ enum WeChatParsing {
         return .unknown
     }
 
+    static func isInterfaceMessageText(_ text: String) -> Bool {
+        let normalized = text
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .filter { !$0.isWhitespace && !$0.isPunctuation }
+        let controls: Set<String> = [
+            "wechat", "weixin", "微信", "search", "qsearch", "搜索", "chats", "聊天",
+            "contacts", "通讯录", "discover", "发现", "moments", "朋友圈", "settings", "设置",
+            "voicecall", "videocall", "语音通话", "视频通话", "按住说话", "发送", "表情", "文件",
+            "截图", "聊天记录", "输入消息", "更多", "转账", "红包"
+        ]
+        if controls.contains(normalized) { return true }
+        return ["typeamessage", "entermessage", "sendamessage", "holdtospeak"].contains(normalized)
+    }
+
+    static func isPlausibleMessageBubble(_ bounds: CGRect, in region: CGRect) -> Bool {
+        guard region.width > 0, bounds.minX >= region.minX, bounds.maxX <= region.maxX,
+              bounds.minY >= region.minY, bounds.maxY <= region.maxY,
+              bounds.width >= 0.008, bounds.width <= 0.72,
+              bounds.height >= 0.006, bounds.height <= 0.10 else { return false }
+        let leftMargin = bounds.minX - region.minX
+        let rightMargin = region.maxX - bounds.maxX
+        let leftBubble = leftMargin <= 0.24 && bounds.midX <= region.midX + 0.06
+        let rightBubble = rightMargin <= 0.24 && bounds.midX >= region.midX - 0.06
+        return leftBubble || rightBubble
+    }
+
     static func normalizeChatTitle(_ text: String) -> String {
         var normalized = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         if let range = normalized.range(of: #"\s*\(\d+\)$"#, options: .regularExpression) {

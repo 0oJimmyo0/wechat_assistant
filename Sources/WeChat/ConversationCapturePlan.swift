@@ -37,6 +37,7 @@ enum ConversationPaneGeometrySource: String, Sendable {
     case accessibilityMessageList
     case accessibilityComposer
     case accessibilityScrollArea
+    case visualDividerCandidate
     case visualDivider
     case detachedWindow
     case configuredFallback
@@ -50,13 +51,47 @@ struct ConversationPaneGeometry: Sendable, Equatable {
     let confidence: Float
 
     var isValidated: Bool {
-        confidence >= 0.70 && source != .configuredFallback
+        confidence >= 0.70 && source != .configuredFallback && source != .visualDividerCandidate
     }
 
     func scrollTarget(in windowFrame: CGRect) -> CGPoint {
         CGPoint(x: windowFrame.minX + windowFrame.width * messageRegion.midX,
                 y: windowFrame.minY + windowFrame.height * (1 - messageRegion.midY))
     }
+
+    func validatingVisualEvidence(titleBounds: CGRect?, messageBounds: [CGRect]) -> ConversationPaneGeometry {
+        guard source == .visualDividerCandidate,
+              let title = titleBounds,
+              title.minX >= leftX,
+              (title.midX - leftX) / max(0.01, 1 - leftX) <= 0.70,
+              !messageBounds.isEmpty else { return self }
+        let aligned = messageBounds.filter { bounds in
+            bounds.minX >= leftX && bounds.maxX <= 1.001 &&
+                bounds.minY >= messageRegion.minY && bounds.maxY <= messageRegion.maxY &&
+                (bounds.minX - messageRegion.minX <= 0.24 ||
+                 messageRegion.maxX - bounds.maxX <= 0.24)
+        }
+        guard CGFloat(aligned.count) / CGFloat(messageBounds.count) >= 0.75 else { return self }
+        return VisionLayoutRegions.geometry(
+            leftX: leftX, headerBottomY: headerRegion.minY,
+            composerTopY: messageRegion.minY,
+            source: .visualDivider, confidence: 0.78
+        )
+    }
+}
+
+struct ConversationCaptureTrust: Equatable, Sendable {
+    let identityConfirmed: Bool
+    let transcriptGeometryValidated: Bool
+    let messagesTrustworthy: Bool
+
+    var mayEnterTrustedStore: Bool {
+        identityConfirmed && transcriptGeometryValidated && messagesTrustworthy
+    }
+
+    static let validated = ConversationCaptureTrust(identityConfirmed: true,
+                                                    transcriptGeometryValidated: true,
+                                                    messagesTrustworthy: true)
 }
 
 enum ConversationAcquisitionState: String {
@@ -64,18 +99,44 @@ enum ConversationAcquisitionState: String {
     case identifying
     case identityConfirmed
     case messagesPending
+    case geometryUnverified
     case ready
     case temporarilyUnavailable
     case conversationChanged
 
-    static func resolve(identityConfirmed: Bool, hasMessages: Bool) -> ConversationAcquisitionState {
-        if identityConfirmed && hasMessages { return .ready }
+    static func resolve(identityConfirmed: Bool, transcriptGeometryValidated: Bool,
+                        trustworthyMessages: Bool) -> ConversationAcquisitionState {
+        if identityConfirmed && !transcriptGeometryValidated { return .geometryUnverified }
+        let trust = ConversationCaptureTrust(identityConfirmed: identityConfirmed,
+                                             transcriptGeometryValidated: transcriptGeometryValidated,
+                                             messagesTrustworthy: trustworthyMessages)
+        if trust.mayEnterTrustedStore { return .ready }
         if identityConfirmed { return .identityConfirmed }
-        if hasMessages { return .messagesPending }
+        if trustworthyMessages { return .messagesPending }
         return .identifying
     }
 
     var permitsAutomaticAnalysis: Bool { self == .ready }
+}
+
+enum HistoricalCaptureObservation: String, Sendable {
+    case notObserved = "not observed"
+    case noVisualMovement = "no visual movement after scroll"
+    case rowsUnrecognized = "viewport changed but message rows were unrecognized"
+    case geometryUnverified = "viewport geometry is unverified"
+    case noSequenceOverlap = "rows recognized but no history sequence overlap"
+    case overlapWithoutOlderRows = "overlap found; no unseen older rows"
+    case olderRowsAdded = "older rows added"
+
+    static func resolve(geometryValidated: Bool, viewportChanged: Bool,
+                        recognizedRowCount: Int, sequenceOverlap: Bool,
+                        olderRowsAdded: Bool) -> HistoricalCaptureObservation {
+        guard geometryValidated else { return .geometryUnverified }
+        guard viewportChanged else { return .noVisualMovement }
+        guard recognizedRowCount > 0 else { return .rowsUnrecognized }
+        guard sequenceOverlap else { return .noSequenceOverlap }
+        return olderRowsAdded ? .olderRowsAdded : .overlapWithoutOlderRows
+    }
 }
 
 enum ConversationCaptureSource: String, Sendable {
@@ -120,7 +181,9 @@ struct VisionMessageBaseline: Equatable {
     }
 
     mutating func record(source: ConversationCaptureSource, hasMessages: Bool,
-                         fingerprint: String?, frameUnchanged: Bool) {
+                         fingerprint: String?, frameUnchanged: Bool,
+                         geometryValidated: Bool, extractionTrustworthy: Bool) {
+        guard geometryValidated, extractionTrustworthy else { return }
         guard source == .vision else {
             reset()
             return
