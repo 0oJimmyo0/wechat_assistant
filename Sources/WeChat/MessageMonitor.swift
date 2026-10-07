@@ -51,6 +51,7 @@ final class MessageMonitor: ObservableObject {
     private var burstDebounce: Task<Void, Never>?
     private var observerDebounce: Task<Void, Never>?
     private var lockedContact: String?
+    private var lockedVisionIdentity: VisionConversationIdentity?
     private var candidateContact: String?
     private var candidateContactPolls = 0
     private var isCheckingConversation = false
@@ -91,13 +92,14 @@ final class MessageMonitor: ObservableObject {
         return [
             "Conversation identity: \(conversationIdentityState.rawValue)",
             "Candidate change observations: \(candidateContactPolls)",
-            "AX message captures: \(messageCaptureCount)",
+            "Conversation captures: \(messageCaptureCount)",
             "Latest observed rows: \(latestSnapshotBlockCount)",
             "Stored context size: \(conversationStore.messages.count)",
             "Tail overlap: \(latestTailOverlap)",
             "Historical overlap: \(latestHistoricalOverlap)",
             "Last successful identity validation age: \(age)",
             lastOlderContextDiagnostic,
+            bridge.conversationCaptureDiagnostic,
             bridge.readerBackendDiagnostic
         ].joined(separator: "\n")
     }
@@ -121,16 +123,17 @@ final class MessageMonitor: ObservableObject {
         sessionCancellation = cancellation
         let bridge = self.bridge
         accessibilityQueue.async { [weak self] in
-            let snapshot = bridge.captureSnapshot()
+            let snapshot = bridge.captureConversationSnapshot()
             guard cancellation.isCancelled == false else { return }
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token, self.isCheckingConversation else { return }
                 self.isCheckingConversation = false
                 guard let snapshot else {
-                    self.status = "Accessibility could not identify the current chat and message list"
+                    self.status = "Could not read the active WeChat conversation"
                     return
                 }
                 self.lockedContact = snapshot.contact
+                self.lockedVisionIdentity = snapshot.visionIdentity
                 self.contactName = snapshot.contact
                 self.conversationIdentityState = .confirmed
                 self.lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
@@ -154,6 +157,7 @@ final class MessageMonitor: ObservableObject {
         lastObservedSnapshot = []
         lastProcessedIncomingMessage = nil
         lockedContact = nil
+        lockedVisionIdentity = nil
         contactName = nil
         candidateContact = nil
         candidateContactPolls = 0
@@ -194,6 +198,7 @@ final class MessageMonitor: ObservableObject {
         lastObservedSnapshot = []
         lastProcessedIncomingMessage = nil
         lockedContact = nil
+        lockedVisionIdentity = nil
         contactName = nil
         candidateContact = nil
         candidateContactPolls = 0
@@ -302,8 +307,13 @@ final class MessageMonitor: ObservableObject {
             while self.isRunning, self.generation == token, self.messages.count < targetCount,
                   attempts < self.maxScrollAttempts, noProgress < self.maxNoProgressAttempts {
                 let before = self.messages.count
+                let identity = self.lockedVisionIdentity
+                let workCancellation = self.sessionCancellation
                 let scroll = await self.performAccessibilityOperation {
-                    self.bridge.scrollMessagePaneUpOnePageIfConversationMatches(contact: contact)
+                    self.bridge.scrollMessagePaneUpwardIfConversationMatches(
+                        contact: contact, identity: identity, fraction: 0.5,
+                        cancellation: workCancellation
+                    )
                 }
                 guard self.isRunning, self.generation == token else { return }
                 switch scroll {
@@ -370,10 +380,25 @@ final class MessageMonitor: ObservableObject {
     private func captureAndMerge(contact: String, purpose: SnapshotPurpose,
                                  cancellation: MonitorWorkCancellation?, generation token: Int) async -> CaptureMergeOutcome {
         let bridge = self.bridge
-        let snapshot = await performAccessibilityOperation { bridge.captureSnapshot() }
+        let identity = lockedVisionIdentity
+        let captured: OlderContextReadResult? = await performAccessibilityOperation {
+            if purpose == .historical {
+                return bridge.readMessagesIfConversationMatches(contact: contact, identity: identity,
+                                                               accurate: false, forceFresh: true,
+                                                               cancellation: cancellation)
+            }
+            guard let snapshot = bridge.captureConversationSnapshot() else { return nil }
+            return .snapshot(snapshot)
+        }
         guard isRunning, generation == token, cancellation?.isCancelled != true else { return .unavailable }
+        let snapshot: WeChatSnapshot?
+        switch captured {
+        case .snapshot(let value): snapshot = value
+        case .conversationChanged: return .conversationChanged
+        case .identityUncertain, .captureUnavailable, .cancelled, .none: snapshot = nil
+        }
         guard let snapshot else {
-            status = "Accessibility snapshot unavailable · keeping stored context"
+            status = "Conversation capture unavailable · keeping stored context"
             conversationIdentityState = .temporarilyUncertain
             hasUnverifiedMessageChanges = true
             return .unavailable
@@ -386,7 +411,7 @@ final class MessageMonitor: ObservableObject {
         lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
         guard !snapshot.messages.isEmpty else {
             latestSnapshotBlockCount = 0
-            status = "Accessibility exposed no message rows · keeping stored context"
+            status = "No message rows visible · keeping stored context"
             return .merged(ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain))
         }
         return .merged(mergeSnapshot(snapshot, purpose: purpose))
@@ -395,6 +420,7 @@ final class MessageMonitor: ObservableObject {
     @discardableResult
     private func mergeSnapshot(_ snapshot: WeChatSnapshot, purpose: SnapshotPurpose) -> ConversationMergeResult {
         let result = conversationStore.merge(snapshot.messages)
+        if lockedVisionIdentity == nil { lockedVisionIdentity = snapshot.visionIdentity }
         messages = conversationStore.messages
         viewportState = result.viewport
         latestTailOverlap = result.viewport == .liveTail ? result.appended.count : 0
@@ -492,16 +518,16 @@ final class MessageMonitor: ObservableObject {
         let cancellation = sessionCancellation
         let bridge = self.bridge
         accessibilityQueue.async { [weak self] in
-            let snapshot = bridge.captureSnapshot()
+            let snapshot = bridge.captureConversationSnapshot()
             guard cancellation?.isCancelled != true else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
                 guard let snapshot else {
-                    // AX can temporarily fail or expose no list. Neither event
-                    // changes the stored conversation or the successful baseline.
-                    self.status = "Accessibility snapshot unavailable · keeping stored context"
+                    // A temporary failure in the selected source does not
+                    // change stored context or the successful merge baseline.
+                    self.status = "Conversation capture unavailable · keeping stored context"
                     self.conversationIdentityState = .temporarilyUncertain
                     self.hasUnverifiedMessageChanges = true
                     return
@@ -510,7 +536,7 @@ final class MessageMonitor: ObservableObject {
                 self.lastTitleValidationUptime = ProcessInfo.processInfo.systemUptime
                 guard !snapshot.messages.isEmpty else {
                     self.latestSnapshotBlockCount = 0
-                    self.status = "Accessibility exposed no message rows · keeping stored context"
+                    self.status = "No message rows visible · keeping stored context"
                     return
                 }
                 let result = self.mergeSnapshot(snapshot, purpose: .live)
@@ -560,10 +586,14 @@ final class MessageMonitor: ObservableObject {
         isReturningToLatest = true
         var appended: [ChatMessage] = []
         let bridge = self.bridge
+        let identity = lockedVisionIdentity
         for _ in 0..<maxScrollAttempts {
             guard isRunning, generation == token, cancellation?.isCancelled != true else { return (false, appended) }
             let scroll = await performAccessibilityOperation {
-                bridge.scrollMessagePaneDownOnePageIfConversationMatches(contact: contact)
+                bridge.scrollMessagePaneDownwardIfConversationMatches(
+                    contact: contact, identity: identity,
+                    fraction: 0.5, cancellation: cancellation
+                )
             }
             guard isRunning, generation == token else { return (false, appended) }
             switch scroll {

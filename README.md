@@ -39,7 +39,7 @@ For a personal local build, create a self-signed code-signing identity in **Keyc
 
 ## First run
 
-1. Open **System Settings → Privacy & Security → Accessibility** and allow **WeChat Reply Copilot**. The app prompts for this permission when needed. If the Accessibility tree is collapsed, it requests Screen Recording permission once; enable the app in **System Settings → Privacy & Security → Screen Recording** if macOS asks. Later capture checks only preflight permission and do not repeatedly open prompts.
+1. Open **System Settings → Privacy & Security → Accessibility** and allow **WeChat Reply Copilot**. The app prompts for this permission when needed. If WeChat's Accessibility tree does not expose messages, the Vision fallback needs Screen Recording permission; enable the app in **System Settings → Privacy & Security → Screen Recording**.
 2. Open WeChat and navigate to a direct conversation.
 3. Choose **Continue with ChatGPT** and finish sign-in in the browser. The app uses OAuth/OIDC with PKCE and a loopback callback.
 4. Choose account-available Everyday and Careful models in Settings.
@@ -71,13 +71,13 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor captures the conversation title and message rows from the same WeChat Accessibility window/list instance. Accessibility provides snapshots; the in-memory `ConversationStore` owns the accumulated timeline. Snapshots merge by ordered overlap, so virtualization and temporary empty reads do not erase observed rows, and repeated identical messages remain separate entries. Snapshots that overlap the known tail can append live rows; historical rows can only backfill earlier context and never trigger incoming-message analysis. The active monitor watches WeChat with `AXObserver` where notifications are supported and retains a 3-second polling watchdog. **Sync latest** scrolls toward the bottom, waits for rows to materialize, and merges; **Load older to 20** performs at most six upward scroll/capture attempts and returns to the latest viewport when it can verify it. Analysis receives at most the latest 20 messages. The active capture path uses Accessibility only; it does not run continuous OCR. If Accessibility cannot expose the active chat/list, activation or sync reports that limitation and keeps previously stored context. Developer diagnostics can still capture reports or an explicitly requested annotated preview.
+The monitor captures one unified snapshot using independent identity and message sources. When both the chat identity and message list are available through Accessibility, it reads them from the same WeChat window/list. If AX exposes only one, it combines that half with local Vision capture; if neither is exposed, it uses the existing Vision title and message readers. Vision reads the visible WeChat window locally and needs Screen Recording permission. The in-memory `ConversationStore` owns the accumulated timeline. Snapshots merge by ordered overlap, so virtualization and temporary empty reads do not erase observed rows, and repeated identical messages remain separate entries. Snapshots that overlap the known tail can append live rows; historical rows can only backfill earlier context and never trigger incoming-message analysis. The active monitor watches WeChat with `AXObserver` where notifications are supported and retains a 3-second polling watchdog. **Sync latest** scrolls toward the bottom, waits for rows to materialize, and merges; **Load older to 20** performs at most six upward scroll/capture attempts and returns to the latest viewport when it can verify it. Analysis receives at most the latest 20 messages. Vision capture remains local; model requests occur only under the app's manual or automatic analysis settings. If no source can identify the chat or read messages, activation or sync reports that limitation and keeps previously stored context. Developer diagnostics list the identity/message source and the permission state.
 
 For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only. **Inspect Vision Capture** reports window/crop geometry and observation counts; it omits recognized text, contact names, and messages. In **Settings → Developer diagnostics**, adjust the normalized conversation-left, header-bottom, and composer-top ratios, then use **Save Annotated Vision Preview** to inspect the blue pane boundary, yellow header, green message canvas, orange excluded composer, accepted red title, rejected purple title candidates, accepted green message blocks, and rejected gray observations. The preview is saved only after you explicitly choose a destination; it contains visible WeChat content, so handle and remove it as sensitive data after debugging.
 
 ## Manual acceptance checklist
 
-- [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission. Screen Recording is only needed for optional manual Vision diagnostics.
+- [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission; grant Screen Recording if WeChat requires the Vision fallback.
 - [ ] With WeChat open to a direct conversation, verify the contact and latest visible messages appear.
 - [ ] Activate in one conversation, switch to another, and verify monitoring stops and the local session clears.
 - [ ] Verify manual mode does not make requests until Analyze is clicked; opt into automatic analysis and verify only identified incoming messages trigger it.
@@ -85,7 +85,7 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 - [ ] Copy each candidate and verify the clipboard contains its text.
 - [ ] Use Analyze, Regenerate carefully, and a special instruction.
 - [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
-- [ ] Confirm monitoring uses Accessibility snapshots and does not continuously capture the screen.
+- [ ] Confirm AX-capable chats use Accessibility and a collapsed AX message tree falls back to local Vision capture.
 - [ ] Save an **Inspect WeChat AX** report and verify only structural metadata is included.
 - [ ] Save an **Inspect Vision Capture** report and confirm it contains counts/geometry only; save an annotated preview only when explicitly needed and treat the image as sensitive.
 - [ ] With WeChat open, check that incoming messages and manual scrolling update within about 1–2 seconds; verify historical rows never trigger analysis and returning to the bottom resumes live tracking.
@@ -97,7 +97,7 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 
 ## Known limitations
 
-- Accessibility structure varies by WeChat release. If WeChat does not expose the active conversation and message list through Accessibility, live capture cannot proceed. Screen Recording is used only by optional manual Vision diagnostics.
+- Accessibility structure varies by WeChat release. When AX lacks the identity or message list, local Vision capture fills the missing source and requires Screen Recording permission. If neither source can identify the chat or read messages, live capture cannot proceed.
 - Only visible/retrievable messages are available; the app does not read WeChat's database. Incoming messages may not appear in a historical viewport until **Sync latest** or **Follow latest** returns to the bottom. Ordered overlap can be uncertain when WeChat exposes too few shared rows; the app keeps the existing context and waits for an anchored snapshot.
 - The reader identifies conversations by the confirmed display title. Two distinct chats with the same normalized title may not be distinguishable; monitoring stops when a title change is confirmed.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.

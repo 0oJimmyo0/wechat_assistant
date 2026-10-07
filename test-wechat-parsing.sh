@@ -25,3 +25,11 @@ swiftc \
     "$PROJECT_DIR/Tests/ConversationStoreTests.swift"
 
 "$STORE_TEST_BINARY"
+
+CAPTURE_TEST_BINARY="$PROJECT_DIR/.build/ConversationCapturePlanTests"
+swiftc \
+    -o "$CAPTURE_TEST_BINARY" \
+    "$PROJECT_DIR/Sources/WeChat/ConversationCapturePlan.swift" \
+    "$PROJECT_DIR/Tests/ConversationCapturePlanTests.swift"
+
+"$CAPTURE_TEST_BINARY"
