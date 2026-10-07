@@ -33,13 +33,14 @@ final class MessageMonitor: ObservableObject {
         accessibilityQueue.async { [weak self] in
             let contact = bridge.currentContact()
             let treeCollapsed = contact == nil && bridge.accessibilityTreeAppearsCollapsed()
+            let screenCaptureAllowed = WeChatScreenReader.hasScreenCapturePermission
             let result = contact == nil ? nil : bridge.readMessages()
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isCheckingConversation = false
                 guard let contact, !contact.isEmpty else {
                     self.status = treeCollapsed
-                        ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                        ? self.collapsedTreeStatus(screenCaptureAllowed: screenCaptureAllowed)
                         : "Could not identify the open WeChat conversation"
                     return
                 }
@@ -88,7 +89,7 @@ final class MessageMonitor: ObservableObject {
                 guard let contact, contact == self.lockedContact else {
                     self.stop()
                     self.status = treeCollapsed
-                        ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                        ? self.collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                         : "Conversation changed or could not be identified — activate again when the chat is open."
                     return
                 }
@@ -98,7 +99,7 @@ final class MessageMonitor: ObservableObject {
                     self.messages = []
                     self.lastIDs = []
                     self.status = collapsed
-                        ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                        ? self.collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                         : "Conversation detected, but message list is unavailable"
                 case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
                     guard !snapshot.isEmpty else {
@@ -121,7 +122,7 @@ final class MessageMonitor: ObservableObject {
             messages = []
             lastIDs = []
             status = collapsed
-                ? "WeChat Accessibility tree appears collapsed — compatibility mode required"
+                ? collapsedTreeStatus(screenCaptureAllowed: WeChatScreenReader.hasScreenCapturePermission)
                 : "Conversation detected: \(contact) · message list is unavailable"
         case .messageListFound(let snapshot, let renderedRows, let bubbleRows, _):
             messages = snapshot
@@ -138,6 +139,12 @@ final class MessageMonitor: ObservableObject {
                 status = "Monitoring this conversation"
             }
         }
+    }
+
+    private func collapsedTreeStatus(screenCaptureAllowed: Bool) -> String {
+        screenCaptureAllowed
+            ? "WeChat's visible conversation could not be read; bring its window to the front and try again"
+            : "Allow Screen Recording for WeChat Reply Copilot in System Settings, then activate again"
     }
 
     private func processSnapshot(_ snapshot: [ChatMessage], contact: String) {

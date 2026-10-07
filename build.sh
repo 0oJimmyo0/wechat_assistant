@@ -50,6 +50,7 @@ swiftc \
     -framework AppKit \
     -framework Carbon \
     -framework ApplicationServices \
+    -framework Vision \
     -framework Combine \
     -framework Network \
     -framework Security \

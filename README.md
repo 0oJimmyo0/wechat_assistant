@@ -71,13 +71,13 @@ Sources/
 └── main.swift    App and menu-bar lifecycle
 ```
 
-The monitor reads the currently selected WeChat window's recognized message list. It does not read WeChat's local database, infer chat content from arbitrary visible text, access chat history outside the visible/retrievable Accessibility tree, or automatically scroll older messages.
+The monitor reads the currently selected WeChat window's recognized message list. If WeChat exposes a collapsed Accessibility tree, it can request Screen Recording access and OCR only that visible WeChat window locally. OCR is limited to the conversation header and right-hand message pane; OCR rows have unknown senders and cannot trigger automatic analysis. It does not read WeChat's local database, access chat history outside the visible window, or automatically scroll older messages. Captured images and OCR text are not saved; text stays local until the user chooses Analyze.
 
 For target-Mac Accessibility troubleshooting, open **Settings → Developer diagnostics → Inspect WeChat AX**. The report is saved only after you choose a location and contains structural roles, sanitized identifiers, frames, and row counts; it omits message text, contact names, profile notes, and credentials.
 
 ## Manual acceptance checklist
 
-- [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission.
+- [ ] Launch on Apple Silicon macOS 14+ and grant Accessibility permission; if prompted for Screen Recording due to a collapsed WeChat tree, grant it for visible-window OCR.
 - [ ] With WeChat open to a direct conversation, verify the contact and latest visible messages appear.
 - [ ] Activate in one conversation, switch to another, and verify monitoring stops and the local session clears.
 - [ ] Verify manual mode does not make requests until Analyze is clicked; opt into automatic analysis and verify only identified incoming messages trigger it.
@@ -85,14 +85,14 @@ For target-Mac Accessibility troubleshooting, open **Settings → Developer diag
 - [ ] Copy each candidate and verify the clipboard contains its text.
 - [ ] Use Analyze, Regenerate carefully, and a special instruction.
 - [ ] Activate and deactivate monitoring; verify deactivation clears the visible session and closing the sidebar stops monitoring.
-- [ ] Confirm text outside the recognized message list is ignored and is never sent for analysis.
+- [ ] Confirm OCR fallback is limited to the WeChat conversation pane, remains manual-only, and sends no text until Analyze is clicked.
 - [ ] Save an **Inspect WeChat AX** report and verify only structural metadata is included.
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 
 ## Known limitations
 
-- Accessibility structure varies by WeChat release. If no recognized message list is exposed, the app reads no message text. Bubble rows with unknown senders remain marked unknown and are never sent automatically.
+- Accessibility structure varies by WeChat release. OCR fallback depends on Screen Recording permission and visible-window text recognition. OCR rows remain sender-unknown and are never sent automatically.
 - Only the current conversation's visible/retrievable messages are available; historical scrolling is manual.
 - OAuth uses the documented local loopback callback. First-time use requires browser sign-in and plan-use authorization.
 - ChatGPT plan access/model availability is controlled by the signed-in account and OpenAI service availability.

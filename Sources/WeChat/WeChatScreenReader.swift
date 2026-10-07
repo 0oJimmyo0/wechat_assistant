@@ -1,0 +1,114 @@
+import AppKit
+import CoreGraphics
+import Vision
+
+struct VisibleWeChatSnapshot {
+    let title: String?
+    let messages: [ChatMessage]
+}
+
+/// Local OCR fallback for WeChat builds that expose a collapsed Accessibility tree.
+/// Captures only the WeChat window and never writes or logs the captured image/text.
+final class WeChatScreenReader {
+    static let shared = WeChatScreenReader()
+
+    private let lock = NSLock()
+    private var cachedKey: String?
+    private var cachedAt = Date.distantPast
+    private var cachedSnapshot: VisibleWeChatSnapshot?
+    private let cacheDuration: TimeInterval = 1.5
+
+    static var hasScreenCapturePermission: Bool { CGPreflightScreenCaptureAccess() }
+
+    func read(pid: pid_t, windowFrame: CGRect) -> VisibleWeChatSnapshot? {
+        let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
+        lock.lock()
+        defer { lock.unlock() }
+        if cachedKey == key, Date().timeIntervalSince(cachedAt) < cacheDuration {
+            return cachedSnapshot
+        }
+        cachedKey = key
+        cachedAt = Date()
+        cachedSnapshot = capture(pid: pid, windowFrame: windowFrame)
+        return cachedSnapshot
+    }
+
+    private func capture(pid: pid_t, windowFrame: CGRect) -> VisibleWeChatSnapshot? {
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess(),
+              let windowID = visibleWindowID(pid: pid, matching: windowFrame),
+              let capturedWindow = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, [.bestResolution]) else {
+            return nil
+        }
+        let cropX = Int((CGFloat(capturedWindow.width) * 0.28).rounded(.down))
+        let conversationCrop = CGRect(
+            x: CGFloat(cropX),
+            y: 0,
+            width: CGFloat(capturedWindow.width - cropX),
+            height: CGFloat(capturedWindow.height)
+        )
+        guard let image = capturedWindow.cropping(to: conversationCrop) else { return nil }
+
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        let handler = VNImageRequestHandler(cgImage: image)
+        guard (try? handler.perform([request])) != nil else { return nil }
+
+        let lines = (request.results ?? []).compactMap { observation -> (String, CGRect, Float)? in
+            guard let candidate = observation.topCandidates(1).first,
+                  candidate.confidence >= 0.45 else { return nil }
+            let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return (text, observation.boundingBox, candidate.confidence)
+        }
+
+        // Crop away the left 28% conversation/sidebar rail before OCR. Only the
+        // right-pane header can identify the active chat; generic chrome is rejected.
+        let title = lines
+            .filter { $0.1.minX >= 0.01 && $0.1.minY >= 0.80 && $0.1.maxY <= 0.965 }
+            .sorted { lhs, rhs in
+                if lhs.1.midY != rhs.1.midY { return lhs.1.midY > rhs.1.midY }
+                return lhs.2 > rhs.2
+            }
+            .map(\.0)
+            .map(WeChatParsing.normalizeChatTitle)
+            .first { !$0.isEmpty && !WeChatParsing.isGenericWindowTitle($0) }
+
+        // OCR cannot safely establish sender identity. Keep every OCR row
+        // manual-only so auto-analysis remains disabled for this fallback.
+        let messages = lines
+            .filter { $0.1.minX >= 0.01 && $0.1.minY >= 0.14 && $0.1.maxY <= 0.80 }
+            .filter { !looksLikeTimestampOrControl($0.0) }
+            .sorted { $0.1.maxY > $1.1.maxY }
+            .suffix(20)
+            .map { ChatMessage(text: $0.0, sender: .unknown) }
+
+        return VisibleWeChatSnapshot(title: title, messages: Array(messages))
+    }
+
+    private func visibleWindowID(pid: pid_t, matching frame: CGRect) -> CGWindowID? {
+        guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        let candidates: [(CGWindowID, CGFloat)] = raw.compactMap { item in
+            guard (item[kCGWindowOwnerPID as String] as? Int32) == pid,
+                  (item[kCGWindowLayer as String] as? Int) == 0,
+                  let number = item[kCGWindowNumber as String] as? NSNumber,
+                  let bounds = item[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
+            let score = abs(rect.origin.x - frame.origin.x) + abs(rect.origin.y - frame.origin.y) +
+                abs(rect.width - frame.width) + abs(rect.height - frame.height)
+            return (CGWindowID(number.uint32Value), score)
+        }
+        return candidates.min(by: { $0.1 < $1.1 })?.0
+    }
+
+    private func looksLikeTimestampOrControl(_ text: String) -> Bool {
+        if text.range(of: #"^\d{1,2}:\d{2}$|^\d{1,4}/\d{1,2}.*$|^\d{1,2}月\d{1,2}日$"#, options: .regularExpression) != nil {
+            return true
+        }
+        return ["WeChat", "微信", "Search", "搜索", "Chats", "聊天", "Contacts", "通讯录"]
+            .contains(text)
+    }
+}

@@ -151,7 +151,7 @@ final class WeChatBridge: @unchecked Sendable {
                 return name
             }
         }
-        return nil
+        return visibleSnapshot(for: window)?.title
     }
 
     func readMessages(limit: Int = 20) -> MessageReadResult {
@@ -174,6 +174,7 @@ final class WeChatBridge: @unchecked Sendable {
         // 3. Conservative older-client fallback: only inspect AXLists under a
         // large right-side scroll area when the chat composer is also present.
         guard hasConversationComposer(in: window) else {
+            if let result = readVisibleMessages(in: window, limit: limit) { return result }
             return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window))
         }
         let windowFrame = frame(window)
@@ -188,7 +189,24 @@ final class WeChatBridge: @unchecked Sendable {
                 return readRows(in: list, limit: limit)
             }
         }
+        if let result = readVisibleMessages(in: window, limit: limit) { return result }
         return .messageListUnavailable(treeCollapsed: accessibilityTreeAppearsCollapsed(in: window))
+    }
+
+    private func readVisibleMessages(in window: AXUIElement, limit: Int) -> MessageReadResult? {
+        guard let snapshot = visibleSnapshot(for: window) else { return nil }
+        let messages = Array(snapshot.messages.suffix(limit))
+        return .messageListFound(
+            messages: messages,
+            renderedRows: messages.count,
+            bubbleRows: messages.count,
+            placeholders: 0
+        )
+    }
+
+    private func visibleSnapshot(for window: AXUIElement) -> VisibleWeChatSnapshot? {
+        guard let app = weChatApplication() else { return nil }
+        return WeChatScreenReader.shared.read(pid: app.processIdentifier, windowFrame: frame(window))
     }
 
     private func readRows(in list: AXUIElement, limit: Int) -> MessageReadResult {
@@ -270,6 +288,7 @@ final class WeChatBridge: @unchecked Sendable {
         lines.append("AXFocusedWindow attribute: \(diagnosticAttributeState(appElement, attribute: "AXFocusedWindow"))")
         lines.append("AXMainWindow attribute: \(diagnosticAttributeState(appElement, attribute: "AXMainWindow"))")
         lines.append("AXChildren attribute: \(diagnosticAttributeState(appElement, attribute: "AXChildren"))")
+        lines.append("Screen capture permission: \(WeChatScreenReader.hasScreenCapturePermission ? "granted" : "not granted")")
 
         for (index, window) in appWindows.enumerated() {
             let role = string(window, "AXRole") ?? "<unavailable>"
