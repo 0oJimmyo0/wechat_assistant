@@ -11,6 +11,11 @@ enum WeChatParsingTests {
         expect(WeChatParsing.isPlausibleChatText("😂", confidence: 0.50), "keeps emoji-only messages")
         expect(!WeChatParsing.isPlausibleChatText("*FF\"ILET", confidence: 0.50), "rejects symbol-heavy OCR artifacts")
         expect(!WeChatParsing.isPlausibleChatText("?!", confidence: 0.90), "rejects punctuation-only OCR")
+        expect(WeChatParsing.titleMatchesMessage("你晚上还回来吗", message: "你晚上还回来吗"), "rejects title matching exact message content")
+        expect(WeChatParsing.titleMatchesMessage("你晚上还回来吗", message: "你晚上还回来吗？"), "normalizes title punctuation before message comparison")
+        expect(WeChatParsing.titleMatchesMessage("你晚上还回", message: "你晚上还回来吗"), "rejects titles that are substantial message substrings")
+        expect(WeChatParsing.titleMatchesMessage("Contact", message: "Contack"), "rejects nearly identical OCR text")
+        expect(!WeChatParsing.titleMatchesMessage("Alex", message: "See you later"), "keeps unrelated titles distinct from messages")
         expect(WeChatParsing.isGenericWindowTitle("WeChat (Chats)"), "recognizes generic WeChat window title")
         expect(!WeChatParsing.isGenericWindowTitle("Alex"), "does not classify a contact name as generic")
 

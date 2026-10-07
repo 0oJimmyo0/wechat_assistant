@@ -8,7 +8,7 @@ struct SettingsView: View {
     @ObservedObject private var auth = ChatGPTAuthManager.shared
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @AppStorage("vision_conversation_left_x") private var conversationLeftX = 0.28
-    @AppStorage("vision_header_bottom_y") private var headerBottomY = 0.82
+    @AppStorage("vision_header_bottom_y") private var headerBottomY = 0.90
     @AppStorage("vision_composer_top_y") private var composerTopY = 0.18
     @State private var isInspectingWeChat = false
     @State private var diagnosticStatus: String?

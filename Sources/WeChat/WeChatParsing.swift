@@ -38,6 +38,43 @@ enum WeChatParsing {
         return contentRatio >= 0.72 && (confidence >= 0.60 || contentRatio >= 0.85)
     }
 
+    static func titleMatchesMessage(_ title: String, message: String) -> Bool {
+        let normalizedTitle = normalizedComparableText(title)
+        let normalizedMessage = normalizedComparableText(message)
+        guard !normalizedTitle.isEmpty, !normalizedMessage.isEmpty else { return false }
+        if normalizedTitle == normalizedMessage { return true }
+        if normalizedTitle.count >= 3 && normalizedMessage.contains(normalizedTitle) { return true }
+        return min(normalizedTitle.count, normalizedMessage.count) >= 4 &&
+            editDistance(normalizedTitle, normalizedMessage) <= 1
+    }
+
+    private static func normalizedComparableText(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .unicodeScalars
+            .filter { !CharacterSet.whitespacesAndNewlines.contains($0) &&
+                !CharacterSet.punctuationCharacters.contains($0) && !CharacterSet.symbols.contains($0) }
+            .map(String.init)
+            .joined()
+    }
+
+    private static func editDistance(_ lhs: String, _ rhs: String) -> Int {
+        let left = Array(lhs), right = Array(rhs)
+        var previous = Array(0...right.count)
+        for (leftIndex, leftCharacter) in left.enumerated() {
+            var current = Array(repeating: 0, count: right.count + 1)
+            current[0] = leftIndex + 1
+            for (rightIndex, rightCharacter) in right.enumerated() {
+                current[rightIndex + 1] = min(
+                    previous[rightIndex + 1] + 1,
+                    current[rightIndex] + 1,
+                    previous[rightIndex] + (leftCharacter == rightCharacter ? 0 : 1)
+                )
+            }
+            previous = current
+        }
+        return previous[right.count]
+    }
+
     static func isGenericWindowTitle(_ title: String) -> Bool {
         let normalized = title.split(whereSeparator: \.isWhitespace).joined().lowercased()
         return ["wechat", "wechat(chats)", "wechat(contacts)", "wechat(discover)", "微信", "微信(聊天)", "微信(通讯录)"].contains(normalized)

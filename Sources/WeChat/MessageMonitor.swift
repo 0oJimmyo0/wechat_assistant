@@ -25,6 +25,9 @@ final class MessageMonitor: ObservableObject {
     private var unidentifiedPolls = 0
     private var candidateContact: String?
     private var candidateContactPolls = 0
+    private var stableVisionIdentity: VisionConversationIdentity?
+    private var candidateVisionIdentity: VisionConversationIdentity?
+    private var titleConsensusCount = 0
     private let unidentifiedPollLimit = 5
     private let accessibilitySwitchConfirmationCount = 2
     private let visionSwitchConfirmationCount = 3
@@ -38,6 +41,7 @@ final class MessageMonitor: ObservableObject {
             "Stable contact state: \(lockedContact == nil ? "unset" : "set")",
             "Candidate contact active: \(candidateContact == nil ? "no" : "yes")",
             "Candidate contact consecutive detections: \(candidateContactPolls)",
+            "Vision title consensus count: \(titleConsensusCount)",
             "Consecutive title misses: \(unidentifiedPolls)"
         ].joined(separator: "\n")
     }
@@ -54,7 +58,10 @@ final class MessageMonitor: ObservableObject {
         messages = []
         contextHistory = []
         lastIDs = []
-        status = "Connected to WeChat · checking conversation"
+        stableVisionIdentity = nil
+        candidateVisionIdentity = nil
+        titleConsensusCount = 0
+        status = "Identifying conversation…"
         generation += 1
         let token = generation
         let bridge = self.bridge
@@ -63,33 +70,23 @@ final class MessageMonitor: ObservableObject {
             var detection = bridge.detectCurrentConversation()
             var contact = detection.contact
             var titleWasUnstable = false
-            if let firstVision = detection.visionSnapshot {
-                guard let firstTitle = contact,
-                      (firstVision.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence else {
-                    contact = nil
-                    titleWasUnstable = true
-                    let finalDetection = detection
-                    Task { @MainActor [weak self] in
-                        guard let self, self.generation == token else { return }
-                        self.isCheckingConversation = false
-                        self.requestScreenCaptureAccessIfNeeded(finalDetection.visionSnapshot?.captureState)
-                        self.status = "Title is uncertain · keep the chat open and activate again"
-                    }
-                    return
+            var consensusCount = 0
+            if detection.visionSnapshot != nil {
+                var captures = [detection]
+                for _ in 1..<3 {
+                    Thread.sleep(forTimeInterval: 0.20)
+                    captures.append(bridge.detectCurrentConversation(forceFreshVision: true))
                 }
-                Thread.sleep(forTimeInterval: 0.25)
-                let confirmation = bridge.detectCurrentConversation(forceFreshVision: true)
-                let confirmed = confirmation.visionSnapshot.map {
-                    ($0.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence &&
-                        confirmation.contact.map {
-                            WeChatParsing.conversationIdentityKey($0) == WeChatParsing.conversationIdentityKey(firstTitle)
-                        } == true
-                } ?? false
-                if confirmed {
-                    detection = confirmation
-                    contact = confirmation.contact
+                let identities = captures.compactMap { $0.visionSnapshot?.titleIdentity }
+                let consensus = identities.count == 3 &&
+                    identities.dropFirst().allSatisfy { identities[0].isSpatiallyConsistent(with: $0) } &&
+                    captures.allSatisfy { ($0.visionSnapshot?.acceptedTitleConfidence ?? 0) >= minimumTitleConfidence }
+                if consensus, let confirmed = captures.last {
+                    detection = confirmed
+                    contact = confirmed.contact
+                    consensusCount = 3
                 } else {
-                    detection = confirmation
+                    detection = captures.last ?? detection
                     contact = nil
                     titleWasUnstable = true
                 }
@@ -100,13 +97,16 @@ final class MessageMonitor: ObservableObject {
                 guard let contact, !contact.isEmpty else {
                     self.requestScreenCaptureAccessIfNeeded(detection.visionSnapshot?.captureState)
                     self.status = titleWasUnstable
-                        ? "Title changed between captures · keep the chat open and activate again"
+                        ? "Identifying conversation… title did not remain stable across captures"
                         : self.detectionFailureStatus(detection)
                     return
                 }
                 self.contactName = contact
                 self.lockedContact = contact
                 self.isUsingVision = detection.visionSnapshot != nil
+                self.stableVisionIdentity = detection.visionSnapshot?.titleIdentity
+                self.candidateVisionIdentity = nil
+                self.titleConsensusCount = consensusCount
                 self.isRunning = true
                 self.status = "Connected · reading recent messages"
             }
@@ -132,6 +132,9 @@ final class MessageMonitor: ObservableObject {
         unidentifiedPolls = 0
         candidateContact = nil
         candidateContactPolls = 0
+        stableVisionIdentity = nil
+        candidateVisionIdentity = nil
+        titleConsensusCount = 0
         timer?.invalidate(); timer = nil
         debounce?.cancel(); debounce = nil
         generation += 1
@@ -153,6 +156,7 @@ final class MessageMonitor: ObservableObject {
         let token = generation
         let bridge = self.bridge
         let lockedContact = self.lockedContact
+        let lockedVisionIdentity = self.stableVisionIdentity
         let minimumTitleConfidence = self.minimumVisionSwitchTitleConfidence
         accessibilityQueue.async { [weak self] in
             let detection = bridge.detectCurrentConversation()
@@ -162,11 +166,16 @@ final class MessageMonitor: ObservableObject {
                     ? detection.contact
                     : nil
             } else {
-                contact = detection.contact
+                contact = lockedVisionIdentity == nil ? detection.contact : nil
             }
             let contactsMatch = contact.map { detected in
                 guard let lockedContact else { return false }
-                return WeChatParsing.conversationIdentityKey(detected) == WeChatParsing.conversationIdentityKey(lockedContact)
+                guard WeChatParsing.conversationIdentityKey(detected) == WeChatParsing.conversationIdentityKey(lockedContact) else { return false }
+                if let lockedVisionIdentity {
+                    guard let newIdentity = detection.visionSnapshot?.titleIdentity else { return false }
+                    return lockedVisionIdentity.isSpatiallyConsistent(with: newIdentity)
+                }
+                return true
             } ?? false
             let result = contactsMatch ? bridge.readMessages(limit: 50) : nil
             Task { @MainActor [weak self] in
@@ -177,6 +186,8 @@ final class MessageMonitor: ObservableObject {
                     self.unidentifiedPolls += 1
                     self.candidateContact = nil
                     self.candidateContactPolls = 0
+                    self.candidateVisionIdentity = nil
+                    self.titleConsensusCount = 0
                     if self.unidentifiedPolls >= self.unidentifiedPollLimit {
                         let failureStatus = self.detectionFailureStatus(detection)
                         self.stop()
@@ -187,16 +198,37 @@ final class MessageMonitor: ObservableObject {
                     return
                 }
 
-                guard let stableContact = self.lockedContact,
-                      self.conversationKey(contact) == self.conversationKey(stableContact) else {
+                let matchesLockedTitle = self.lockedContact.map {
+                    self.conversationKey(contact) == self.conversationKey($0)
+                } ?? false
+                let matchesLockedPosition: Bool
+                if let stableIdentity = self.stableVisionIdentity, detection.visionSnapshot != nil {
+                    matchesLockedPosition = detection.visionSnapshot?.titleIdentity.map {
+                        stableIdentity.isSpatiallyConsistent(with: $0)
+                    } ?? false
+                } else {
+                    matchesLockedPosition = self.stableVisionIdentity == nil
+                }
+                guard matchesLockedTitle && matchesLockedPosition else {
                     let incomingKey = self.conversationKey(contact)
-                    if let candidate = self.candidateContact,
-                       self.conversationKey(candidate) == incomingKey {
+                    let incomingIdentity = detection.visionSnapshot?.titleIdentity
+                    let sameCandidateText = self.candidateContact.map {
+                        self.conversationKey($0) == incomingKey
+                    } ?? false
+                    let sameCandidatePosition: Bool
+                    if let current = self.candidateVisionIdentity, let incomingIdentity {
+                        sameCandidatePosition = current.isSpatiallyConsistent(with: incomingIdentity)
+                    } else {
+                        sameCandidatePosition = self.candidateVisionIdentity == nil && incomingIdentity == nil
+                    }
+                    if sameCandidateText && sameCandidatePosition {
                         self.candidateContactPolls += 1
                     } else {
                         self.candidateContact = contact
                         self.candidateContactPolls = 1
+                        self.candidateVisionIdentity = incomingIdentity
                     }
+                    self.titleConsensusCount = self.candidateContactPolls
                     let requiredCount = detection.visionSnapshot == nil
                         ? self.accessibilitySwitchConfirmationCount
                         : self.visionSwitchConfirmationCount
@@ -211,7 +243,9 @@ final class MessageMonitor: ObservableObject {
                 self.unidentifiedPolls = 0
                 self.candidateContact = nil
                 self.candidateContactPolls = 0
-                self.isUsingVision = detection.visionSnapshot != nil
+                self.candidateVisionIdentity = nil
+                self.titleConsensusCount = self.stableVisionIdentity == nil ? 0 : 3
+                self.isUsingVision = self.isUsingVision || detection.visionSnapshot != nil
                 guard let result else { return }
                 switch result {
                 case .messageListUnavailable(let collapsed, let visionState):
