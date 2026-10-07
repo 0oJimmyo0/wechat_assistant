@@ -66,6 +66,17 @@ enum WeChatParsingTests {
         let displacedTitleA = identity("Alice", x: 0.70)
         expect(consensus(titleA, nil, displacedTitleA) == nil, "all-pairs recovery retains spatial constraints")
 
+        var titleTracker = VisionTitleTracker()
+        expect(titleTracker.resolve(title: "Alice", identity: titleA) == nil,
+               "lower-confidence titles wait for a second observation")
+        expect(titleTracker.resolve(title: "Alice", identity: titleA) == "Alice",
+               "lower-confidence title is accepted after consistent text and geometry")
+        let strongTitle = identity("Bob", confidence: 0.90)
+        expect(titleTracker.resolve(title: "Bob", identity: strongTitle) == "Bob",
+               "strong title confidence and geometry accepts one observation")
+        expect(titleTracker.resolve(title: "Carol", identity: titleC) == nil,
+               "a different lower-confidence title starts a fresh consensus")
+
         let existing = (14...20).map { visionMessage("M\($0)", order: $0 - 14) }
         let olderViewport = (8...14).map { visionMessage("M\($0)", order: $0 - 8) }
         let loadedHistory = ChatHistoryMerger.merge(existing: existing, visible: olderViewport, limit: 100)
@@ -95,9 +106,10 @@ enum WeChatParsingTests {
         print("All WeChat parsing checks passed.")
     }
 
-    private static func identity(_ title: String, x: CGFloat = 0.50) -> VisionConversationIdentity {
+    private static func identity(_ title: String, x: CGFloat = 0.50,
+                                 confidence: Float = 0.70) -> VisionConversationIdentity {
         VisionConversationIdentity(normalizedTitle: title, titleCenterX: x, titleCenterY: 0.08,
-                                   titleWidth: 0.12, confidence: 0.70)
+                                   titleWidth: 0.12, confidence: confidence)
     }
 
     private static func consensus(_ identities: VisionConversationIdentity?...) -> VisionTitlePair? {

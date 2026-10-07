@@ -29,6 +29,36 @@ struct VisionConversationIdentity: Sendable, Equatable {
     }
 }
 
+struct VisionTitleTracker {
+    private(set) var candidate: VisionConversationIdentity?
+    private(set) var matchingObservations = 0
+
+    mutating func resolve(title: String, identity: VisionConversationIdentity,
+                          strongConfidence: Float = 0.82) -> String? {
+        let strongGeometry = identity.titleWidth > 0 && identity.titleWidth <= 0.48 &&
+            (0.0...1.0).contains(identity.titleCenterX) &&
+            (0.0...1.0).contains(identity.titleCenterY)
+        if identity.confidence >= strongConfidence && strongGeometry {
+            reset()
+            return title
+        }
+        if let candidate, candidate.isSpatiallyConsistent(with: identity) {
+            matchingObservations += 1
+        } else {
+            candidate = identity
+            matchingObservations = 1
+        }
+        guard matchingObservations >= 2 else { return nil }
+        reset()
+        return title
+    }
+
+    mutating func reset() {
+        candidate = nil
+        matchingObservations = 0
+    }
+}
+
 struct VisionTitlePair: Sendable {
     let firstIndex: Int
     let secondIndex: Int

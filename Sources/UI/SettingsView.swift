@@ -8,7 +8,7 @@ struct SettingsView: View {
     @ObservedObject private var auth = ChatGPTAuthManager.shared
     @ObservedObject private var monitor = MessageMonitor.shared
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
-    @AppStorage("vision_conversation_left_x") private var conversationLeftX = 0.28
+    @AppStorage("vision_conversation_left_x") private var messagePaneLeftX = 0.28
     @AppStorage("vision_header_bottom_y") private var headerBottomY = 0.90
     @AppStorage("vision_composer_top_y") private var composerTopY = 0.18
     @State private var isInspectingWeChat = false
@@ -52,7 +52,7 @@ struct SettingsView: View {
             Section("Developer diagnostics") {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Vision layout calibration").font(.subheadline)
-                    calibrationSlider("Conversation pane starts", value: $conversationLeftX, range: 0.15...0.60)
+                    calibrationSlider("Message pane starts", value: $messagePaneLeftX, range: 0.15...0.60)
                     calibrationSlider("Header bottom", value: $headerBottomY, range: 0.65...0.96)
                     calibrationSlider("Composer top", value: $composerTopY, range: 0.05...min(0.35, headerBottomY - 0.04))
                     Text("Ratios use normalized image coordinates from the bottom left. Adjust, then save an annotated preview to inspect the regions. Calibration stays on this Mac; screenshots are saved only when you choose a destination.")

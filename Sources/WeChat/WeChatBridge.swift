@@ -19,10 +19,20 @@ struct WeChatSnapshot: Sendable {
     let visionIdentity: VisionConversationIdentity?
     let messageFingerprint: String?
     let headerFingerprint: String?
-    let conversationLeftX: CGFloat?
+    let messagePaneLeftX: CGFloat?
     let messagesUnchanged: Bool
     let headerUnchanged: Bool
     let captureTimingDiagnostic: String
+}
+
+/// A local observation that can be retained while conversation identity is
+/// still being resolved. Callers must not send it to automatic analysis.
+struct PendingConversationObservation: Sendable {
+    let messages: [ObservedMessage]
+    let messageRowCount: Int
+    let messageSource: ConversationCaptureSource
+    let visionIdentity: VisionConversationIdentity?
+    let headerFingerprint: String?
 }
 
 enum ConversationCaptureFailure: Sendable {
@@ -53,6 +63,7 @@ enum ConversationCaptureFailure: Sendable {
 
 enum ConversationCaptureResult: Sendable {
     case success(WeChatSnapshot)
+    case identityPending(PendingConversationObservation)
     case failure(ConversationCaptureFailure)
 }
 
@@ -129,6 +140,8 @@ final class WeChatBridge: @unchecked Sendable {
     private var activeCapturePlan: ConversationCapturePlan?
     private var activePlanPID: pid_t?
     private var activePlanWindow: AXUIElement?
+    private var activePlanWindowFrame: CGRect?
+    private var visionTitleTracker = VisionTitleTracker()
 
     private struct AXSessionElement {
         let identifier: String
@@ -175,6 +188,8 @@ final class WeChatBridge: @unchecked Sendable {
             activeCapturePlan = nil
             activePlanPID = nil
             activePlanWindow = nil
+            activePlanWindowFrame = nil
+            visionTitleTracker.reset()
             backendLock.broadcast()
             backendLock.unlock()
         }
@@ -322,6 +337,8 @@ final class WeChatBridge: @unchecked Sendable {
             activeCapturePlan = nil
             activePlanPID = nil
             activePlanWindow = nil
+            activePlanWindowFrame = nil
+            visionTitleTracker.reset()
             if backendPID != pid || capabilityProbeWindow.map({ !CFEqual($0, window) }) == true {
                 cachedCapabilityProbe = nil
                 readerBackend = .unknown
@@ -522,16 +539,61 @@ final class WeChatBridge: @unchecked Sendable {
 
     private func cachedPlan(for pid: pid_t, window: AXUIElement) -> ConversationCapturePlan? {
         backendLock.lock()
-        defer { backendLock.unlock() }
-        guard activePlanPID == pid, let activePlanWindow, CFEqual(activePlanWindow, window) else { return nil }
-        return activeCapturePlan
+        let matches = activePlanPID == pid && activePlanWindow.map { CFEqual($0, window) } == true
+        let plan = matches ? activeCapturePlan : nil
+        let storedFrame = matches ? activePlanWindowFrame : nil
+        backendLock.unlock()
+        guard let plan else { return nil }
+        let currentFrame = frame(window, timeout: 0.08)
+        let driftLimit = max(140, (storedFrame?.width ?? currentFrame.width) * 0.12)
+        let drift = storedFrame.map {
+            abs($0.minX - currentFrame.minX) + abs($0.minY - currentFrame.minY) +
+                abs($0.width - currentFrame.width) + abs($0.height - currentFrame.height)
+        }
+        guard drift.map({ $0 <= driftLimit }) ?? true else {
+            beginConversationSession()
+            return nil
+        }
+        return plan
     }
 
     private func cacheActivePlan(_ plan: ConversationCapturePlan, pid: pid_t, window: AXUIElement) {
+        let windowFrame = frame(window, timeout: 0.08)
         backendLock.lock()
+        let sameSessionWindow = activePlanPID == pid && activePlanWindow.map { CFEqual($0, window) } == true
         activeCapturePlan = plan
         activePlanPID = pid
         activePlanWindow = window
+        if !sameSessionWindow || activePlanWindowFrame == nil {
+            activePlanWindowFrame = windowFrame
+        }
+        backendLock.unlock()
+    }
+
+    /// Capture-source choices are scoped to one explicit monitoring session.
+    /// Keep the general AX capability probe, but never carry a selected source
+    /// plan into a later activation.
+    func beginConversationSession() {
+        backendLock.lock()
+        activeCapturePlan = nil
+        activePlanPID = nil
+        activePlanWindow = nil
+        activePlanWindowFrame = nil
+        visionTitleTracker.reset()
+        backendLock.unlock()
+    }
+
+    func endConversationSession() { beginConversationSession() }
+
+    private func resolveVisionTitle(_ title: String, identity: VisionConversationIdentity) -> String? {
+        backendLock.lock()
+        defer { backendLock.unlock() }
+        return visionTitleTracker.resolve(title: title, identity: identity)
+    }
+
+    private func resetPendingVisionTitle() {
+        backendLock.lock()
+        visionTitleTracker.reset()
         backendLock.unlock()
     }
 
@@ -555,6 +617,8 @@ final class WeChatBridge: @unchecked Sendable {
         activeCapturePlan = nil
         activePlanPID = nil
         activePlanWindow = nil
+        activePlanWindowFrame = nil
+        visionTitleTracker.reset()
         backendLock.broadcast()
         backendLock.unlock()
     }
@@ -572,7 +636,7 @@ final class WeChatBridge: @unchecked Sendable {
                                     previousMessageFingerprint: String? = nil,
                                     lockedContact: String? = nil,
                                     initialActivation: Bool = false,
-                                    conversationLeftX: CGFloat? = nil) -> ConversationCaptureResult {
+                                    messagePaneLeftX: CGFloat? = nil) -> ConversationCaptureResult {
         let totalStarted = Date()
         guard let window = mainWindow(), let app = weChatApplication() else {
             updateCaptureDiagnostic(plan: nil, hasAXIdentity: false, hasAXMessages: false,
@@ -668,8 +732,6 @@ final class WeChatBridge: @unchecked Sendable {
         var contact = axContact
         var visionIdentity: VisionConversationIdentity?
         var visionObservation: VisibleWeChatSnapshot?
-        var titleRetrySucceeded = false
-        var titleRetryMilliseconds = 0
         if usesVision {
             let observation = WeChatScreenReader.shared.readConversationObservation(
                 pid: app.processIdentifier,
@@ -680,7 +742,7 @@ final class WeChatBridge: @unchecked Sendable {
                 accurateMessages: accurateVision,
                 previousHeaderFingerprint: previousHeaderFingerprint,
                 previousMessageFingerprint: previousMessageFingerprint,
-                conversationLeftX: conversationLeftX,
+                messagePaneLeftX: messagePaneLeftX,
                 allowWideMessageCropFallback: initialActivation
             )
             guard observation.captureSucceeded else {
@@ -689,8 +751,8 @@ final class WeChatBridge: @unchecked Sendable {
                                         timing: axProbeDiagnostic(fastProbe, resolvedProbe: probe,
                                                                   fallbackAttempted: fallbackAttempted,
                                                                   fallbackMilliseconds: fallbackMilliseconds) + "\n" +
-                                            visionTimingDiagnostic(observation, titleFound: false,
-                                                                   retryMilliseconds: 0))
+                                            visionTimingDiagnostic(observation, titleFound: false)
+                )
                 return .failure(.visionCaptureFailed)
             }
             visionObservation = observation
@@ -698,35 +760,16 @@ final class WeChatBridge: @unchecked Sendable {
                 if observation.headerFrameUnchanged, let lockedContact {
                     contact = lockedContact
                 } else {
-                    contact = observation.title
+                    if let identity = observation.titleIdentity, let title = observation.title {
+                        contact = resolveVisionTitle(title, identity: identity)
+                    } else {
+                        contact = nil
+                        resetPendingVisionTitle()
+                    }
                 }
                 visionIdentity = observation.titleIdentity
-                if contact == nil, initialActivation {
-                    let retryStarted = Date()
-                    let retry = retryVisionTitle(pid: app.processIdentifier,
-                                                 windowFrame: frame(window, timeout: 0.08))
-                    titleRetryMilliseconds = Int(Date().timeIntervalSince(retryStarted) * 1000)
-                    contact = retry?.title
-                    visionIdentity = retry?.titleIdentity
-                    titleRetrySucceeded = retry != nil
-                }
             }
         }
-        guard let contact, !contact.isEmpty else {
-            updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
-                                    failure: capturePlan.identity == .vision
-                                        ? "Vision conversation title unavailable"
-                                        : "AX conversation identity unavailable", hasAXTitle: axIdentity.hasTitle,
-                                    timing: axProbeDiagnostic(fastProbe, resolvedProbe: probe,
-                                                              fallbackAttempted: fallbackAttempted,
-                                                              fallbackMilliseconds: fallbackMilliseconds) +
-                                        (visionObservation.map {
-                                            "\n" + visionTimingDiagnostic($0, titleFound: false,
-                                                                          retryMilliseconds: titleRetryMilliseconds)
-                                        } ?? ""))
-            return .failure(.identityUnavailable)
-        }
-
         let messages: [ChatMessage]
         let rowCount: Int
         let messagesUnchanged: Bool
@@ -740,6 +783,27 @@ final class WeChatBridge: @unchecked Sendable {
             messagesUnchanged = visionObservation?.messageFrameUnchanged ?? false
         }
 
+        guard let contact, !contact.isEmpty else {
+            updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
+                                    failure: capturePlan.identity == .vision
+                                        ? "Vision conversation title unavailable"
+                                        : "AX conversation identity unavailable", hasAXTitle: axIdentity.hasTitle,
+                                    timing: axProbeDiagnostic(fastProbe, resolvedProbe: probe,
+                                                              fallbackAttempted: fallbackAttempted,
+                                                              fallbackMilliseconds: fallbackMilliseconds) +
+                                        (visionObservation.map {
+                                            "\n" + visionTimingDiagnostic($0, titleFound: false)
+                                        } ?? ""))
+            if !messages.isEmpty {
+                return .identityPending(PendingConversationObservation(
+                    messages: messages, messageRowCount: rowCount, messageSource: capturePlan.messages,
+                    visionIdentity: visionIdentity,
+                    headerFingerprint: visionObservation?.headerFingerprint
+                ))
+            }
+            return .failure(.identityUnavailable)
+        }
+
         let totalMilliseconds = Int(Date().timeIntervalSince(totalStarted) * 1000)
         let timing = [
             "Capture total: \(totalMilliseconds) ms",
@@ -750,8 +814,7 @@ final class WeChatBridge: @unchecked Sendable {
             "AX message read: \(axMessageReadMilliseconds) ms",
             "Capture plan: \(capturePlan.identity.rawValue) / \(capturePlan.messages.rawValue)",
             visionObservation.map {
-                visionTimingDiagnostic($0, titleFound: $0.title != nil || titleRetrySucceeded,
-                                       retryMilliseconds: titleRetryMilliseconds)
+                visionTimingDiagnostic($0, titleFound: $0.title != nil)
             } ?? "Vision: not used"
         ].joined(separator: "\n")
         updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil,
@@ -763,29 +826,10 @@ final class WeChatBridge: @unchecked Sendable {
                               messageSource: capturePlan.messages, visionIdentity: visionIdentity,
                               messageFingerprint: visionObservation?.messageFingerprint,
                               headerFingerprint: visionObservation?.headerFingerprint,
-                              conversationLeftX: visionObservation?.conversationLeftX,
+                              messagePaneLeftX: visionObservation?.messagePaneLeftX,
                               messagesUnchanged: messagesUnchanged,
                               headerUnchanged: visionObservation?.headerFrameUnchanged ?? false,
                               captureTimingDiagnostic: timing))
-    }
-
-    private func retryVisionTitle(pid: pid_t, windowFrame: CGRect) -> VisibleWeChatSnapshot? {
-        var first: VisibleWeChatSnapshot?
-        for attempt in 0..<2 {
-            if attempt > 0 { Thread.sleep(forTimeInterval: 0.12) }
-            let observation = WeChatScreenReader.shared.readTitleIdentity(pid: pid, windowFrame: windowFrame,
-                                                                          forceFresh: true)
-            guard observation.captureSucceeded, let title = observation.title,
-                  let identity = observation.titleIdentity else { continue }
-            if let first, let firstTitle = first.title,
-               WeChatParsing.conversationIdentityKey(firstTitle) == WeChatParsing.conversationIdentityKey(title),
-               let firstIdentity = first.titleIdentity,
-               firstIdentity.isSpatiallyConsistent(with: identity) {
-                return observation
-            }
-            first = observation
-        }
-        return nil
     }
 
     private func axProbeDiagnostic(_ fastProbe: AXCapabilityProbe?, resolvedProbe: AXCapabilityProbe?, fallbackAttempted: Bool,
@@ -794,13 +838,20 @@ final class WeChatBridge: @unchecked Sendable {
         "AX fallback: attempted \(fallbackAttempted ? "yes" : "no"), identity \(resolvedProbe?.hasAXIdentity == true ? "found" : "missing"), list \(resolvedProbe?.hasAXMessageList == true ? "found" : "missing"), duration \(fallbackMilliseconds) ms"
     }
 
-    private func visionTimingDiagnostic(_ observation: VisibleWeChatSnapshot, titleFound: Bool,
-                                        retryMilliseconds: Int) -> String {
-        "Vision: window capture \(observation.captureSucceeded ? "success" : "failed") " +
+    private func visionTimingDiagnostic(_ observation: VisibleWeChatSnapshot, titleFound: Bool) -> String {
+        let calibration = VisionLayoutCalibration.current
+        let titleROI = CGRect(x: 0.005, y: calibration.headerBottomY,
+                              width: 0.99, height: 1 - calibration.headerBottomY)
+        return "Vision: window capture \(observation.captureSucceeded ? "success" : "failed") " +
         "(discovery \(observation.windowDiscoveryDurationMilliseconds) ms, screenshot \(observation.captureDurationMilliseconds) ms), " +
         "title OCR \(observation.headerOCRDurationMilliseconds) ms, message OCR \(observation.messageOCRDurationMilliseconds) ms, " +
         "title found \(titleFound ? "yes" : "no"), visible messages \(observation.messages.count)\n" +
-        "Message crop: x=\(String(format: "%.3f", observation.conversationLeftX)), " +
+        "Identity: title ROI full-window \(String(format: "%.3f,%.3f,%.3f,%.3f", titleROI.minX, titleROI.minY, titleROI.width, titleROI.height)), " +
+        "observations \(observation.headerObservationCount), candidates \(observation.headerCandidates.count), " +
+        "selected \(observation.titleIdentity == nil ? "no" : "yes"), " +
+        "confidence \(observation.acceptedTitleConfidence.map { String(format: "%.3f", $0) } ?? "unavailable"), " +
+        "header fingerprint \(observation.headerFingerprint == nil ? "unavailable" : (observation.headerFrameUnchanged ? "unchanged" : "changed"))\n" +
+        "Messages: pane left x=\(String(format: "%.3f", observation.messagePaneLeftX)), " +
         "width=\(String(format: "%.3f", observation.conversationCrop.width)), " +
         "region=\(String(format: "%.3f,%.3f,%.3f,%.3f", observation.messageCrop.minX, observation.messageCrop.minY, observation.messageCrop.width, observation.messageCrop.height))\n" +
         "OCR level: \(observation.messageRecognitionLevel), fast observations: \(observation.fastOCRObservationCount), " +
@@ -814,7 +865,7 @@ final class WeChatBridge: @unchecked Sendable {
         "observations \(observation.wideCropObservationCount), " +
         "succeeded \(observation.wideCropFallbackSucceeded ? "yes" : "no")\n" +
         "Message fingerprint: \(observation.messageFingerprint == nil ? "unavailable" : (observation.messageFrameUnchanged ? "unchanged" : "changed")), " +
-        "title-only retry \(retryMilliseconds) ms"
+        "additional title screenshot retries: none; next watchdog observation retries if needed"
     }
 
     var conversationCaptureDiagnostic: String {
@@ -906,7 +957,7 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     func detectCurrentConversation(forceFreshVision: Bool = false,
-                                  conversationLeftX: CGFloat? = nil,
+                                  messagePaneLeftX: CGFloat? = nil,
                                   onStage: ((String) -> Void)? = nil) -> WeChatConversationDetection {
         onStage?("Finding WeChat window…")
         let windowStarted = Date()
@@ -938,7 +989,7 @@ final class WeChatBridge: @unchecked Sendable {
                                               capabilityProbeMilliseconds: backendInfo.probeMilliseconds)
         }
         let snapshot = visibleTitleIdentity(for: window, forceFresh: forceFreshVision,
-                                            conversationLeftX: conversationLeftX)
+                                            messagePaneLeftX: messagePaneLeftX)
         return WeChatConversationDetection(
             contact: snapshot?.title,
             windowFound: true,
@@ -1003,11 +1054,11 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
-        conversationLeftX: CGFloat? = nil,
+        messagePaneLeftX: CGFloat? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
-                                               conversationLeftX: conversationLeftX,
+                                               messagePaneLeftX: messagePaneLeftX,
                                                cancellation: cancellation, direction: .older)
     }
 
@@ -1045,7 +1096,7 @@ final class WeChatBridge: @unchecked Sendable {
         let calibration = VisionLayoutCalibration.current
         let yRatioFromTop = 1 - ((calibration.composerTopY + calibration.headerBottomY) * 0.5)
         let location = CGPoint(
-            x: windowFrame.minX + windowFrame.width * (calibration.conversationLeftX + (1 - calibration.conversationLeftX) * 0.5),
+            x: windowFrame.minX + windowFrame.width * (calibration.messagePaneLeftX + (1 - calibration.messagePaneLeftX) * 0.5),
             y: windowFrame.minY + windowFrame.height * yRatioFromTop
         )
         guard windowFrame.insetBy(dx: 8, dy: 8).contains(location) else { return .scrollUnavailable }
@@ -1062,11 +1113,11 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
-        conversationLeftX: CGFloat? = nil,
+        messagePaneLeftX: CGFloat? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextScrollResult {
         scrollMessagePaneIfConversationMatches(contact: contact, identity: identity, fraction: fraction,
-                                               conversationLeftX: conversationLeftX,
+                                               messagePaneLeftX: messagePaneLeftX,
                                                cancellation: cancellation, direction: .newer)
     }
 
@@ -1074,13 +1125,13 @@ final class WeChatBridge: @unchecked Sendable {
         contact: String,
         identity: VisionConversationIdentity?,
         fraction: CGFloat,
-        conversationLeftX: CGFloat?,
+        messagePaneLeftX: CGFloat?,
         cancellation: MonitorWorkCancellation?,
         direction: ChatScrollDirection
     ) -> OlderContextScrollResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
         let detection = detectCurrentConversation(forceFreshVision: true,
-                                                  conversationLeftX: conversationLeftX)
+                                                  messagePaneLeftX: messagePaneLeftX)
         switch olderContextIdentityCheck(detection, contact: contact, identity: identity) {
         case .changed: return .conversationChanged
         case .uncertain: return .identityUncertain
@@ -1093,7 +1144,7 @@ final class WeChatBridge: @unchecked Sendable {
         let calibration = VisionLayoutCalibration.current
         let canvasHeight = calibration.headerBottomY - calibration.composerTopY
         guard canvasHeight > 0.1 else { return .scrollUnavailable }
-        let xRatio = calibration.conversationLeftX + (1 - calibration.conversationLeftX) * 0.5
+        let xRatio = calibration.messagePaneLeftX + (1 - calibration.messagePaneLeftX) * 0.5
         let yRatioFromTop = 1 - ((calibration.composerTopY + calibration.headerBottomY) * 0.5)
         let location = CGPoint(
             x: windowFrame.minX + windowFrame.width * xRatio,
@@ -1119,7 +1170,7 @@ final class WeChatBridge: @unchecked Sendable {
         forceFresh: Bool = true,
         previousHeaderFingerprint: String? = nil,
         previousMessageFingerprint: String? = nil,
-        conversationLeftX: CGFloat? = nil,
+        messagePaneLeftX: CGFloat? = nil,
         cancellation: MonitorWorkCancellation?
     ) -> OlderContextReadResult {
         guard cancellation?.isCancelled != true else { return .cancelled }
@@ -1128,10 +1179,11 @@ final class WeChatBridge: @unchecked Sendable {
                                                   previousHeaderFingerprint: previousHeaderFingerprint,
                                                   previousMessageFingerprint: previousMessageFingerprint,
                                                   lockedContact: contact,
-                                                  conversationLeftX: conversationLeftX)
+                                                  messagePaneLeftX: messagePaneLeftX)
         let snapshot: WeChatSnapshot
         switch capture {
         case .success(let value): snapshot = value
+        case .identityPending: return cancellation?.isCancelled == true ? .cancelled : .identityUncertain
         case .failure: return cancellation?.isCancelled == true ? .cancelled : .captureUnavailable
         }
         guard WeChatParsing.conversationIdentityKey(snapshot.contact) ==
@@ -1191,11 +1243,11 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func visibleTitleIdentity(for window: AXUIElement, forceFresh: Bool = false,
-                                      conversationLeftX: CGFloat? = nil) -> VisibleWeChatSnapshot? {
+                                      messagePaneLeftX: CGFloat? = nil) -> VisibleWeChatSnapshot? {
         guard let app = weChatApplication() else { return nil }
         return WeChatScreenReader.shared.readTitleIdentity(
             pid: app.processIdentifier, windowFrame: frame(window, timeout: 0.08), forceFresh: forceFresh,
-            conversationLeftX: conversationLeftX
+            messagePaneLeftX: messagePaneLeftX
         )
     }
 

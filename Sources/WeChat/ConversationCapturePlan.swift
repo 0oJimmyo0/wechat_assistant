@@ -1,4 +1,47 @@
 import Foundation
+import CoreGraphics
+
+/// Normalized rectangles are always relative to the complete WeChat window.
+/// Title and message pane geometry are intentionally independent.
+enum VisionLayoutRegions {
+    static func titleSearch(bottomY: CGFloat) -> CGRect {
+        CGRect(x: 0.005, y: bottomY, width: 0.99, height: 1 - bottomY)
+    }
+
+    static func messagePane(leftX: CGFloat, verticalRegion: CGRect) -> CGRect {
+        let paneLeft = min(0.60, max(0.01, leftX))
+        let availableWidth = 1 - paneLeft
+        let x = paneLeft + verticalRegion.minX * availableWidth
+        let width = verticalRegion.width * availableWidth
+        return CGRect(x: x, y: verticalRegion.minY, width: width, height: verticalRegion.height)
+    }
+
+    static func windowBounds(_ localBounds: CGRect, in region: CGRect) -> CGRect {
+        CGRect(x: region.minX + localBounds.minX * region.width,
+               y: region.minY + localBounds.minY * region.height,
+               width: localBounds.width * region.width,
+               height: localBounds.height * region.height)
+    }
+}
+
+enum ConversationAcquisitionState: String {
+    case inactive
+    case identifying
+    case identityConfirmed
+    case messagesPending
+    case ready
+    case temporarilyUnavailable
+    case conversationChanged
+
+    static func resolve(identityConfirmed: Bool, hasMessages: Bool) -> ConversationAcquisitionState {
+        if identityConfirmed && hasMessages { return .ready }
+        if identityConfirmed { return .identityConfirmed }
+        if hasMessages { return .messagesPending }
+        return .identifying
+    }
+
+    var permitsAutomaticAnalysis: Bool { self == .ready }
+}
 
 enum ConversationCaptureSource: String, Sendable {
     case accessibility = "AX"
