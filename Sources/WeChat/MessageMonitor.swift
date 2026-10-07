@@ -16,6 +16,9 @@ final class MessageMonitor: ObservableObject {
     private var timer: Timer?
     private var debounce: Task<Void, Never>?
     private var lastIDs: [String] = []
+    // Session-only bounded fingerprints prevent scroll-back from looking like incoming text.
+    private var seenHashes: Set<Int> = []
+    private var seenHashOrder: [Int] = []
     private var lockedContact: String?
     private var generation = 0
     private var burstGeneration = 0
@@ -49,6 +52,7 @@ final class MessageMonitor: ObservableObject {
                 self.messages = snapshot.messages
                 self.lockedContact = contact
                 self.lastIDs = snapshot.messages.map(\.id)
+                self.rememberSeen(self.lastIDs)
                 self.isRunning = true
                 self.status = self.captureStatus(snapshot)
                 self.timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -70,6 +74,8 @@ final class MessageMonitor: ObservableObject {
         burstGeneration += 1
         messages = []
         lastIDs = []
+        seenHashes.removeAll()
+        seenHashOrder.removeAll()
         contactName = nil
         lockedContact = nil
         status = "Paused"
@@ -122,7 +128,9 @@ final class MessageMonitor: ObservableObject {
         messages = snapshot.messages
         let ids = snapshot.messages.map(\.id)
         guard ids != lastIDs else { return }
-        let added = newMessages(snapshot.messages, old: lastIDs)
+        let candidates = newMessages(snapshot.messages, old: lastIDs)
+        let added = candidates.filter { !seenHashes.contains($0.id.hashValue) }
+        rememberSeen(ids)
         lastIDs = ids
 
         // An unanchored view change (including scrolling to earlier history)
@@ -150,6 +158,18 @@ final class MessageMonitor: ObservableObject {
         }
         // No overlap is ambiguous: scroll/recycling/failed reads vs truly new.
         return []
+    }
+
+    private func rememberSeen(_ ids: [String]) {
+        for id in ids {
+            let hash = id.hashValue
+            if seenHashes.insert(hash).inserted { seenHashOrder.append(hash) }
+        }
+        if seenHashOrder.count > 400 {
+            let excess = seenHashOrder.count - 400
+            for hash in seenHashOrder.prefix(excess) { seenHashes.remove(hash) }
+            seenHashOrder.removeFirst(excess)
+        }
     }
 
     private func scheduleBurst(contact: String, canAutoAnalyze: Bool) {
