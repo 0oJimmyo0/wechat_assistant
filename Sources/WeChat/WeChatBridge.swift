@@ -6,9 +6,31 @@ final class WeChatBridge: @unchecked Sendable {
     static let shared = WeChatBridge()
 
     var hasAccessibilityPermission: Bool { AXIsProcessTrusted() }
-    var isWeChatRunning: Bool {
-        NSWorkspace.shared.runningApplications.contains { $0.localizedName?.contains("WeChat") == true }
+
+    private let officialWeChatBundleID = "com.tencent.xinWeChat"
+
+    /// Resolve the real WeChat process by bundle identifier, never by a fuzzy
+    /// application-name match. The helper itself is named "WeChat Reply Copilot",
+    /// so matching `localizedName.contains("WeChat")` can accidentally bind the
+    /// Accessibility bridge to this app instead of WeChat.
+    private func weChatApplication() -> NSRunningApplication? {
+        let apps = NSWorkspace.shared.runningApplications
+
+        // Prefer the official WeChat bundle exactly.
+        if let official = apps.first(where: { $0.bundleIdentifier == officialWeChatBundleID }) {
+            return official
+        }
+
+        // Conservative fallback for locally cloned WeChat builds whose bundle ID
+        // keeps Tencent's prefix. Explicitly exclude this helper's own process.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        return apps.first {
+            $0.processIdentifier != ownPID &&
+            ($0.bundleIdentifier?.hasPrefix(officialWeChatBundleID) == true)
+        }
     }
+
+    var isWeChatRunning: Bool { weChatApplication() != nil }
 
     func requestAccessibilityPermission() {
         let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
@@ -16,7 +38,7 @@ final class WeChatBridge: @unchecked Sendable {
     }
 
     private func applicationElement() -> AXUIElement? {
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName?.contains("WeChat") == true }) else { return nil }
+        guard let app = weChatApplication() else { return nil }
         return AXUIElementCreateApplication(app.processIdentifier)
     }
 
