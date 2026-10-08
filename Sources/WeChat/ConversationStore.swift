@@ -77,6 +77,16 @@ final class ConversationStore {
                 return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
             }
             let arrivalConfirmed = reliableOverlap
+            // Keep existing occurrence IDs while enriching a matching row with
+            // a separator that only became visible on a later capture.
+            let existingStart = messages.count - overlap.length
+            for offset in 0..<overlap.length {
+                let index = existingStart + offset
+                if messages[index].timeSeparatorBefore == nil,
+                   let label = snapshot[overlap.observedStart + offset].timeSeparatorBefore {
+                    messages[index] = messages[index].withTimeSeparator(label)
+                }
+            }
             let merged = messages + appended
             messages = Array(merged.suffix(maximumMessages))
             return ConversationMergeResult(appended: appended, prepended: [],
@@ -87,6 +97,13 @@ final class ConversationStore {
         // identifies a historical viewport. Only its unanchored older prefix
         // is inserted; rows after an internal match never count as live.
         if let overlap = historical {
+            for offset in 0..<overlap.length {
+                let index = overlap.existingStart + offset
+                if messages[index].timeSeparatorBefore == nil,
+                   let label = snapshot[overlap.observedStart + offset].timeSeparatorBefore {
+                    messages[index] = messages[index].withTimeSeparator(label)
+                }
+            }
             let prefix = Array(snapshot.prefix(overlap.observedStart))
             let merged: [ChatMessage]
             if prefix.isEmpty {
