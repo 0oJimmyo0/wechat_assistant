@@ -13,6 +13,8 @@ struct ReplySidebarView: View {
     @State private var generationID: UUID?
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
+    @State private var displayedMessageLimit = 5
+    private let manualAnalysisContextLimit = 20
 
     var body: some View {
         VStack(spacing: 0) {
@@ -49,13 +51,13 @@ struct ReplySidebarView: View {
                          ? "Clearly identified incoming messages may be sent to OpenAI after the conversation pauses."
                          : "Messages stay on this Mac until you choose Analyze.")
                         .font(.caption2).foregroundStyle(.secondary)
-                    Button { generate(context: monitor.messages, model: auth.everydayModel) } label: {
+                    Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.everydayModel) } label: {
                         Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
-                    Button { generate(context: monitor.messages, model: auth.carefulModel) } label: {
+                    }.buttonStyle(.borderedProminent).disabled(isGenerating || monitor.isLoadingOlderContext || monitor.isSyncing || !monitor.canAnalyzeManually || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
+                    Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.carefulModel) } label: {
                         Label("Regenerate carefully", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
-                    }.buttonStyle(.bordered).disabled(isGenerating || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
+                    }.buttonStyle(.bordered).disabled(isGenerating || monitor.isLoadingOlderContext || monitor.isSyncing || !monitor.canAnalyzeManually || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
                 }
                 .padding(16)
             }
@@ -117,7 +119,7 @@ struct ReplySidebarView: View {
                 Text(monitor.status)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
@@ -127,8 +129,71 @@ struct ReplySidebarView: View {
     }
 
     private var recentMessagesSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("RECENT MESSAGES · LAST 5")
+        let visibleMessages = Array(monitor.messages.suffix(displayedMessageLimit))
+        return VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("RECENT MESSAGES · SHOWING \(visibleMessages.count) OF \(monitor.messages.count)")
+            Text(monitor.messages.count < 20
+                 ? "Context: \(monitor.messages.count) / 20 loaded · model receives up to 20"
+                 : "Context: 20 / 20 loaded · \(monitor.messages.count) stored; model receives latest 20")
+                .font(.caption2).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button {
+                    monitor.refresh()
+                } label: {
+                    Label(monitor.isSyncing ? "Refreshing…" : "Refresh",
+                          systemImage: monitor.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!monitor.canSyncNow)
+
+                if monitor.isRunning && monitor.viewportState != .liveTail {
+                    Button {
+                        monitor.followLatest()
+                    } label: {
+                        Label(monitor.isReturningToLatest ? "Returning…" : "Follow latest",
+                              systemImage: "arrow.down.to.line")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(monitor.isLoadingOlderContext || monitor.isFollowingLatest || monitor.isSyncing)
+                }
+                Spacer(minLength: 0)
+            }
+            Text(monitor.captureDetails.summary).font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(monitor.captureDuration).font(.caption2).foregroundStyle(.secondary)
+            if monitor.captureDetails.candidateCount > monitor.captureDetails.acceptedCount {
+                Text("Unverified observations are excluded from stored messages and analysis.")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+            if monitor.messages.count > 5 {
+                Button(displayedMessageLimit == 5 ? "Show latest 20" : "Show latest 5") {
+                    displayedMessageLimit = displayedMessageLimit == 5 ? 20 : 5
+                }.buttonStyle(.plain).font(.caption)
+            }
+            if monitor.isRunning && monitor.messages.count < 20 && monitor.canLoadOlderContext &&
+                monitor.conversationIdentityState == .confirmed && monitor.acquisitionState == .ready {
+                Button {
+                    monitor.loadOlderContext()
+                } label: {
+                    Label(monitor.isLoadingOlderContext ? "Loading…" : "Load older to 20",
+                          systemImage: monitor.isLoadingOlderContext ? "hourglass" : "arrow.up.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(monitor.isLoadingOlderContext || monitor.isSyncing)
+            }
+            if monitor.isLoadingOlderContext {
+                Text(monitor.isReturningToLatest
+                     ? "Returning to latest messages…"
+                     : "Loading older context… \(monitor.olderContextProgress ?? "0 / 20")")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if let olderContextStatus = monitor.olderContextStatus {
+                Text(olderContextStatus)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if monitor.messages.isEmpty {
                 Text("No chat message text is available from this WeChat view yet.")
                     .font(.callout)
@@ -138,8 +203,8 @@ struct ReplySidebarView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             } else {
-                ForEach(Array(monitor.messages.suffix(5).enumerated()), id: \.offset) { item in
-                    recentMessageRow(item.element)
+                ForEach(visibleMessages) { message in
+                    recentMessageRow(message)
                 }
             }
         }
@@ -147,7 +212,7 @@ struct ReplySidebarView: View {
 
     private func recentMessageRow(_ message: ChatMessage) -> some View {
         let isMe = message.senderIdentified && message.isFromMe
-        let sender = isMe ? "You" : (message.senderIdentified ? (monitor.contactName ?? "Contact") : "Sender unclear")
+        let sender = isMe ? "Self" : (message.senderIdentified ? "Target · \(monitor.contactName ?? "Contact")" : "Sender unclear")
         return HStack {
             if isMe { Spacer(minLength: 36) }
             VStack(alignment: isMe ? .trailing : .leading, spacing: 3) {
@@ -211,7 +276,7 @@ struct ReplySidebarView: View {
     }
 
     private func generate(context: [ChatMessage], model: String) {
-        guard auth.isSignedIn, !isGenerating else { return }
+        guard auth.isSignedIn, !isGenerating, !monitor.isLoadingOlderContext, !monitor.isSyncing, monitor.canAnalyzeManually else { return }
         guard !model.isEmpty else { errorMessage = "Choose an available model in settings."; return }
         let requestID = UUID()
         generationID = requestID

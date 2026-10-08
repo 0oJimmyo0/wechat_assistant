@@ -4,7 +4,7 @@ final class SuggestionEngine {
     static let shared = SuggestionEngine()
 
     func generate(context: [ChatMessage], profile: RelationshipProfile, instruction: String, model: String) async throws -> ReplySuggestion {
-        let text = context.suffix(20).map { message in
+        let text = context.suffix(100).map { message in
             let speaker = message.senderIdentified ? (message.isFromMe ? "我" : "对方") : "说话方不确定"
             return "\(speaker)：\(message.text)"
         }.joined(separator: "\n")

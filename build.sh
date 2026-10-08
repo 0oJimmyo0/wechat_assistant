@@ -50,6 +50,8 @@ swiftc \
     -framework AppKit \
     -framework Carbon \
     -framework ApplicationServices \
+    -framework Vision \
+    -framework ScreenCaptureKit \
     -framework Combine \
     -framework Network \
     -framework Security \
@@ -79,6 +81,7 @@ echo ""
 SIGNING_IDENTITIES="$(security find-identity -p codesigning 2>/dev/null || true)"
 if [[ "$SIGNING_IDENTITIES" == *"$SIGNING_IDENTITY"* ]]; then
     echo "Signing with stable identity: $SIGNING_IDENTITY"
+    echo "If macOS asks to access this signing key, choose 'Always Allow' once to avoid future prompts."
     codesign --force --deep --timestamp=none --sign "$SIGNING_IDENTITY" "$BUILD_DIR/$APP_NAME.app"
 else
     echo "Stable identity '$SIGNING_IDENTITY' not found; using ad-hoc signing."
