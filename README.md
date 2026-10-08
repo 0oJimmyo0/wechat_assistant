@@ -104,6 +104,17 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 - This feature does not persist chat text or inferred time metadata to disk. Deactivation/chat changes clear the in-memory history and existing privacy controls still gate analysis.
 - Before merging, verify AX and Vision timestamp-label placement on the user's installed WeChat version, scrolling/bottom anchoring, repeated-message identity, incoming badges, and that backfill never triggers automatic analysis. A passing macOS compile cannot validate live WeChat behavior.
 
+### macOS CI versus screenshot OCR validation
+
+The new CI workflow compiles the app and runs deterministic parsing, history,
+and Vision bubble-reconstruction tests. The synthetic pixel-to-text Vision
+integration fixture remains enabled for normal local runs of
+`bash test-wechat-vision.sh`. On hosted macOS CI only, the fixture is
+explicitly deferred: the unchanged base branch and feature branch both miss
+the same mixed-language multiline bubble on the hosted runner.
+**Run the unskipped test on your target Mac** and verify real WeChat content
+before merging this draft PR.
+
 ## Known limitations
 
 - Accessibility structure varies by WeChat release. When AX lacks the identity or message list, local Vision capture fills the missing source and requires Screen Recording permission. If neither source can identify the chat or read messages, live capture cannot proceed.
