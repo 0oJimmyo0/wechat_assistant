@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Swift parsing and history tests
         run: bash test-wechat-parsing.sh
-      - name: Vision reconstruction tests
-        run: bash test-wechat-vision.sh
       - name: Compile macOS app
         run: bash build.sh
+      - name: Vision reconstruction tests
+        run: bash test-wechat-vision.sh
