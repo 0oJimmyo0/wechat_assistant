@@ -25,6 +25,7 @@ final class MonitorWorkCancellation: @unchecked Sendable {
 final class MessageMonitor: ObservableObject {
     static let shared = MessageMonitor()
 
+    @Published private(set) var sessionID = UUID()
     @Published private(set) var isRunning = false
     @Published private(set) var contactName: String?
     @Published private(set) var messages: [ChatMessage] = []
@@ -41,6 +42,7 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var isReturningToLatest = false
     @Published private(set) var isSyncing = false
     @Published private(set) var captureDuration = "Capture: not run"
+    @Published private(set) var newIncomingMessageIDs: [UUID] = []
     @Published private(set) var captureDetails = CaptureAttemptDiagnostics()
 
     var onBurst: ((String, [ChatMessage], Bool) -> Void)?
@@ -88,7 +90,16 @@ final class MessageMonitor: ObservableObject {
     private let maxScrollAttempts = 6
     private let maxNoProgressAttempts = 2
 
+    var trustedMessages: [ChatMessage] { conversationStore.messages }
+
     private var contextHistory: [ChatMessage] { conversationStore.messages }
+
+    var monitoringState: ConversationMonitoringState {
+        ConversationMonitoringState.resolve(running: isRunning,
+            identityConfirmed: conversationIdentityState == .confirmed,
+            transcriptTrusted: acquisitionState == .ready && !hasUnverifiedMessageChanges,
+            viewport: viewportState, liveEdge: latestLiveEdgeConfirmed ? true : (viewportState == .historical ? false : nil))
+    }
 
     var canAnalyzeManually: Bool {
         acquisitionState == .ready && conversationIdentityState == .confirmed &&
@@ -206,6 +217,7 @@ final class MessageMonitor: ObservableObject {
     }
 
     private func resetForActivation() {
+        sessionID = UUID()
         stopTimersAndObserver()
         burstDebounce?.cancel(); burstDebounce = nil
         observerDebounce?.cancel(); observerDebounce = nil
@@ -215,6 +227,7 @@ final class MessageMonitor: ObservableObject {
         pendingVisionIdentity = nil
         pendingHeaderFingerprint = nil
         messages = []
+        newIncomingMessageIDs.removeAll()
         lastObservedSnapshot = []
         lastHeaderFingerprint = nil
         visionMessageBaseline.reset()
@@ -236,6 +249,7 @@ final class MessageMonitor: ObservableObject {
         olderContextProgress = nil
         olderContextStatus = nil
         canLoadOlderContext = true
+        newIncomingMessageIDs.removeAll()
         messageCaptureCount = 0
         latestSnapshotBlockCount = 0
         latestTailOverlap = 0
@@ -245,6 +259,7 @@ final class MessageMonitor: ObservableObject {
     }
 
     func stop() {
+        sessionID = UUID()
         let wasActive = isRunning || isCheckingConversation
         isRunning = false
         isCheckingConversation = false
@@ -267,6 +282,7 @@ final class MessageMonitor: ObservableObject {
         pendingVisionIdentity = nil
         pendingHeaderFingerprint = nil
         messages = []
+        newIncomingMessageIDs.removeAll()
         lastObservedSnapshot = []
         lastHeaderFingerprint = nil
         visionMessageBaseline.reset()
@@ -381,9 +397,11 @@ final class MessageMonitor: ObservableObject {
         }
     }
 
-    func loadOlderContext(targetCount: Int = 20) {
+    func loadOlderContext(targetCount requestedCount: Int = 20) {
+        let targetCount = min(historyLimit, max(20, requestedCount))
         guard isRunning, !isLoadingOlderContext, !isPolling, !isSyncing,
-              canLoadOlderContext, messages.count < targetCount,
+              canLoadOlderContext, acquisitionState == .ready, conversationIdentityState == .confirmed,
+              messages.count < targetCount,
               let contact = lockedContact else { return }
         isLoadingOlderContext = true
         isReturningToLatest = false
@@ -604,11 +622,6 @@ final class MessageMonitor: ObservableObject {
             return .merged(ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain))
         }
         recordCaptureFingerprints(snapshot)
-        if visionMessageBaseline.shouldSkipOCR(frameUnchanged: snapshot.messagesUnchanged) {
-            status = "Monitoring · no visible message changes"
-            let result = ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: viewportState)
-            return .merged(result)
-        }
         guard !snapshot.messages.isEmpty else {
             if purpose == .historical {
                 lastHistoricalCaptureObservation = HistoricalCaptureObservation.resolve(
@@ -648,7 +661,13 @@ final class MessageMonitor: ObservableObject {
         }
         updateCaptureDiagnostics()
         unverifiedCaptureMessages.removeAll()
+        let previouslyObservingLive = latestLiveEdgeConfirmed && viewportState == .liveTail && !hasUnverifiedMessageChanges
         let result = conversationStore.merge(snapshot.messages, trust: captureTrust(snapshot), liveEdgeState: snapshot.liveEdgeState)
+        let incoming = ConversationArrivalPolicy.incoming(result, liveObservation: purpose == .live,
+            previouslyObservingLive: previouslyObservingLive, identityConfirmed: conversationIdentityState == .confirmed)
+        let retainedIDs = Set(conversationStore.messages.map(\.localID))
+        newIncomingMessageIDs = Array((newIncomingMessageIDs + incoming.map(\.localID))
+            .filter { retainedIDs.contains($0) }.suffix(historyLimit))
         if lockedVisionIdentity == nil { lockedVisionIdentity = snapshot.visionIdentity }
         recordCaptureFingerprints(snapshot)
         messages = conversationStore.messages
@@ -787,7 +806,7 @@ final class MessageMonitor: ObservableObject {
 
     private func processIncoming(_ appended: [ChatMessage], contact: String) {
         guard acquisitionState == .ready else { return }
-        let incoming = appended.filter { $0.senderIdentified && !$0.isFromMe }
+        let incoming = appended.filter { $0.sender == .other && newIncomingMessageIDs.contains($0.localID) }
         guard !incoming.isEmpty else { return }
         lastProcessedIncomingMessage = incoming.last?.localID
         let canAutoAnalyze = WeChatParsing.canAutomaticallyAnalyze(messages.suffix(analysisContextLimit))
@@ -877,10 +896,6 @@ final class MessageMonitor: ObservableObject {
                     return
                 }
                 self.recordCaptureFingerprints(snapshot)
-                if self.visionMessageBaseline.shouldSkipOCR(frameUnchanged: snapshot.messagesUnchanged) {
-                    self.status = "Monitoring · no visible message changes"
-                    return
-                }
                 guard !snapshot.messages.isEmpty else {
                     self.latestSnapshotBlockCount = 0
                     self.status = "Conversation identified, but visible messages could not be read · retrying"

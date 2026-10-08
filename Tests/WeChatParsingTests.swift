@@ -63,6 +63,25 @@ enum WeChatParsingTests {
         expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "10:30", value: nil) == "10:30",
                "an actual timestamp-shaped bubble retains its original message text")
 
+        expect(WeChatParsing.timeSeparatorLabel("10:30") == "10:30", "recognizes an observed clock-time separator")
+        expect(WeChatParsing.timeSeparatorLabel("昨天 10:30") == "昨天 10:30", "recognizes localized WeChat divider")
+        expect(WeChatParsing.timeSeparatorLabel("2026年10月7日 14:35") != nil, "recognizes dated WeChat divider")
+        expect(WeChatParsing.timeSeparatorLabel("Can we meet at 10:30?") == nil,
+               "conversation sentences cannot masquerade as time separators")
+        expect(WeChatParsing.timeSeparatorLabel("random content") == nil, "unknown metadata is not a timestamp")
+        for label in ["Today", "Yesterday 3:05 PM", "今天 上午9:30", "星期三 14:05", "Monday 14:05", "October 7, 2026 14:05", "10/7/2026 09:05"] {
+            expect(WeChatParsing.timeSeparatorLabel(label) == label, "Chinese/English labels retain literal observed text")
+        }
+        for label in ["25:00", "10:75", "2026/19/45", "Today we met", "2026-10-07\nhello"] {
+            expect(WeChatParsing.timeSeparatorLabel(label) == nil, "invalid clocks/dates and sentences cannot become dividers")
+        }
+        let originalTimed = ChatMessage(text: "message", sender: .other)
+        let observedTimed = originalTimed.withTimeSeparator("Yesterday 10:30")
+        expect(originalTimed.timeSeparatorBefore == nil && observedTimed.timeSeparatorBefore == "Yesterday 10:30",
+               "time dividers remain optional evidence; never inferred from firstSeenAt")
+        expect(originalTimed.localID == observedTimed.localID && originalTimed.id == observedTimed.id,
+               "adding verified time metadata preserves occurrence identity")
+
         let unknown = ChatMessage(text: "hello", sender: .unknown)
         let incoming = ChatMessage(text: "hello", sender: .other)
         let outgoing = ChatMessage(text: "hello", sender: .me)

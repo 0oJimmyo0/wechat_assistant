@@ -50,6 +50,10 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section("Developer diagnostics") {
+                Text(monitor.captureDetails.summary).font(.caption).textSelection(.enabled)
+                Text(monitor.captureDuration).font(.caption).foregroundStyle(.secondary)
+                Text("Session history: \(monitor.trustedMessages.count) / 200 messages · capture work runs outside the UI thread")
+                    .font(.caption).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Vision layout calibration").font(.subheadline)
                     calibrationSlider("Message pane starts", value: $messagePaneLeftX, range: 0.01...0.70)
@@ -92,7 +96,7 @@ struct SettingsView: View {
                 }
             }
             Section("Privacy") {
-                Text("Conversation messages are held in memory only while monitoring is active. Deactivate or switch conversations to clear that context; the app does not save conversation history to disk. When you choose Analyze, the app sends at most the latest 20 observed messages, your local relationship profile, and any special instruction. The contact name and other conversations are excluded. Automatic analysis, if enabled, is limited to identified incoming Accessibility messages. Deactivation cannot recall a request OpenAI has already received. Your relationship profile remains in local app preferences. Copying a reply places it on the system clipboard.")
+                Text("Conversation messages are held in memory only while monitoring is active. Deactivate or switch conversations to clear that context; the app does not save conversation history to disk. When you confirm a manual analysis preview, the app sends at most 20 validated messages from the latest context or your selected chronological range, any observed WeChat time separators in those messages, your local relationship profile, and any special instruction. Capture times are excluded. The contact name and other conversations are excluded. Automatic analysis, if enabled, is limited to identified incoming Accessibility messages. Deactivation cannot recall a request OpenAI has already received. Your relationship profile remains in local app preferences. Copying a reply places it on the system clipboard.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Link("OpenAI data controls", destination: URL(string: "https://developers.openai.com/api/docs/guides/your-data")!)
                     .font(.caption)

@@ -1,0 +1,23 @@
+name: macOS transcript validation
+on:
+  pull_request:
+    paths:
+      - "Sources/**"
+      - "Tests/**"
+      - "test-wechat-*.sh"
+      - "build.sh"
+      - ".github/workflows/transcript-validation.yml"
+  workflow_dispatch:
+jobs:
+  swift:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift parsing and history tests
+        run: bash test-wechat-parsing.sh
+      - name: Compile macOS app
+        run: bash build.sh
+      - name: Deterministic Vision reconstruction tests
+        env:
+          WECHAT_SKIP_SCREENSHOT_OCR_FIXTURE: "1"
+        run: bash test-wechat-vision.sh

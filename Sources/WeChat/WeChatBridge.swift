@@ -964,6 +964,14 @@ final class WeChatBridge: @unchecked Sendable {
                                 hasAXMessages: capturePlan.messages == .accessibility && list != nil,
                                 failure: "none", hasAXTitle: axIdentity.hasTitle, timing: timing)
         cacheActivePlan(capturePlan, pid: app.processIdentifier, window: window)
+        backendLock.lock()
+        let verifiedViewport = capturedGeometry.isValidated && geometryWindow.map({ CFEqual($0, window) }) == true
+            ? geometryViewport : nil
+        backendLock.unlock()
+        // Older builds can expose a verified native transcript viewport without
+        // semantic bubble identifiers. Use the same scrollbar evidence there.
+        let observedLiveEdge = axHasUnreadableBubbles || !capturedGeometry.isValidated
+            ? nil : (list ?? verifiedViewport).flatMap { liveEdgeState(in: $0) }
         return .success(WeChatSnapshot(contact: contact, messages: messages, capturedAt: Date(),
                               messageRowCount: rowCount, identitySource: capturePlan.identity,
                               messageSource: capturePlan.messages,
@@ -976,7 +984,7 @@ final class WeChatBridge: @unchecked Sendable {
                               messagesUnchanged: messagesUnchanged,
                               headerUnchanged: visionObservation?.headerFrameUnchanged ?? false,
                               captureTimingDiagnostic: timing,
-                              liveEdgeState: axHasUnreadableBubbles ? nil : list.flatMap { liveEdgeState(in: $0) }))
+                              liveEdgeState: observedLiveEdge))
     }
 
     private func axProbeDiagnostic(_ fastProbe: AXCapabilityProbe?, resolvedProbe: AXCapabilityProbe?, fallbackAttempted: Bool,
@@ -1188,6 +1196,7 @@ final class WeChatBridge: @unchecked Sendable {
         result.rowAttributesUnavailable = visible == nil && fallback == nil
         result.rows = rows.count
         var rowStack = rows.reversed().map { ($0, 0) }
+        var pendingTimeSeparator: String?
         while let (row, rowDepth) = rowStack.popLast() {
             guard Date() < deadline, result.nodes < 500 else { result.exhausted = true; break }
             result.nodes += 1
@@ -1195,9 +1204,16 @@ final class WeChatBridge: @unchecked Sendable {
             let id = fields["AXIdentifier"] as? String ?? ""
             if id == WeChatParsing.placeholderRowIdentifier { result.placeholders += 1; continue }
             guard id == WeChatParsing.messageRowIdentifier else {
+                // Only a stand-alone label inside the confirmed message list can
+                // act as a time divider. Other UI text is never message content.
+                let role = fields["AXRole"] as? String ?? ""
+                if ["AXStaticText", "AXGroup", "AXRow", "AXCell"].contains(role),
+                   let label = WeChatParsing.timeSeparatorLabel(
+                    fields["AXTitle"] as? String ?? fields["AXValue"] as? String) {
+                    pendingTimeSeparator = label
+                }
                 // Some releases wrap confirmed bubbles in list rows/cells.
                 // These wrappers never supply message text themselves.
-                let role = fields["AXRole"] as? String ?? ""
                 if rowDepth < 2, ["AXRow", "AXCell", "AXGroup", "AXUnknown"].contains(role) {
                     rowStack.append(contentsOf: (boundedChildren(row, maximum: 8) ?? []).reversed().map { ($0, rowDepth + 1) })
                 }
@@ -1230,8 +1246,13 @@ final class WeChatBridge: @unchecked Sendable {
             }
             if let text {
                 result.messages.append(ChatMessage(text: text,
-                    sender: WeChatParsing.sender(from: fields["AXDescription"] as? String ?? ""), source: .accessibility))
-            } else { result.unreadableBubbles += 1 }
+                    sender: WeChatParsing.sender(from: fields["AXDescription"] as? String ?? ""),
+                    source: .accessibility, timeSeparatorBefore: pendingTimeSeparator))
+                pendingTimeSeparator = nil
+            } else {
+                result.unreadableBubbles += 1
+                pendingTimeSeparator = nil
+            }
         }
         result.messages = Array(result.messages.suffix(max(0, limit)))
         captureDiagnosticLock.lock()
@@ -1524,15 +1545,11 @@ final class WeChatBridge: @unchecked Sendable {
             let fields = attributes(element, ["AXVerticalScrollBar", "AXParent"])
             if let raw = fields["AXVerticalScrollBar"], CFGetTypeID(raw as CFTypeRef) == AXUIElementGetTypeID() {
                 let bar = raw as! AXUIElement
-                let values = attributes(bar, ["AXValue", "AXMinValue", "AXMaxValue"])
-                if let value = values["AXValue"] as? NSNumber,
-                   let minimum = values["AXMinValue"] as? NSNumber,
-                   let maximum = values["AXMaxValue"] as? NSNumber,
-                   maximum.doubleValue > minimum.doubleValue {
-                    let position = (value.doubleValue - minimum.doubleValue) / (maximum.doubleValue - minimum.doubleValue)
-                    guard position.isFinite, (0...1).contains(position) else { return nil }
-                    return position >= 0.999
-                }
+                let values = attributes(bar, ["AXValue", "AXMinValue", "AXMaxValue", "AXRole", "AXOrientation"])
+                return ScrollBarEvidence.liveEdge(value: (values["AXValue"] as? NSNumber)?.doubleValue,
+                    minimum: (values["AXMinValue"] as? NSNumber)?.doubleValue,
+                    maximum: (values["AXMaxValue"] as? NSNumber)?.doubleValue,
+                    role: values["AXRole"] as? String, orientation: values["AXOrientation"] as? String)
             }
             if let raw = fields["AXParent"], CFGetTypeID(raw as CFTypeRef) == AXUIElementGetTypeID() {
                 current = (raw as! AXUIElement)

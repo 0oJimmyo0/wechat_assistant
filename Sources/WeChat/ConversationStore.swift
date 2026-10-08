@@ -21,6 +21,11 @@ struct ConversationMergeResult: Sendable {
 /// store owns the accumulated message list shown to the UI and supplied to analysis.
 final class ConversationStore {
     private(set) var messages: [ChatMessage] = []
+    var timeSeparatorEvents: [ConversationTimeSeparatorEvent] {
+        messages.compactMap { message in
+            message.observedTimeSeparator.map { ConversationTimeSeparatorEvent(beforeMessageID: message.localID, observation: $0) }
+        }
+    }
     private let maximumMessages: Int
 
     init(maximumMessages: Int = 200) {
@@ -77,6 +82,16 @@ final class ConversationStore {
                 return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
             }
             let arrivalConfirmed = reliableOverlap
+            // Keep existing occurrence IDs while enriching a matching row with
+            // a separator that only became visible on a later capture.
+            let existingStart = messages.count - overlap.length
+            for offset in 0..<overlap.length where anchorOccurrences == 1 && observedOccurrences == 1 {
+                let index = existingStart + offset
+                if messages[index].timeSeparatorBefore == nil,
+                   let observation = snapshot[overlap.observedStart + offset].observedTimeSeparator {
+                    messages[index] = messages[index].withTimeSeparator(observation)
+                }
+            }
             let merged = messages + appended
             messages = Array(merged.suffix(maximumMessages))
             return ConversationMergeResult(appended: appended, prepended: [],
@@ -88,14 +103,23 @@ final class ConversationStore {
         // is inserted; rows after an internal match never count as live.
         if let overlap = historical {
             let prefix = Array(snapshot.prefix(overlap.observedStart))
-            let merged: [ChatMessage]
-            if prefix.isEmpty {
-                merged = messages
-            } else if overlap.existingStart == 0 {
-                merged = prefix + messages
-            } else {
+            // An ambiguous sequence cannot prepend rows or enrich timestamps.
+            let matches = (0...(messages.count - overlap.length)).filter {
+                ChatHistoryMerger.sequencesMatch(messages, lhsStart: $0,
+                    snapshot, rhsStart: overlap.observedStart, length: overlap.length)
+            }.count
+            guard matches == 1, prefix.isEmpty || (overlap.existingStart == 0 && overlap.length >= 2 &&
+                Set(snapshot.suffix(overlap.length).map(ChatHistoryMerger.key(for:))).count >= 2) else {
                 return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
             }
+            for offset in 0..<overlap.length {
+                let index = overlap.existingStart + offset
+                if messages[index].timeSeparatorBefore == nil,
+                   let observation = snapshot[overlap.observedStart + offset].observedTimeSeparator {
+                    messages[index] = messages[index].withTimeSeparator(observation)
+                }
+            }
+            let merged = prefix + messages
             let previousIDs = Set(messages.map(\.localID))
             messages = Array(merged.suffix(maximumMessages))
             let prepended = messages.filter { !previousIDs.contains($0.localID) }

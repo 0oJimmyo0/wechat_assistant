@@ -95,6 +95,26 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 
+## Local conversation timeline (development branch)
+
+- The sidebar has an **independently scrollable chat transcript**. Scrolling in this pane never scrolls or changes WeChat, so real-time monitoring can continue while the user reads older locally captured messages.
+- **Jump to latest** navigates to the newest *local* message. If verified new messages arrive while the user reads older rows, the button shows a pending count without pulling the viewport away. **WeChat: follow latest** is a separate control that moves WeChat's own window when monitoring has switched into a historical viewport.
+- **Load 20 earlier** calls the existing controlled WeChat scroll-and-capture workflow. It restores WeChat to its latest viewport after loading and merges older messages into session-only history. The history is capped at 200 message occurrences; more history requires a subsequent load and can stop on ambiguous overlap or unavailable content.
+- Message display order follows the verified conversation sequence, not an assumed timestamp. The UI shows *literal* time/date separators only when recovered from recognized Accessibility message-list rows or high-confidence centered OCR within validated transcript geometry. Not every message exposes a send time; the `firstSeenAt` field records observation time and is never presented as a sent timestamp.
+- This feature does not persist chat text or inferred time metadata to disk. Deactivation/chat changes clear the in-memory history and existing privacy controls still gate analysis.
+- Before merging, verify AX and Vision timestamp-label placement on the user's installed WeChat version, scrolling/bottom anchoring, repeated-message identity, incoming badges, and that backfill never triggers automatic analysis. A passing macOS compile cannot validate live WeChat behavior.
+
+### macOS CI versus screenshot OCR validation
+
+The new CI workflow compiles the app and runs deterministic parsing, history,
+and Vision bubble-reconstruction tests. The synthetic pixel-to-text Vision
+integration fixture remains enabled for normal local runs of
+`bash test-wechat-vision.sh`. On hosted macOS CI only, the fixture is
+explicitly deferred: the unchanged base branch and feature branch both miss
+the same mixed-language multiline bubble on the hosted runner.
+**Run the unskipped test on your target Mac** and verify real WeChat content
+before merging this draft PR.
+
 ## Known limitations
 
 - Accessibility structure varies by WeChat release. When AX lacks the identity or message list, local Vision capture fills the missing source and requires Screen Recording permission. If neither source can identify the chat or read messages, live capture cannot proceed.
@@ -165,3 +185,29 @@ bash test-wechat-vision.sh
 Fixtures contain public test text only. Private screenshots are never committed.
 See [LIVE_VALIDATION.md](LIVE_VALIDATION.md) for measured results and outstanding
 interactive tests, including the unresolved visual-only geometry fallback.
+
+### Transcript refinements
+
+The local timeline and assistant suggestions occupy independently scrollable,
+resizable split panes. The timeline renders all retained validated messages in
+chronological order (up to 200). Loading 20 earlier preserves the visible local
+row and offset; Jump to latest changes only Copilot's scroll position. Confirmed
+incoming occurrences increment the local unread badge while browsing history.
+“WeChat: follow latest” separately controls the WeChat viewport. Missing live-tail
+evidence is shown as Monitoring uncertain and cannot authorize automatic analysis.
+
+Observed time separators retain their literal label and capture evidence beside
+the following occurrence. Individual send times remain unknown. Ambiguous
+historical overlap cannot attach a label to a guessed repeated message.
+
+Manual analysis previews the latest 20 validated messages or a selected contiguous
+range of up to 20. Select the first and last rows using Analyze selected context;
+then review the exact chronological message block, separators, model, profile,
+and instruction before sending. A changed session or evicted/changed context
+invalidates the preview. Capture times and contact metadata are excluded.
+Detailed capture diagnostics are in Settings.
+
+`bash test-transcript-ui.sh` exercises the real SwiftUI scroll viewport with public
+fixture data in a temporary macOS window. It requires a logged-in desktop and
+never interacts with WeChat or a model. See [REFINEMENT_VALIDATION.md](REFINEMENT_VALIDATION.md)
+for per-stage files, test results, measurements, and the outstanding live merge gate.

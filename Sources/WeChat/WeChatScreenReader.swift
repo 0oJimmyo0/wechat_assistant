@@ -947,6 +947,7 @@ final class WeChatScreenReader {
                                          region: CGRect, bubbles: [VisionBubbleRegion]) -> ParsedMessageCapture {
         var rejectedBounds: [CGRect] = []
         var lines: [VisionMessageLine] = []
+        var observedTimeSeparators: [VisionTimeSeparatorObservation] = []
         var unreadableBubbleIDs: Set<Int> = []
         var plausibleTextCount = 0
         var geometryRejectedCount = 0
@@ -957,6 +958,16 @@ final class WeChatScreenReader {
                 continue
             }
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            let mappedBounds = mapBounds(observation.boundingBox, from: region)
+            // WeChat's own centered time dividers are metadata, not chat bubbles.
+            if candidate.confidence >= 0.90,
+               let label = WeChatParsing.timeSeparatorLabel(text),
+               abs(mappedBounds.midX - region.midX) <= region.width * 0.16,
+               region.contains(mappedBounds), mappedBounds.width <= region.width * 0.60,
+               !bubbles.contains(where: { $0.bounds.intersects(mappedBounds) }) {
+                observedTimeSeparators.append(VisionTimeSeparatorObservation(label: label, bounds: mappedBounds, confidence: candidate.confidence))
+                continue
+            }
             guard WeChatParsing.isReliableOCRText(text, confidence: candidate.confidence) else {
                 let bounds = mapBounds(observation.boundingBox, from: region)
                 let line = VisionMessageLine(text: text, bounds: bounds, confidence: candidate.confidence)
@@ -993,7 +1004,9 @@ final class WeChatScreenReader {
             return true
         }
         let (messages, bounds) = VisionMessageReconstruction.reconstruct(confirmed, bubbles: bubbles, region: region)
-        return ParsedMessageCapture(messages: messages, bounds: bounds,
+        let timedMessages = TimeSeparatorPlacement.associate(observedTimeSeparators,
+            messages: messages, bounds: bounds, allBubbleBounds: bubbles.map(\.bounds))
+        return ParsedMessageCapture(messages: timedMessages, bounds: bounds,
                                     rejectedBounds: rejectedBounds,
                                     plausibleTextCount: plausibleTextCount,
                                     geometryRejectedCount: geometryRejectedCount,
