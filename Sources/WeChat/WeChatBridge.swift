@@ -375,11 +375,14 @@ final class WeChatBridge: @unchecked Sendable {
         backendLock.lock()
         let cached = cachedAXWindowPID == pid ? cachedAXWindow : nil
         backendLock.unlock()
-        if let focused = windowElement(app, attribute: "AXFocusedWindow", timeout: 0.08) {
-            guard isUsableConversationWindow(focused) else { return nil }
+        if let focused = windowElement(app, attribute: "AXFocusedWindow", timeout: 0.08),
+           isUsableConversationWindow(focused) {
             cacheMainWindow(focused, pid: pid)
             return focused
         }
+        // A transient dialog or preferences window may be focused while the
+        // real conversation is still present. Continue to cached/main/windows
+        // candidates rather than declaring WeChat unavailable.
         if let cached, isUsableConversationWindow(cached) { return cached }
 
         // Focused/main window attributes are cheaper than materializing and
@@ -762,9 +765,10 @@ final class WeChatBridge: @unchecked Sendable {
             cacheCapabilityProbe(fallback.probe, pid: app.processIdentifier, window: window)
         }
         let axResolutionStarted = Date()
-        let axIdentity = reusedPlan?.identity == .vision
-            ? (contact: nil, hasTitle: false)
-            : accessibilityIdentity(in: window, app: app)
+        // A Vision choice is not permanent: AX identity may become readable
+        // after a transiently collapsed tree. Recheck the already bounded/cached
+        // AX identity path, especially when no contact has been locked yet.
+        let axIdentity = accessibilityIdentity(in: window, app: app)
         let axContact = axIdentity.contact
         let list = reusedPlan?.messages == .vision ? nil : messageListElement(in: window)
         let axResolutionMilliseconds = Int(Date().timeIntervalSince(axResolutionStarted) * 1000)
@@ -773,9 +777,8 @@ final class WeChatBridge: @unchecked Sendable {
         backendLock.unlock()
         let plan: ConversationCapturePlan?
         if let reusedPlan {
-            plan = ConversationCapturePlan(
-                identity: reusedPlan.identity == .accessibility && axContact == nil ? .vision : reusedPlan.identity,
-                messages: reusedPlan.messages == .accessibility && list == nil ? .vision : reusedPlan.messages
+            plan = ConversationCapturePlan.recover(
+                cached: reusedPlan, hasAXIdentity: axContact != nil, hasAXMessages: list != nil
             )
         } else {
             plan = ConversationCapturePlan.select(hasAXIdentity: axContact != nil,

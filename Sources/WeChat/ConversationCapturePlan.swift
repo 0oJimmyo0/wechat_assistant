@@ -196,6 +196,18 @@ struct ConversationCapturePlan: Equatable, Sendable {
     let identity: ConversationCaptureSource
     let messages: ConversationCaptureSource
 
+    /// Reassess semantic identity on every capture, even after Vision was used.
+    /// The cached message backend is left intact for performance.
+    static func recover(cached: ConversationCapturePlan, hasAXIdentity: Bool,
+                        hasAXMessages: Bool) -> ConversationCapturePlan {
+        ConversationCapturePlan(
+            identity: hasAXIdentity ? .accessibility :
+                (cached.identity == .accessibility ? .vision : cached.identity),
+            messages: cached.messages == .accessibility && !hasAXMessages
+                ? .vision : cached.messages
+        )
+    }
+
     static func select(
         hasAXIdentity: Bool,
         hasAXMessages: Bool,
