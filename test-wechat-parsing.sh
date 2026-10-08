@@ -70,3 +70,9 @@ swiftc -o "$PROJECT_DIR/.build/ScrollBarEvidenceTests" \
     "$PROJECT_DIR/Sources/WeChat/ScrollBarEvidence.swift" \
     "$PROJECT_DIR/Tests/ScrollBarEvidenceTests.swift"
 "$PROJECT_DIR/.build/ScrollBarEvidenceTests"
+
+swiftc -o "$PROJECT_DIR/.build/PendingIdentityPolicyTests" \
+    "$PROJECT_DIR/Sources/WeChat/ChatMessage.swift" \
+    "$PROJECT_DIR/Sources/WeChat/PendingIdentityPolicy.swift" \
+    "$PROJECT_DIR/Tests/PendingIdentityPolicyTests.swift"
+"$PROJECT_DIR/.build/PendingIdentityPolicyTests"
