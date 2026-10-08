@@ -19,3 +19,17 @@ jobs:
         run: bash build.sh
       - name: Vision reconstruction tests
         run: bash test-wechat-vision.sh
+      - name: Check base branch OCR fixture for comparison (diagnostic only)
+        if: failure()
+        run: |
+          git fetch --depth=1 origin fix/wechat-process-detection
+          git worktree add .build/vision-baseline FETCH_HEAD
+          set +e
+          (cd .build/vision-baseline && bash test-wechat-vision.sh)
+          result=$?
+          if [ "$result" -eq 0 ]; then
+            echo "::warning::Base OCR fixture PASSES; inspect the new changes for a regression."
+          else
+            echo "::warning::Base OCR fixture ALSO FAILS in this hosted macOS environment."
+          fi
+          exit 0
