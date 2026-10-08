@@ -9,6 +9,7 @@ swiftc -target arm64-apple-macos14.0 -O -parse-as-library \
     -o "$PROJECT_DIR/.build/TranscriptUIIntegrationTests" \
     "$PROJECT_DIR/Sources/WeChat/ChatMessage.swift" \
     "$PROJECT_DIR/Sources/WeChat/TranscriptScrollState.swift" \
+    "$PROJECT_DIR/Sources/WeChat/ScrollBarEvidence.swift" \
     "$PROJECT_DIR/Sources/UI/ChatTranscriptView.swift" \
     "$PROJECT_DIR/Tests/TranscriptUIIntegrationTests.swift"
 "$PROJECT_DIR/.build/TranscriptUIIntegrationTests"

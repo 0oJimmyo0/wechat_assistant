@@ -65,3 +65,8 @@ swiftc -o "$PROJECT_DIR/.build/HistoryRefinementTests" \
     "$PROJECT_DIR/Sources/WeChat/ConversationStore.swift" \
     "$PROJECT_DIR/Tests/HistoryRefinementTests.swift"
 "$PROJECT_DIR/.build/HistoryRefinementTests"
+
+swiftc -o "$PROJECT_DIR/.build/ScrollBarEvidenceTests" \
+    "$PROJECT_DIR/Sources/WeChat/ScrollBarEvidence.swift" \
+    "$PROJECT_DIR/Tests/ScrollBarEvidenceTests.swift"
+"$PROJECT_DIR/.build/ScrollBarEvidenceTests"

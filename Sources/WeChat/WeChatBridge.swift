@@ -1545,15 +1545,11 @@ final class WeChatBridge: @unchecked Sendable {
             let fields = attributes(element, ["AXVerticalScrollBar", "AXParent"])
             if let raw = fields["AXVerticalScrollBar"], CFGetTypeID(raw as CFTypeRef) == AXUIElementGetTypeID() {
                 let bar = raw as! AXUIElement
-                let values = attributes(bar, ["AXValue", "AXMinValue", "AXMaxValue"])
-                if let value = values["AXValue"] as? NSNumber,
-                   let minimum = values["AXMinValue"] as? NSNumber,
-                   let maximum = values["AXMaxValue"] as? NSNumber,
-                   maximum.doubleValue > minimum.doubleValue {
-                    let position = (value.doubleValue - minimum.doubleValue) / (maximum.doubleValue - minimum.doubleValue)
-                    guard position.isFinite, (0...1).contains(position) else { return nil }
-                    return position >= 0.999
-                }
+                let values = attributes(bar, ["AXValue", "AXMinValue", "AXMaxValue", "AXRole", "AXOrientation"])
+                return ScrollBarEvidence.liveEdge(value: (values["AXValue"] as? NSNumber)?.doubleValue,
+                    minimum: (values["AXMinValue"] as? NSNumber)?.doubleValue,
+                    maximum: (values["AXMaxValue"] as? NSNumber)?.doubleValue,
+                    role: values["AXRole"] as? String, orientation: values["AXOrientation"] as? String)
             }
             if let raw = fields["AXParent"], CFGetTypeID(raw as CFTypeRef) == AXUIElementGetTypeID() {
                 current = (raw as! AXUIElement)

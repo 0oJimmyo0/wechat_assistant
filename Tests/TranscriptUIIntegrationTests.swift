@@ -14,6 +14,7 @@ struct ProbeView: View {
             onViewportChange: { model.viewport = $0 }).padding(12)
     }
 }
+@MainActor final class FlippedFixtureDocument: NSView { override var isFlipped: Bool { true } }
 @main @MainActor enum TranscriptUIProbe {
     static func pump(_ seconds: TimeInterval = 0.8) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
     static func findScroll(_ view: NSView) -> NSScrollView? {
@@ -34,6 +35,21 @@ struct ProbeView: View {
         window.orderFront(nil)
         pump(1.2)
         guard let scroll = findScroll(host), let document = scroll.documentView else { check(false,"native transcript scroll view exists"); return }
+        let fixture = NSScrollView(frame: NSRect(x: 0,y: 0,width: 300,height: 400))
+        fixture.hasVerticalScroller = true
+        fixture.documentView = FlippedFixtureDocument(frame: NSRect(x: 0,y: 0,width: 300,height: 2000))
+        guard let scroller = fixture.verticalScroller else { check(false,"native vertical scroller exists"); return }
+        check(scroller.accessibilityRole() == .scrollBar && scroller.accessibilityOrientation() == .vertical,
+            "native scroller reports the required role and vertical orientation")
+        fixture.contentView.scroll(to: .zero); fixture.reflectScrolledClipView(fixture.contentView)
+        let top = (scroller.accessibilityValue() as? NSNumber)?.doubleValue
+        fixture.contentView.scroll(to: NSPoint(x: 0,y: 2000 - fixture.contentView.bounds.height))
+        fixture.reflectScrolledClipView(fixture.contentView)
+        let bottom = (scroller.accessibilityValue() as? NSNumber)?.doubleValue
+        check(top == 0 && bottom == 1,"native scrollbar value is normalized at known viewport endpoints")
+        check(ScrollBarEvidence.liveEdge(value: top,minimum: nil,maximum: nil,role: "AXScrollBar",orientation: "AXVerticalOrientation") == false &&
+            ScrollBarEvidence.liveEdge(value: bottom,minimum: nil,maximum: nil,role: "AXScrollBar",orientation: "AXVerticalOrientation") == true,
+            "native endpoint observations classify top as history and bottom as live")
         let initialHeight = scroll.contentView.bounds.height
         window.setContentSize(NSSize(width: 420,height: 650)); pump()
         check(scroll.contentView.bounds.height > initialHeight + 100,"transcript grows when resized")

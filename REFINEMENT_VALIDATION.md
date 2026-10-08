@@ -54,6 +54,36 @@ window state works. No private content was logged, no screenshot was saved by
 these refinement tests, no outgoing WeChat message was sent, and no database was
 accessed.
 
+## Follow-up live validation and scrollbar fix
+
+On the open conversation, the verified transcript scroll area's vertical
+`AXScrollBar` reported `AXValue = 1` and `AXVerticalOrientation`, while both
+`AXMinValue` and `AXMaxValue` were absent. Requiring those range attributes left
+monitoring uncertain at the real bottom. `ScrollBarEvidence.swift` now accepts
+normalized values only for a verified vertical scrollbar. Explicit ranges must
+be complete and valid; unsupported roles, orientations, missing values, and
+out-of-range numbers remain uncertain. Near-bottom history does not count as
+the live endpoint. Vision remains ineligible for automatic analysis.
+
+The new deterministic evidence tests cover these cases. The native AppKit probe
+verifies normalized top/bottom values using a fixed-height flipped document;
+the SwiftUI lazy transcript changes its measured document height during layout
+and therefore cannot serve as a fixed endpoint fixture. Existing transcript
+resize, unread, prepend, and 200-row checks still pass (0 px prepend error;
+571 ms synthetic sweep including 550 ms intentional waits). Parsing/store,
+unskipped Vision OCR, native UI tests, and the signed build all passed.
+
+A fresh ten-attempt read-only live run accepted two Chinese messages and one
+observed separator after one identity-pending observation. Eight subsequent
+trusted histories matched including occurrence IDs and metadata. All nine
+validated snapshots reported `liveEdge=true`; automatic eligibility remained
+false. Validated capture **P50/P95: 121/923 ms**, cached captures 119–123 ms.
+This measures capture/store latency, not end-to-end sidebar Refresh. The open
+view had no accepted Latin or multiline messages, so live mixed-language and
+multiline coverage is still unverified. The user has confirmed a conversation
+is open; text/contact comparison and actual arrival/history workflows remain
+pending. No private text or screenshot was saved by this probe.
+
 ## Outstanding interactive acceptance tests
 
 Keep PR #3 draft until the following pass on the intended WeChat version:
