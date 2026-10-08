@@ -13,7 +13,6 @@ struct ReplySidebarView: View {
     @State private var generationID: UUID?
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
-    @State private var displayedMessageLimit = 5
     private let manualAnalysisContextLimit = 20
 
     var body: some View {
@@ -129,29 +128,21 @@ struct ReplySidebarView: View {
     }
 
     private var recentMessagesSection: some View {
-        let visibleMessages = Array(monitor.messages.suffix(displayedMessageLimit))
-        return VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("RECENT MESSAGES · SHOWING \(visibleMessages.count) OF \(monitor.messages.count)")
-            Text(monitor.messages.count < 20
-                 ? "Context: \(monitor.messages.count) / 20 loaded · model receives up to 20"
-                 : "Context: 20 / 20 loaded · \(monitor.messages.count) stored; model receives latest 20")
-                .font(.caption2).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Button {
-                    monitor.refresh()
-                } label: {
+                Button { monitor.refresh() } label: {
                     Label(monitor.isSyncing ? "Refreshing…" : "Refresh",
-                          systemImage: monitor.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                          systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(!monitor.canSyncNow)
 
+                // This button moves WECHAT's viewport. Jump to latest inside
+                // the chat pane only changes the Copilot's local scroll position.
                 if monitor.isRunning && monitor.viewportState != .liveTail {
-                    Button {
-                        monitor.followLatest()
-                    } label: {
-                        Label(monitor.isReturningToLatest ? "Returning…" : "Follow latest",
+                    Button { monitor.followLatest() } label: {
+                        Label(monitor.isReturningToLatest ? "Returning…" : "WeChat: follow latest",
                               systemImage: "arrow.down.to.line")
                     }
                     .buttonStyle(.bordered)
@@ -160,75 +151,36 @@ struct ReplySidebarView: View {
                 }
                 Spacer(minLength: 0)
             }
-            Text(monitor.captureDetails.summary).font(.caption2).foregroundStyle(.secondary)
+            Text(monitor.captureDetails.summary)
+                .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text(monitor.captureDuration).font(.caption2).foregroundStyle(.secondary)
             if monitor.captureDetails.candidateCount > monitor.captureDetails.acceptedCount {
                 Text("Unverified observations are excluded from stored messages and analysis.")
                     .font(.caption2).foregroundStyle(.orange)
             }
-            if monitor.messages.count > 5 {
-                Button(displayedMessageLimit == 5 ? "Show latest 20" : "Show latest 5") {
-                    displayedMessageLimit = displayedMessageLimit == 5 ? 20 : 5
-                }.buttonStyle(.plain).font(.caption)
-            }
-            if monitor.isRunning && monitor.messages.count < 20 && monitor.canLoadOlderContext &&
-                monitor.conversationIdentityState == .confirmed && monitor.acquisitionState == .ready {
-                Button {
-                    monitor.loadOlderContext()
-                } label: {
-                    Label(monitor.isLoadingOlderContext ? "Loading…" : "Load older to 20",
-                          systemImage: monitor.isLoadingOlderContext ? "hourglass" : "arrow.up.circle")
+            ChatTranscriptView(
+                messages: monitor.messages,
+                contactName: monitor.contactName ?? "Contact",
+                canLoadEarlier: monitor.isRunning && monitor.messages.count < 200 &&
+                    monitor.canLoadOlderContext && monitor.conversationIdentityState == .confirmed &&
+                    monitor.acquisitionState == .ready && !monitor.isSyncing,
+                loadingEarlier: monitor.isLoadingOlderContext,
+                onLoadEarlier: {
+                    monitor.loadOlderContext(targetCount: min(200, monitor.messages.count + 20))
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(monitor.isLoadingOlderContext || monitor.isSyncing)
-            }
+            )
+            .id(monitor.contactName ?? "no-chat")
+
             if monitor.isLoadingOlderContext {
                 Text(monitor.isReturningToLatest
-                     ? "Returning to latest messages…"
-                     : "Loading older context… \(monitor.olderContextProgress ?? "0 / 20")")
+                     ? "Returning WeChat to its latest messages…"
+                     : "Loading earlier messages… \(monitor.olderContextProgress ?? "")")
                     .font(.caption2).foregroundStyle(.secondary)
             } else if let olderContextStatus = monitor.olderContextStatus {
-                Text(olderContextStatus)
-                    .font(.caption2).foregroundStyle(.secondary)
+                Text(olderContextStatus).font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if monitor.messages.isEmpty {
-                Text("No chat message text is available from this WeChat view yet.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            } else {
-                ForEach(visibleMessages) { message in
-                    recentMessageRow(message)
-                }
-            }
-        }
-    }
-
-    private func recentMessageRow(_ message: ChatMessage) -> some View {
-        let isMe = message.senderIdentified && message.isFromMe
-        let sender = isMe ? "Self" : (message.senderIdentified ? "Target · \(monitor.contactName ?? "Contact")" : "Sender unclear")
-        return HStack {
-            if isMe { Spacer(minLength: 36) }
-            VStack(alignment: isMe ? .trailing : .leading, spacing: 3) {
-                Text(sender)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(message.text)
-                    .font(.system(size: 13))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity, alignment: isMe ? .trailing : .leading)
-                    .background(isMe ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-            }
-            if !isMe { Spacer(minLength: 36) }
         }
     }
 
