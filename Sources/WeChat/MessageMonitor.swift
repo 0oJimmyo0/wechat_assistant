@@ -76,6 +76,7 @@ final class MessageMonitor: ObservableObject {
     private var messageCaptureCount = 0
     private var consecutiveEmptyAXSnapshots = 0
     private var consecutiveCaptureFailures = 0
+    private var consecutiveIdentityPending = 0
     private var latestLiveEdgeConfirmed = false
     private var latestSnapshotBlockCount = 0
     private var latestTailOverlap = 0
@@ -171,6 +172,7 @@ final class MessageMonitor: ObservableObject {
                 self.updateCaptureDiagnostics()
                 if case .identityPending(let observation) = captureResult {
                     self.retainPendingIdentityObservation(observation)
+                    self.noteIdentityPending()
                     self.isRunning = true
                     self.conversationIdentityState = .temporarilyUncertain
                     self.acquisitionState = .messagesPending
@@ -191,6 +193,7 @@ final class MessageMonitor: ObservableObject {
                     return
                 }
                 self.consecutiveCaptureFailures = 0
+                self.consecutiveIdentityPending = 0
                 self.lockedContact = snapshot.contact
                 self.lockedVisionIdentity = snapshot.visionIdentity
                 self.contactName = snapshot.contact
@@ -256,6 +259,7 @@ final class MessageMonitor: ObservableObject {
         latestHistoricalOverlap = 0
         consecutiveEmptyAXSnapshots = 0
         consecutiveCaptureFailures = 0
+        consecutiveIdentityPending = 0
     }
 
     func stop() {
@@ -299,11 +303,35 @@ final class MessageMonitor: ObservableObject {
         hasUnverifiedMessageChanges = false
         consecutiveEmptyAXSnapshots = 0
         consecutiveCaptureFailures = 0
+        consecutiveIdentityPending = 0
         status = "Paused"
         if wasActive { onDeactivated?() }
     }
 
     func pollNow() { poll() }
+
+    /// Explicit recovery is safe only before a conversation was confirmed.
+    /// It starts a fresh read without accepting pending text or sending a model
+    /// request. Verified conversations still use the ordinary Refresh action.
+    func retryChatDetection() {
+        guard !isCheckingConversation, !isPolling, !isSyncing, lockedContact == nil else { return }
+        stop()
+        bridge.resetReaderBackend()
+        start()
+    }
+
+    private func noteIdentityPending() {
+        // An initial Vision title may legitimately need two matching reads.
+        // After repeated pending reads, refresh cached AX capabilities so a
+        // transient Vision-only plan cannot block later semantic identity.
+        guard lockedContact == nil else { return }
+        consecutiveIdentityPending += 1
+        if consecutiveIdentityPending >= 3 {
+            bridge.resetReaderBackend()
+            consecutiveIdentityPending = 0
+            lastOlderContextDiagnostic = "Identity pending: refreshed AX/Vision reader capabilities"
+        }
+    }
 
     /// Capture the user's current viewport. Manual history never triggers analysis.
     func refresh() {
@@ -857,6 +885,7 @@ final class MessageMonitor: ObservableObject {
                 self.updateCaptureDiagnostics()
                 if case .identityPending(let observation) = capture {
                     self.retainPendingIdentityObservation(observation)
+                    self.noteIdentityPending()
                     self.conversationIdentityState = .temporarilyUncertain
                     self.acquisitionState = .messagesPending
                     self.status = "Messages captured locally · confirming conversation before analysis"
@@ -875,6 +904,7 @@ final class MessageMonitor: ObservableObject {
                     return
                 }
                 self.consecutiveCaptureFailures = 0
+                self.consecutiveIdentityPending = 0
                 if self.lockedContact == nil {
                     self.discardPendingIdentityMessages()
                 }
