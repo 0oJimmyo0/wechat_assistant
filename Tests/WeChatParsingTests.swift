@@ -63,6 +63,19 @@ enum WeChatParsingTests {
         expect(WeChatParsing.messageText(identifier: "chat_bubble_item_view", title: "10:30", value: nil) == "10:30",
                "an actual timestamp-shaped bubble retains its original message text")
 
+        expect(WeChatParsing.timeSeparatorLabel("10:30") == "10:30", "recognizes an observed clock-time separator")
+        expect(WeChatParsing.timeSeparatorLabel("昨天 10:30") == "昨天 10:30", "recognizes localized WeChat divider")
+        expect(WeChatParsing.timeSeparatorLabel("2026年10月7日 14:35") != nil, "recognizes dated WeChat divider")
+        expect(WeChatParsing.timeSeparatorLabel("Can we meet at 10:30?") == nil,
+               "conversation sentences cannot masquerade as time separators")
+        expect(WeChatParsing.timeSeparatorLabel("random content") == nil, "unknown metadata is not a timestamp")
+        let originalTimed = ChatMessage(text: "message", sender: .other)
+        let observedTimed = originalTimed.withTimeSeparator("Yesterday 10:30")
+        expect(originalTimed.timeSeparatorBefore == nil && observedTimed.timeSeparatorBefore == "Yesterday 10:30",
+               "time dividers remain optional evidence; never inferred from firstSeenAt")
+        expect(originalTimed.localID == observedTimed.localID && originalTimed.id == observedTimed.id,
+               "adding verified time metadata preserves occurrence identity")
+
         let unknown = ChatMessage(text: "hello", sender: .unknown)
         let incoming = ChatMessage(text: "hello", sender: .other)
         let outgoing = ChatMessage(text: "hello", sender: .me)
