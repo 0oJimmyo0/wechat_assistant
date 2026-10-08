@@ -160,7 +160,13 @@ struct ReplySidebarView: View {
                 }
                 Spacer(minLength: 0)
             }
+            Text(monitor.captureDetails.summary).font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text(monitor.captureDuration).font(.caption2).foregroundStyle(.secondary)
+            if monitor.captureDetails.candidateCount > monitor.captureDetails.acceptedCount {
+                Text("Unverified observations are excluded from stored messages and analysis.")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
             if monitor.messages.count > 5 {
                 Button(displayedMessageLimit == 5 ? "Show latest 20" : "Show latest 5") {
                     displayedMessageLimit = displayedMessageLimit == 5 ? 20 : 5

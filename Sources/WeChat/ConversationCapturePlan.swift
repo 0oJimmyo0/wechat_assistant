@@ -12,6 +12,33 @@ enum VisionLayoutRegions {
         return CGRect(x: x, y: verticalRegion.minY, width: width, height: verticalRegion.height)
     }
 
+    /// AX coordinates start at the screen's top-left; Vision coordinates start
+    /// at the window's bottom-left. Use the measured viewport, not calibration.
+    static func normalizedAXFrame(_ frame: CGRect, in window: CGRect) -> CGRect? {
+        guard window.width > 0, window.height > 0, frame.width > 0, frame.height > 0,
+              frame.minX >= window.minX - 2, frame.minY >= window.minY - 2,
+              frame.maxX <= window.maxX + 2, frame.maxY <= window.maxY + 2 else { return nil }
+        let clipped = frame.intersection(window)
+        return CGRect(x: (clipped.minX - window.minX) / window.width,
+                      y: 1 - (clipped.maxY - window.minY) / window.height,
+                      width: clipped.width / window.width, height: clipped.height / window.height)
+    }
+
+    static func accessibilityTranscript(viewport: CGRect, composer: CGRect?, window: CGRect,
+                                        source: ConversationPaneGeometrySource) -> ConversationPaneGeometry? {
+        guard let region = normalizedAXFrame(viewport, in: window),
+              region.width >= 0.28, region.height >= 0.25,
+              region.minX >= 0.01, region.maxY <= 0.97, region.minY >= 0.05 else { return nil }
+        if source != .accessibilityMessageList {
+            guard let composer, normalizedAXFrame(composer, in: window) != nil,
+                  composer.minY >= viewport.maxY, composer.width >= viewport.width * 0.80,
+                  abs(composer.minX - viewport.minX) <= 20 else { return nil }
+        }
+        return ConversationPaneGeometry(leftX: region.minX,
+            headerRegion: CGRect(x: region.minX, y: region.maxY, width: region.width, height: 1 - region.maxY),
+            messageRegion: region, source: source, confidence: 0.98)
+    }
+
     static func windowBounds(_ localBounds: CGRect, in region: CGRect) -> CGRect {
         CGRect(x: region.minX + localBounds.minX * region.width,
                y: region.minY + localBounds.minY * region.height,
@@ -59,9 +86,11 @@ struct ConversationPaneGeometry: Sendable, Equatable {
                 y: windowFrame.minY + windowFrame.height * (1 - messageRegion.midY))
     }
 
-    func validatingVisualEvidence(titleBounds: CGRect?, messageBounds: [CGRect]) -> ConversationPaneGeometry {
+    func validatingVisualEvidence(titleBounds: CGRect?, messageBounds: [CGRect], composerBounds: CGRect? = nil) -> ConversationPaneGeometry {
         guard source == .visualDividerCandidate,
-              let title = titleBounds,
+              let title = titleBounds, let composer = composerBounds,
+              headerRegion.contains(title), composer.maxY <= messageRegion.minY,
+              composer.minX >= leftX, composer.width >= messageRegion.width * 0.80,
               title.minX >= leftX,
               (title.midX - leftX) / max(0.01, 1 - leftX) <= 0.70,
               !messageBounds.isEmpty else { return self }
@@ -77,6 +106,25 @@ struct ConversationPaneGeometry: Sendable, Equatable {
             composerTopY: messageRegion.minY,
             source: .visualDivider, confidence: 0.78
         )
+    }
+}
+
+struct CaptureAttemptDiagnostics: Sendable, Equatable {
+    var source: ConversationCaptureSource?
+    var geometryVerified = false
+    var ocrMode = "not used"
+    var rawCount = 0
+    var candidateCount = 0
+    var acceptedCount = 0
+    var durationMilliseconds = 0
+    var rejectionReason: String?
+    var hasRun = false
+
+    var summary: String {
+        guard hasRun else { return "Capture: not run" }
+        let reason = rejectionReason.map { " · " + $0 } ?? ""
+        return "Source: \(source?.rawValue ?? "unavailable") · geometry: \(geometryVerified ? "verified" : "unverified") · OCR: \(ocrMode)\n" +
+            "\(durationMilliseconds) ms · raw: \(rawCount) · candidates: \(candidateCount) · accepted: \(acceptedCount)" + reason
     }
 }
 

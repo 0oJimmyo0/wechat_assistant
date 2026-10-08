@@ -1,85 +1,123 @@
 # WeChat capture validation — 2026-10-07
 
-**Merge gate remains closed.** Code checks do not establish the live WeChat 4.x
-acceptance criteria, correct contact/content, or the under-two-second Refresh target.
+**Merge gate remains closed.** The target Mac runs WeChat **3.3.1**, not 4.x.
+Automated checks and the observations below do not establish all live acceptance criteria.
 
-## Checkout and PR #2
+## Reproduction and correction
 
-Implementation changes are in the user's existing `fix/wechat-process-detection`
-checkout, based on `46940c9`. PR #2 has a different head, `621daa42b81f3fa11a72805c355a8994806bc4fe`.
-That exact PR head was fetched and separately built in a detached worktree at
-`.build/pr2-validation`. No branch was merged, pushed, or published. These local
-implementation changes have not been applied to PR #2.
+The initial read-only probe could not see an AX window while WeChat was hidden.
+Bringing the existing WeChat conversation forward exposed the window and its
+transcript scroll area. The window frame was `(127,73,1269,788)`, the transcript
+frame `(447,164,950,486)`, and the composer frame `(453,726,938,129)` in AX screen
+coordinates. The sidebar table contained 698 virtual rows; depth-first discovery
+spent its budget traversing that unrelated table.
 
-## Available verification
+Discovery now walks breadth-first and inspects visible list/table children only.
+Transcript geometry uses the measured viewport, with an aligned composer below
+it as evidence for builds without the semantic message-list identifier. AX
+screen coordinates are normalized into Vision coordinates without substituting
+a calibrated crop. A measured native viewport reached validated geometry with
+initial discovery of approximately 34 ms, compared with approximately 950 ms
+of earlier probes. A representative initial capture took approximately 1.3 s.
+These are diagnostic observations, not a controlled same-conversation benchmark.
 
-- The macOS application builds and signs locally. The existing ScreenCaptureKit
-  migration warning for `CGWindowListCreateImage` is unrelated to these changes.
-- Parsing/source-selection/store regression suites cover direct and descendant
-  text filtering, sender uncertainty, distinct repeated-message IDs, stable
-  overlap identities, historical overlap taking priority over repeated tail
-  text, memory limits, exact AX punctuation/case, and missing/negative live-edge
-  evidence blocking automatic arrival classification.
-- PR #2's exact head builds and signs on this Mac. A temporary read-only capture
-  harness reported Accessibility trusted, no contact, no message list, and zero
-  bubbles/messages. This is an unavailable capture, not a successful live test.
-- The current app's content-free live diagnostic reported the official WeChat
-  process, Accessibility permission, zero AX windows, and an unavailable main
-  conversation window. Screen Recording permission was granted.
-- Ten capture attempts reported `WeChat window unavailable`. There are **zero
-  validated latency samples**. Their durations do not demonstrate faster loading.
-- `/Applications/WeChat.app` reports `CFBundleShortVersionString` **3.3.1**. No
-  real WeChat 4.x conversation was available for this run.
+The earlier fast OCR path accepted nonempty but suspicious mixed-language text.
+It now retries accurately for Chinese, mixed, low-confidence, or unreadable
+observations. Message OCR enables language detection with English and simplified/
+traditional Chinese. Reconstruction requires a completely visible, filled bubble
+background; it groups lines by that component rather than proximity. A rejected
+low-confidence row makes its entire bubble unreadable. Cropped bubbles, centered
+notices, timestamps, sidebar, header, and composer text cannot supply context.
+Vision messages remain ineligible for automatic analysis.
 
-## Implementation limits to check live
+## Live observations
 
-The message source requires the semantic `chat_message_list` identifier. It
-never substitutes a geometrically plausible unrelated AX list. Known bubble
-rows read batched title/value attributes; fallback text remains inside those
-rows, excluding metadata identifiers, timestamp labels, and controls. Wrapped
-bubble rows are inspected within bounded list-row descendants. AX text keeps
-case, whitespace, and punctuation for overlap comparison; each retained message
-occurrence owns a UUID. A session stores at most 200 messages and is cleared on
-stop or confirmed conversation change, preserving the existing privacy control.
+A content-free, ten-attempt read-only harness observed one identity-pending
+capture followed by nine captures with confirmed identity and verified native
+scroll-area geometry. Three complete visible bubbles entered the trusted store;
+a long top bubble crossed the viewport boundary and was excluded. The eight
+subsequent observations preserved message text, count, order, and local IDs in
+memory. No private message text or contact name was printed.
 
-Automatic analysis requires identified senders, multiple distinct ordered
-anchors, unique overlap, continuous live monitoring, and readable scrollbar
-minimum/maximum/value evidence of the latest viewport. Missing scrollbar evidence
-or unreadable bubbles keep arrival uncertain; manual analysis remains available
-for validated context. Refresh, Follow latest, and loading history cannot trigger
-automatic analysis themselves. Confirm that WeChat 4.x exposes this scrollbar
-evidence; if it does not, automatic analysis intentionally remains disabled.
+- Identity-pending capture: 1526 ms.
+- First validated capture: 628 ms.
+- Eight unchanged validated captures: 120–132 ms, reusing OCR after exact pixel
+  fingerprints of the transcript and header matched.
+- Validated P50/P95: **122/628 ms**, nine samples in one open conversation.
+- Automatic-analysis eligibility: false for every observed Vision message.
 
-The structural diagnostic never outputs AXTitle/AXValue/AXDescription contents
-or contact identifiers. It lists supported attribute names and bounded sampled
-row counts. Capture metrics keep at most 200 attempts and compute P50/P95 from
-validated captures only. The ten-attempt benchmark does not scroll, send messages,
-or call a model. Existing local Vision support is preserved; no new OCR or
-WeChat database access was introduced.
+A second ten-attempt run on a changed viewport retained two accepted bubbles
+from 31 OCR observations. It again preserved eight subsequent trusted histories
+and reported P50/P95 **137/980 ms**; the identity-pending cold attempt took
+2358 ms. Cached attempts retained the original raw observation count in their
+diagnostics. This confirms that cold activation can still exceed two seconds,
+and conservative filtering can omit visible text. It does not establish complete
+transcript coverage.
 
-## Required live WeChat 4.x checks before merge
+These timings demonstrate the warm capture path on this machine, not all UI
+Refresh situations. The earlier and later previews used different conversations;
+they cannot establish a same-chat before/after text comparison. The required
+annotated previews were deliberately saved locally under ignored
+`.build/diagnostics/` and inspected. Accepted boxes were inside the measured
+transcript; sidebar, header, composer, timestamps, and a clipped top bubble were
+excluded. These private previews are not part of the repository.
 
-1. Open a direct chat on WeChat 4.x, activate, and compare the contact and each
-   captured message with the visible conversation. Check a group chat as well.
-2. Inspect the AX diagnostic: confirmed list/bubble identifiers, hierarchy, roles,
-   row counts, text attribute support, no message/contact text in the report.
-3. Place distinctive text in a sidebar preview/contact details and confirm it
-   never appears in captured context. Check dates, recalls, notices, attachments,
-   and virtual placeholders. Verify exact failure stages when text is unavailable.
-4. Have a participant send identical messages twice. Confirm two distinct
-   occurrences and stable IDs on Refresh. No app restart should be required.
-5. Scroll backward through repeats and previously unseen history, then Refresh.
-   Confirm context updates with stable ordering and no automatic analysis.
-6. Test new arrivals at the bottom, missing sender information, an unavailable
-   scrollbar, an ambiguous overlap, and returning from history. Only arrivals
-   with all identity/sender/direction evidence may trigger opted-in analysis.
-7. Change chat/window, reopen a window, and resize it. Confirm cache invalidation,
-   session isolation, and that suggestions use only the active validated chat.
-8. Check the 5/20 display toggle, actual captured count, Refresh status/duration,
-   and that stopping/closing clears all retained messages and suggestions.
-9. Run `--capture-benchmark` on representative open chats and measure Refresh in
-   the UI. Record initial capture and warm P50/P95, scanned nodes, and extracted
-   counts without saving chat text. Typical validated Refresh must be under 2 s;
-   compare the same conversation/window/version with the baseline build.
-10. Re-run `bash test-wechat-parsing.sh` and `./build.sh` on the final change, then
-    mark these live checks complete before considering merge.
+The live harness exercised capture and the conversation store, not the complete
+sidebar workflow. Manual confirmation of all characters and the active contact,
+new arrivals, scrolling, switching conversations, and real repeated identical
+messages remains outstanding. No messages were sent, no chat was selected by the
+harness, and no model request or database access was performed.
+
+## Automated verification
+
+`bash test-wechat-parsing.sh` covers parsing, source selection, measured geometry,
+all-attempt diagnostics, distinct repeated occurrence IDs, exact AX punctuation,
+ordered overlap, bounded history, OCR variation, three unchanged observations,
+ambiguous tail overlap, historical scrolling, and uncertain arrival evidence.
+
+`bash test-wechat-vision.sh` runs the production OCR/reconstruction path on a
+synthetic, sanitized recreation of the observed layout, using only public test
+text. It verifies Chinese, English punctuation, mixed multiline messages,
+separate bubbles, identical occurrences, unreadable lines, and UI exclusions.
+It does not load the user's private screenshot or establish accuracy for every
+real screenshot, theme, attachment, or font.
+
+The macOS app builds and signs with the existing stable local identity. The
+existing `CGWindowListCreateImage` deprecation warning remains. Capture metrics
+retain at most 200 attempts; P50/P95 use validated captures only. Every attempt,
+including identity-pending and failed captures, updates source, geometry, OCR
+mode, raw/candidate/accepted counts, duration, and rejection reason.
+
+## Limits and remaining merge gate
+
+Visual-divider geometry without measured AX viewport/composer evidence stays
+unverified. Full visual-only header/composer boundary detection is unresolved;
+the app deliberately refuses to trust a calibrated plausible crop. Pixel bubble
+segmentation is bounded and conservative; unsupported backgrounds or partially
+visible messages may be omitted rather than guessed.
+
+AX text extraction still requires `chat_message_list` and confirmed
+`chat_bubble_item_view` rows. WeChat 3.3.1 did not expose these semantic identifiers.
+PR #2's exact head `621daa42b81f3fa11a72805c355a8994806bc4fe` was separately built
+in `.build/pr2-validation`; it has not been merged. Fixes remain on
+`fix/wechat-process-detection` in `0oJimmyo0/wechat_assistant`.
+
+Before merging, manually verify on the intended WeChat version:
+
+1. Correct contact and every readable Chinese/English/multiline message in direct
+   and group conversations; no unrelated UI or system notices.
+2. Two identical real messages remain distinct and three unchanged UI Refresh
+   operations retain content, ordering, count, and identities.
+3. Incoming messages appear without restarting; scrolling backward and returning
+   to latest never creates false arrivals or automatic analysis.
+4. Switching, resizing, reopening, and changing windows invalidates stale context
+   and suggestions. Failed captures preserve the last trusted history.
+5. Refresh, Follow latest, Load older to 20, the 5/20 display, status/counts, and
+   stop/close privacy clearing work in the rebuilt sidebar.
+6. Measure UI Refresh latency across representative conversations. Confirm AX
+   diagnostics contain structure and attribute support only, with no private text.
+7. Run both regression scripts and the macOS build on the final changes.
+
+Read-only WeChat access and suggestion-only replies remain unchanged. Automatic
+analysis requires identity, sender, reliable ordered overlap, and latest-viewport
+arrival evidence; Vision or uncertain captures cannot trigger it.

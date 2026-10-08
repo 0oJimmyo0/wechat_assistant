@@ -67,7 +67,16 @@ final class ConversationStore {
                 ChatHistoryMerger.sequencesMatch(messages, lhsStart: $0,
                     snapshot, rhsStart: overlap.observedStart, length: overlap.length)
             }.count
-            let arrivalConfirmed = overlap.length >= 2 && anchorKeys.count >= 2 && anchorOccurrences == 1
+            let observedOccurrences = (0...(snapshot.count - overlap.length)).filter {
+                ChatHistoryMerger.sequencesMatch(messages, lhsStart: messages.count - overlap.length,
+                    snapshot, rhsStart: $0, length: overlap.length)
+            }.count
+            let reliableOverlap = overlap.length >= 2 && anchorKeys.count >= 2 &&
+                anchorOccurrences == 1 && observedOccurrences == 1
+            if !appended.isEmpty && !reliableOverlap {
+                return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
+            }
+            let arrivalConfirmed = reliableOverlap
             let merged = messages + appended
             messages = Array(merged.suffix(maximumMessages))
             return ConversationMergeResult(appended: appended, prepended: [],

@@ -12,7 +12,7 @@ enum ConversationStoreTests {
 
         let duplicateStore = ConversationStore()
         _ = duplicateStore.merge(rows("A", "哈哈"), trust: .validated)
-        let duplicate = duplicateStore.merge(rows("哈哈", "哈哈", "B"), trust: .validated)
+        let duplicate = duplicateStore.merge(rows("A", "哈哈", "哈哈", "B"), trust: .validated)
         expect(texts(duplicateStore) == ["A", "哈哈", "哈哈", "B"], "repeated identical messages remain separate")
         expect(duplicate.appended.map(\.text) == ["哈哈", "B"], "duplicate sequence overlap preserves the extra occurrence")
 
@@ -49,7 +49,7 @@ enum ConversationStoreTests {
         expect(arrival.arrivalConfirmed, "a unique pair of distinct ordered anchors confirms arrival")
         expect(Array(safeArrival.messages.prefix(3)).map(\.localID) == stableIDs,
                "overlapping observations preserve occurrence identities")
-        expect(!duplicate.arrivalConfirmed, "a single repeated anchor cannot confirm arrival")
+        expect(!duplicate.arrivalConfirmed, "missing live-edge evidence cannot confirm repeated-message arrival")
         expect(Set(duplicateStore.messages.map(\.id)).count == duplicateStore.messages.count,
                "identical messages have distinct occurrence IDs")
 
@@ -71,9 +71,31 @@ enum ConversationStoreTests {
 
         let exactAX = ConversationStore()
         _ = exactAX.merge(rows("Hello!", "Hello"), trust: .validated)
-        _ = exactAX.merge(rows("Hello", "hello"), trust: .validated)
+        _ = exactAX.merge(rows("Hello!", "Hello", "hello"), trust: .validated)
         expect(texts(exactAX) == ["Hello!", "Hello", "hello"],
                "case and punctuation distinguish accessibility message content")
+
+        let ambiguous = ConversationStore()
+        _ = ambiguous.merge(rows("A", "哈哈"), trust: .validated)
+        let original = ambiguous.messages
+        let uncertain = ambiguous.merge(rows("哈哈", "哈哈", "B"), trust: .validated, liveEdgeState: true)
+        expect(uncertain.viewport == .uncertain && uncertain.appended.isEmpty && ambiguous.messages == original,
+               "ambiguous repeated overlap never appends, even with bottom-scrollbar evidence")
+
+        let refreshStore = ConversationStore()
+        _ = refreshStore.merge(visionRows("第一条内容。", "review paper", "明天讨论结果。"), trust: .validated)
+        let beforeRefresh = refreshStore.messages
+        for _ in 0..<3 {
+            let refreshed = refreshStore.merge(visionRows("第一条内容。", "review paper", "明天讨论结果。"), trust: .validated)
+            expect(refreshed.unchanged && refreshStore.messages == beforeRefresh,
+                   "three unchanged captures preserve exact text, count, order and occurrence IDs")
+        }
+        let fuzzyRefresh = refreshStore.merge(visionRows("第一条内容。", "review pape", "明天讨论结果。"), trust: .validated)
+        expect(fuzzyRefresh.unchanged && refreshStore.messages == beforeRefresh,
+               "minor OCR variation does not rewrite trusted text or create an incoming occurrence")
+        let unrelated = refreshStore.merge(visionRows("没有重叠", "未知上下文"), trust: .validated)
+        expect(unrelated.viewport == .uncertain && refreshStore.messages == beforeRefresh,
+               "an unanchored OCR view keeps the last validated history unchanged")
 
         let fullBounded = ConversationStore(maximumMessages: 20)
         _ = fullBounded.merge((10..<30).map { row("\($0)") }, trust: .validated)

@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import ScreenCaptureKit
 import Vision
+import CryptoKit
 
 struct VisibleWeChatSnapshot: Sendable {
     let title: String?
@@ -117,6 +118,11 @@ final class WeChatScreenReader {
     private var cachedKey: String?
     private var cachedAt = Date.distantPast
     private var cachedSnapshot: VisibleWeChatSnapshot?
+    private var cachedMessageCapture: ParsedMessageCapture?
+    private var cachedMessageObservationCount = 0
+    private var cachedMessageFingerprint: String?
+    private var cachedMessageSourceKey: String?
+    private var cachedMessageRecognitionLevel: VNRequestTextRecognitionLevel = .accurate
     private var cachedSourceKey: String?
     private var cachedSourceAt = Date.distantPast
     private var cachedCapturedWindow: CapturedWindow?
@@ -288,6 +294,8 @@ final class WeChatScreenReader {
         let wideCropFallbackSucceeded = false
         var activeMessageRecognitionLevel = mode.messageRecognitionLevel
         let effectiveMessageRegion = geometry.messageRegion
+        var bubbleRegions: [VisionBubbleRegion] = []
+        let messageSourceKey = sourceKey + ":" + String(describing: effectiveMessageRegion)
         var headerFingerprint: String?
         var headerFrameUnchanged = false
         var headerOCRDurationMilliseconds = 0
@@ -298,16 +306,16 @@ final class WeChatScreenReader {
 
         if mode.readsTitle {
             if let headerImage = crop(image, to: titleRegion) {
-                headerFingerprint = perceptualFingerprint(headerImage, width: 32, height: 24)
+                headerFingerprint = exactFingerprint(headerImage)
                 headerFrameUnchanged = previousHeaderFingerprint.map {
-                    fingerprintDistance(headerFingerprint ?? "", $0) <= 0.003
+                    headerFingerprint == $0
                 } ?? false
                 if !headerFrameUnchanged {
                     let ocrStarted = Date()
                     let request = VNRecognizeTextRequest()
                     request.recognitionLevel = .accurate
                     request.usesLanguageCorrection = true
-                    request.recognitionLanguages = ["zh-Hans", "en-US"]
+                    request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
                     request.minimumTextHeight = 0.006
                     visionSucceeded = (try? VNImageRequestHandler(cgImage: headerImage).perform([request])) != nil
                     headerObservations = request.results ?? []
@@ -320,12 +328,19 @@ final class WeChatScreenReader {
 
         if mode.readsMessages {
             if let messageImage = crop(image, to: effectiveMessageRegion),
-               let fingerprint = perceptualFingerprint(messageImage) {
+               let fingerprint = exactFingerprint(messageImage) {
                 messageFingerprint = fingerprint
                 messageFrameUnchanged = previousMessageFingerprint.map {
-                    fingerprintDistance(fingerprint, $0) <= 0.015
+                    fingerprint == $0
                 } ?? false
-                if !messageFrameUnchanged {
+                if messageFrameUnchanged, cachedMessageFingerprint == fingerprint,
+                   cachedMessageSourceKey == messageSourceKey, let cachedMessageCapture,
+                   geometry.isValidated {
+                    parsedMessages = cachedMessageCapture
+                    activeMessageRecognitionLevel = cachedMessageRecognitionLevel
+                } else {
+                    messageFrameUnchanged = false
+                    bubbleRegions = VisionMessageReconstruction.bubbleRegions(in: image, region: effectiveMessageRegion)
                     let initial = recognizeMessageImage(messageImage, level: mode.messageRecognitionLevel)
                     messageOCRSucceeded = initial.succeeded
                     messageObservations = initial.observations
@@ -335,20 +350,23 @@ final class WeChatScreenReader {
                     } else {
                         accurateOCRObservationCount = initial.observations.count
                     }
-                    parsedMessages = parseMessageObservations(messageObservations, region: effectiveMessageRegion)
+                    parsedMessages = parseMessageObservations(messageObservations, region: effectiveMessageRegion, bubbles: bubbleRegions)
 
-                    // Fast OCR is a speed path, not an empty-result authority.
-                    // Retry accurate OCR against this same cropped image when
-                    // fast OCR yields no accepted message bubbles.
-                    if parsedMessages.messages.isEmpty && mode.messageRecognitionLevel == .fast {
+                    // Mixed-language, suspicious, and low-confidence results
+                    // must be re-read accurately even when fast OCR found text.
+                    let qualityCandidates = messageObservations.compactMap { observation -> (text: String, confidence: Float)? in
+                        guard let candidate = observation.topCandidates(1).first else { return nil }
+                        return (candidate.string, candidate.confidence)
+                    }
+                    if mode.messageRecognitionLevel == .fast && WeChatParsing.needsAccurateOCR(qualityCandidates, acceptedCount: parsedMessages.messages.count) {
                         accurateFallbackAttempted = true
                         let accurate = recognizeMessageImage(messageImage, level: .accurate)
-                        messageOCRSucceeded = messageOCRSucceeded || accurate.succeeded
+                        messageOCRSucceeded = accurate.succeeded
                         accurateOCRObservationCount = accurate.observations.count
                         messageOCRDurationMilliseconds += accurate.durationMilliseconds
                         if accurate.succeeded {
                             messageObservations = accurate.observations
-                            parsedMessages = parseMessageObservations(messageObservations, region: effectiveMessageRegion)
+                            parsedMessages = parseMessageObservations(messageObservations, region: effectiveMessageRegion, bubbles: bubbleRegions)
                             activeMessageRecognitionLevel = .accurate
                         }
                     }
@@ -407,9 +425,16 @@ final class WeChatScreenReader {
             )
         }
         let resolvedGeometry = geometry.validatingVisualEvidence(
-            titleBounds: accepted?.diagnostic.bounds, messageBounds: messageBounds
+            titleBounds: accepted?.diagnostic.bounds, messageBounds: messageBounds, composerBounds: nil
         )
 
+        if resolvedGeometry.isValidated, !parsedMessages.messages.isEmpty, let messageFingerprint {
+            cachedMessageCapture = parsedMessages
+            if !messageFrameUnchanged { cachedMessageObservationCount = messageObservations.count }
+            cachedMessageFingerprint = messageFingerprint
+            cachedMessageSourceKey = messageSourceKey
+            cachedMessageRecognitionLevel = activeMessageRecognitionLevel
+        }
         return (makeSnapshot(
             title: title,
             messages: Array(messages.suffix(50)),
@@ -427,11 +452,11 @@ final class WeChatScreenReader {
             titleIdentity: acceptedIdentity,
             titleRejectedAsMessageCount: titleSelection.rejectedAsMessageCount,
             titleRejectedAsSentenceCount: titleSelection.rejectedAsSentenceCount,
-            messageObservations: messageObservations.count,
+            messageObservations: messageFrameUnchanged ? cachedMessageObservationCount : messageObservations.count,
             messageBounds: Array(messageBounds.suffix(50)),
             rejectedMessageBounds: rejectedMessageBounds,
             messageExtractionTrustworthy: !messages.isEmpty && messageBounds.count == messages.count &&
-                messages.allSatisfy { $0.source == .vision && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.confidence >= 0.45 },
+                messages.allSatisfy { $0.source == .vision && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.confidence >= 0.70 },
             messageFingerprint: messageFingerprint,
             messageFrameUnchanged: messageFrameUnchanged,
             headerFingerprint: headerFingerprint,
@@ -440,7 +465,7 @@ final class WeChatScreenReader {
             messageOCRDurationMilliseconds: messageOCRDurationMilliseconds,
             visionDurationMilliseconds: Int(Date().timeIntervalSince(visionStarted) * 1000),
             messagePaneLeftX: usedLeftX,
-            messageRecognitionLevel: messageRecognitionLevelName(activeMessageRecognitionLevel),
+            messageRecognitionLevel: (messageFrameUnchanged ? "cached " : "") + messageRecognitionLevelName(activeMessageRecognitionLevel),
             fastOCRObservationCount: fastOCRObservationCount,
             accurateFallbackAttempted: accurateFallbackAttempted,
             accurateOCRObservationCount: accurateOCRObservationCount,
@@ -678,35 +703,6 @@ final class WeChatScreenReader {
         )
     }
 
-    private func perceptualFingerprint(_ image: CGImage, width: Int = 16, height: Int = 16) -> String? {
-        var pixels = [UInt8](repeating: 0, count: width * height)
-        let rendered = pixels.withUnsafeMutableBytes { storage -> Bool in
-            guard let context = CGContext(
-                data: storage.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: width,
-                space: CGColorSpaceCreateDeviceGray(),
-                bitmapInfo: CGImageAlphaInfo.none.rawValue
-            ) else { return false }
-            context.interpolationQuality = .low
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-        guard rendered else { return nil }
-        return Data(pixels).base64EncodedString()
-    }
-
-    private func fingerprintDistance(_ lhs: String, _ rhs: String) -> Double {
-        guard let left = Data(base64Encoded: lhs), let right = Data(base64Encoded: rhs),
-              left.count == right.count, !left.isEmpty else { return .infinity }
-        let totalDifference = zip(left, right).reduce(0) { partial, pair in
-            partial + abs(Int(pair.0) - Int(pair.1))
-        }
-        return Double(totalDifference) / (Double(left.count) * 255)
-    }
-
     private func rankHeaderCandidates(_ observations: [VNRecognizedTextObservation], region: CGRect) -> [RankedHeaderCandidate] {
         var candidates: [RankedHeaderCandidate] = []
         for observation in observations {
@@ -799,8 +795,8 @@ final class WeChatScreenReader {
         return looksLikeSearchControl || (paneX >= 0.58 && normalized.contains("搜索"))
     }
 
-    func diagnosticReport(pid: pid_t, windowFrame: CGRect) -> String {
-        let snapshot = read(pid: pid, windowFrame: windowFrame, forceFresh: true)
+    func diagnosticReport(pid: pid_t, windowFrame: CGRect, paneGeometry: ConversationPaneGeometry? = nil) -> String {
+        let snapshot = read(pid: pid, windowFrame: windowFrame, mode: .fullFast, forceFresh: true, paneGeometry: paneGeometry)
         let size = snapshot.capturedSize.map { "\(Int($0.width))x\(Int($0.height))" } ?? "unavailable"
         let crop = snapshot.conversationCrop
         let headerRegion = snapshot.paneGeometry.headerRegion
@@ -863,14 +859,14 @@ final class WeChatScreenReader {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    func annotatedPreview(pid: pid_t, windowFrame: CGRect) -> NSImage? {
+    func annotatedPreview(pid: pid_t, windowFrame: CGRect, paneGeometry: ConversationPaneGeometry? = nil) -> NSImage? {
         let key = "\(pid):\(Int(windowFrame.origin.x)): \(Int(windowFrame.origin.y)): \(Int(windowFrame.width)): \(Int(windowFrame.height))"
         cacheCondition.lock()
         while captureInProgress { cacheCondition.wait() }
         captureInProgress = true
         cacheCondition.unlock()
 
-        let result = capture(pid: pid, windowFrame: windowFrame, mode: .full, forceFresh: true)
+        let result = capture(pid: pid, windowFrame: windowFrame, mode: .fullFast, forceFresh: true, paneGeometry: paneGeometry)
         cacheCondition.lock()
         cachedKey = key
         cachedSnapshot = result.snapshot
@@ -894,8 +890,10 @@ final class WeChatScreenReader {
         NSColor.systemGreen.setStroke()
         visionRect(result.snapshot.paneGeometry.messageRegion, size: size).stroke()
         NSColor.systemOrange.setStroke()
-        visionRect(CGRect(x: 0, y: 0, width: 1, height: VisionLayoutCalibration.current.composerTopY),
-                   size: size).stroke()
+        visionRect(CGRect(x: result.snapshot.paneGeometry.leftX, y: 0,
+                         width: 1 - result.snapshot.paneGeometry.leftX,
+                         height: result.snapshot.paneGeometry.messageRegion.minY), size: size).stroke()
+        visionRect(CGRect(x: 0, y: 0, width: result.snapshot.paneGeometry.leftX, height: 1), size: size).stroke()
         NSColor.systemPurple.setStroke()
         for candidate in result.snapshot.headerCandidates where !candidate.accepted {
             visionRect(candidate.bounds, size: size).stroke()
@@ -946,9 +944,10 @@ final class WeChatScreenReader {
     }
 
     private func parseMessageObservations(_ observations: [VNRecognizedTextObservation],
-                                         region: CGRect) -> ParsedMessageCapture {
+                                         region: CGRect, bubbles: [VisionBubbleRegion]) -> ParsedMessageCapture {
         var rejectedBounds: [CGRect] = []
-        var lines: [RecognizedMessageLine] = []
+        var lines: [VisionMessageLine] = []
+        var unreadableBubbleIDs: Set<Int> = []
         var plausibleTextCount = 0
         var geometryRejectedCount = 0
         var timestampControlRejectedCount = 0
@@ -958,8 +957,13 @@ final class WeChatScreenReader {
                 continue
             }
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard WeChatParsing.isPlausibleChatText(text, confidence: candidate.confidence) else {
-                rejectedBounds.append(mapBounds(observation.boundingBox, from: region))
+            guard WeChatParsing.isReliableOCRText(text, confidence: candidate.confidence) else {
+                let bounds = mapBounds(observation.boundingBox, from: region)
+                let line = VisionMessageLine(text: text, bounds: bounds, confidence: candidate.confidence)
+                if let bubble = VisionMessageReconstruction.region(for: line, in: bubbles) {
+                    unreadableBubbleIDs.insert(bubble.id)
+                }
+                rejectedBounds.append(bounds)
                 continue
             }
             plausibleTextCount += 1
@@ -976,10 +980,19 @@ final class WeChatScreenReader {
                 rejectedBounds.append(bounds)
                 continue
             }
-            lines.append(RecognizedMessageLine(text: text, bounds: bounds,
+            lines.append(VisionMessageLine(text: text, bounds: bounds,
                                                confidence: candidate.confidence))
         }
-        let (messages, bounds) = groupMessageLines(lines, region: region)
+        let confirmed = lines.filter { line in
+            guard let bubble = VisionMessageReconstruction.region(for: line, in: bubbles),
+                  !unreadableBubbleIDs.contains(bubble.id) else {
+                rejectedBounds.append(line.bounds)
+                geometryRejectedCount += 1
+                return false
+            }
+            return true
+        }
+        let (messages, bounds) = VisionMessageReconstruction.reconstruct(confirmed, bubbles: bubbles, region: region)
         return ParsedMessageCapture(messages: messages, bounds: bounds,
                                     rejectedBounds: rejectedBounds,
                                     plausibleTextCount: plausibleTextCount,
@@ -993,7 +1006,8 @@ final class WeChatScreenReader {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = level
         request.usesLanguageCorrection = level == .accurate
-        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        request.recognitionLanguages = ["en-US", "zh-Hans", "zh-Hant"]
+        request.automaticallyDetectsLanguage = true
         request.minimumTextHeight = 0.008
         let succeeded = (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil
         return MessageOCRCapture(observations: request.results ?? [], succeeded: succeeded,
@@ -1050,64 +1064,29 @@ final class WeChatScreenReader {
         return CGFloat(bestX) / CGFloat(image.width)
     }
 
-    private func groupMessageLines(_ lines: [RecognizedMessageLine], region: CGRect) -> ([ChatMessage], [CGRect]) {
-        var bubbles: [(text: String, bounds: CGRect, lines: [RecognizedMessageLine])] = []
-        for line in lines.sorted(by: { $0.bounds.maxY > $1.bounds.maxY }) {
-            if let previous = bubbles.last {
-                let verticalGap = previous.bounds.minY - line.bounds.maxY
-                let referenceHeight = max(previous.bounds.height / CGFloat(previous.lines.count), line.bounds.height)
-                let verticalTolerance = max(0.010, referenceHeight * 0.75)
-                let overlap = max(0, min(previous.bounds.maxX, line.bounds.maxX) - max(previous.bounds.minX, line.bounds.minX))
-                let narrowerWidth = max(0.001, min(previous.bounds.width, line.bounds.width))
-                let rangesOverlap = overlap / narrowerWidth >= 0.40
-                let alignmentTolerance = max(0.025, referenceHeight * 1.8)
-                let leftAligned = abs(previous.bounds.minX - line.bounds.minX) <= alignmentTolerance
-                let rightAligned = abs(previous.bounds.maxX - line.bounds.maxX) <= alignmentTolerance
-                let previousSide = WeChatParsing.messageSide(previous.bounds, in: region)
-                let lineSide = WeChatParsing.messageSide(line.bounds, in: region)
-                let compatibleSide = previousSide == .unknown || lineSide == .unknown || previousSide == lineSide
-                let sameBubble = verticalGap >= -referenceHeight * 0.4 &&
-                    verticalGap <= verticalTolerance &&
-                    (rangesOverlap || leftAligned || rightAligned) && compatibleSide
-                if sameBubble {
-                    bubbles[bubbles.count - 1].text += "\n" + line.text
-                    bubbles[bubbles.count - 1].bounds = previous.bounds.union(line.bounds)
-                    bubbles[bubbles.count - 1].lines.append(line)
-                    continue
-                }
-            }
-            bubbles.append((line.text, line.bounds, [line]))
-        }
-        let messages = bubbles.enumerated().map { index, bubble in
-            let sender = WeChatParsing.messageSide(bubble.bounds, in: region)
-            let normalizedText = bubble.text
-                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
-            let senderKey = senderKey(for: sender)
-            // Order within this transient OCR snapshot distinguishes repeated
-            // identical bubbles while remaining stable as bubbles shift vertically.
-            let snapshotKey = "vision:\(senderKey):\(normalizedText):order\(index)"
-            let confidence = bubble.lines.map(\.confidence).reduce(0, +) / Float(max(1, bubble.lines.count))
-            return ChatMessage(text: bubble.text, sender: sender, allowsAutomaticAnalysis: false,
-                               id: snapshotKey, source: .vision, confidence: confidence)
-        }
-        return (messages, bubbles.map(\.bounds))
+    /// Exercise the same OCR/reconstruction pipeline on local redacted fixtures.
+    func readFixture(_ image: CGImage, geometry: ConversationPaneGeometry) -> (messages: [ChatMessage], bounds: [CGRect]) {
+        guard geometry.isValidated, let roi = crop(image, to: geometry.messageRegion) else { return ([], []) }
+        let recognized = recognizeMessageImage(roi, level: .accurate)
+        let bubbles = VisionMessageReconstruction.bubbleRegions(in: image, region: geometry.messageRegion)
+        let parsed = parseMessageObservations(recognized.observations, region: geometry.messageRegion, bubbles: bubbles)
+        return (parsed.messages, parsed.bounds)
     }
 
-    private func senderKey(for sender: MessageSender) -> String {
-        switch sender {
-        case .me: return "me"
-        case .other: return "other"
-        case .unknown: return "unknown"
+    private func exactFingerprint(_ image: CGImage) -> String? {
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
         }
+        guard rendered else { return nil }
+        return SHA256.hash(data: Data(pixels)).map { String(format: "%02x", $0) }.joined()
     }
 }
 
-private struct RecognizedMessageLine {
-    let text: String
-    let bounds: CGRect
-    let confidence: Float
-}
 
 private struct ParsedMessageCapture {
     let messages: [ChatMessage]
@@ -1146,7 +1125,7 @@ private enum VisionReadMode: Equatable {
     var messageRecognitionLevel: VNRequestTextRecognitionLevel {
         self == .messagesFast || self == .fullFast ? .fast : .accurate
     }
-    var captureScale: CGFloat { self == .messagesFast ? 1.25 : 1.5 }
+    var captureScale: CGFloat { 1.5 }
 }
 
 private struct LegacyWindow {

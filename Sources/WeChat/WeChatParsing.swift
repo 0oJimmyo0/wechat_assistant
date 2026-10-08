@@ -57,6 +57,23 @@ enum WeChatParsing {
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 
+    static func containsChinese(_ text: String) -> Bool {
+        text.unicodeScalars.contains { (0x3400...0x9FFF).contains(Int($0.value)) }
+    }
+
+    static func isReliableOCRText(_ text: String, confidence: Float) -> Bool {
+        guard confidence >= 0.70, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !text.unicodeScalars.contains(where: { $0.value == 0xFFFD || (CharacterSet.controlCharacters.contains($0) && ![9, 10, 13].contains($0.value)) }) else { return false }
+        return isPlausibleChatText(text, confidence: confidence) ||
+            (confidence >= 0.90 && text.count <= 12 && text.unicodeScalars.allSatisfy { CharacterSet.punctuationCharacters.contains($0) })
+    }
+
+    static func needsAccurateOCR(_ candidates: [(text: String, confidence: Float)], acceptedCount: Int) -> Bool {
+        acceptedCount == 0 || candidates.contains {
+            containsChinese($0.text) || $0.confidence < 0.90 || !isReliableOCRText($0.text, confidence: $0.confidence)
+        }
+    }
+
     static func isPlausibleChatText(_ text: String, confidence: Float) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, confidence >= 0.45 else { return false }
         let scalars = Array(text.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) })

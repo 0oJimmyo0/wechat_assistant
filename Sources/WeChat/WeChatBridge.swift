@@ -155,6 +155,22 @@ final class WeChatBridge: @unchecked Sendable {
     private var activePlanWindowFrame: CGRect?
     private var visionTitleTracker = VisionTitleTracker()
 
+    private var geometryWindow: AXUIElement?
+    private var geometryViewport: AXUIElement?
+    private var geometryComposer: AXUIElement?
+    private var geometrySource: ConversationPaneGeometrySource?
+    private var lastAttempt = CaptureAttemptDiagnostics()
+
+    private func discoveryChildren(_ element: AXUIElement) -> [AXUIElement] {
+        let role = string(element, "AXRole", timeout: 0.01)
+        if role == "AXTable" || role == "AXList" {
+            // Virtualized tables can contain hundreds of off-screen sidebar
+            // rows. Only their visible rows are relevant to discovery.
+            return boundedChildren(element, attribute: "AXVisibleChildren", maximum: 24) ?? []
+        }
+        return boundedChildren(element, maximum: 40) ?? []
+    }
+
     private var captureLatencies: [(milliseconds: Int, validated: Bool)] = []
     private var lastAXReadDiagnostic = "AX rows: not read"
 
@@ -176,6 +192,12 @@ final class WeChatBridge: @unchecked Sendable {
         let amount = min(count, maximum)
         guard AXUIElementCopyAttributeValues(element, attribute as CFString, max(0, count - amount), amount, &raw) == .success else { return nil }
         return raw as? [AXUIElement]
+    }
+
+    var captureAttemptDiagnostics: CaptureAttemptDiagnostics {
+        captureDiagnosticLock.lock()
+        defer { captureDiagnosticLock.unlock() }
+        return lastAttempt
     }
 
     var capturePerformanceSummary: String {
@@ -294,14 +316,15 @@ final class WeChatBridge: @unchecked Sendable {
         var matches: [AXUIElement] = []
         var visited = 0
         let deadline = Date().addingTimeInterval(0.55)
-        while let (node, level) = stack.popLast(), visited < 300, Date() < deadline {
+        while visited < stack.count, visited < 300, Date() < deadline {
+            let (node, level) = stack[visited]
             visited += 1
             if predicate(node) {
                 matches.append(node)
                 if stopAtFirst { break }
             }
             if level < min(depth, 18) {
-                stack.append(contentsOf: (boundedChildren(node, maximum: 80) ?? []).reversed().map { ($0, level + 1) })
+                stack.append(contentsOf: discoveryChildren(node).map { ($0, level + 1) })
             }
         }
         return matches
@@ -474,7 +497,8 @@ final class WeChatBridge: @unchecked Sendable {
         var hasMessageList = false
         var messageList: AXUIElement?
         let shortTimeout: Float = 0.02
-        while let (element, depth) = stack.popLast(), visited < 96 {
+        while visited < stack.count, visited < 96 {
+            let (element, depth) = stack[visited]
             if cancellation.isCancelled || Date() >= deadline { break }
             visited += 1
             let id = identifier(element, timeout: shortTimeout)
@@ -497,7 +521,7 @@ final class WeChatBridge: @unchecked Sendable {
                 messageList = element
             }
             if depth < 8, Date() < deadline {
-                stack.append(contentsOf: (boundedChildren(element, maximum: 80) ?? []).reversed().map { ($0, depth + 1) })
+                stack.append(contentsOf: discoveryChildren(element).map { ($0, depth + 1) })
             }
             if (title != nil || selectedSession != nil) && hasMessageList { break }
         }
@@ -519,7 +543,8 @@ final class WeChatBridge: @unchecked Sendable {
         var sessionElements = base.sessionElements
         var messageList = base.messageListElement
         var foundList = base.hasMessageList
-        while let (element, depth) = stack.popLast(), visited < 250, Date() < deadline {
+        while visited < stack.count, visited < 250, Date() < deadline {
+            let (element, depth) = stack[visited]
             visited += 1
             let id = identifier(element, timeout: 0.006)
             if id == WeChatParsing.chatTitleIdentifier, title == nil {
@@ -543,7 +568,7 @@ final class WeChatBridge: @unchecked Sendable {
                 messageList = element
             }
             if depth < 18, Date() < deadline {
-                stack.append(contentsOf: (boundedChildren(element, maximum: 80) ?? []).reversed().map { ($0, depth + 1) })
+                stack.append(contentsOf: discoveryChildren(element).map { ($0, depth + 1) })
             }
             if (title != nil || selectedSession != nil) && foundList { break }
         }
@@ -612,6 +637,7 @@ final class WeChatBridge: @unchecked Sendable {
         activePlanPID = nil
         activePlanWindow = nil
         activePlanWindowFrame = nil
+        geometryWindow = nil; geometryViewport = nil; geometryComposer = nil; geometrySource = nil
         visionTitleTracker.reset()
         backendLock.unlock()
     }
@@ -651,6 +677,7 @@ final class WeChatBridge: @unchecked Sendable {
         activePlanPID = nil
         activePlanWindow = nil
         activePlanWindowFrame = nil
+        geometryWindow = nil; geometryViewport = nil; geometryComposer = nil; geometrySource = nil
         visionTitleTracker.reset()
         backendLock.broadcast()
         backendLock.unlock()
@@ -673,9 +700,17 @@ final class WeChatBridge: @unchecked Sendable {
                                     paneGeometry: ConversationPaneGeometry? = nil) -> ConversationCaptureResult {
         let totalStarted = Date()
         var validatedCapture = false
+        var attempt = CaptureAttemptDiagnostics()
         defer {
             captureDiagnosticLock.lock()
-            captureLatencies.append((Int(Date().timeIntervalSince(totalStarted) * 1000), validatedCapture))
+            attempt.hasRun = true
+            attempt.durationMilliseconds = Int(Date().timeIntervalSince(totalStarted) * 1000)
+            attempt.acceptedCount = validatedCapture ? attempt.candidateCount : 0
+            attempt.rejectionReason = lastCaptureFailure == "none"
+                ? (validatedCapture ? nil : (attempt.geometryVerified ? "message content unverified" : "transcript geometry unverified"))
+                : lastCaptureFailure
+            lastAttempt = attempt
+            captureLatencies.append((attempt.durationMilliseconds, validatedCapture))
             captureLatencies = Array(captureLatencies.suffix(200))
             captureDiagnosticLock.unlock()
         }
@@ -692,12 +727,22 @@ final class WeChatBridge: @unchecked Sendable {
         }
         let windowFrame = frame(window, timeout: 0.08)
         let calibration = VisionLayoutCalibration.current
-        let resolvedGeometry = paneGeometry ?? accessibilityPaneGeometry(in: window, windowFrame: windowFrame) ??
+        let reusableGeometry = paneGeometry.flatMap { candidate -> ConversationPaneGeometry? in
+            backendLock.lock()
+            let previousFrame = activePlanWindowFrame
+            backendLock.unlock()
+            guard candidate.source == .visualDivider,
+                  previousFrame?.size == windowFrame.size else { return nil }
+            return candidate
+        }
+        let resolvedGeometry = accessibilityPaneGeometry(in: window, windowFrame: windowFrame) ?? reusableGeometry ??
             VisionLayoutRegions.geometry(
                 leftX: messagePaneLeftX ?? calibration.messagePaneLeftX,
                 headerBottomY: calibration.headerBottomY, composerTopY: calibration.composerTopY,
                 source: .configuredFallback, confidence: 0.40
             )
+
+        attempt.geometryVerified = resolvedGeometry.isValidated
 
         // Reuse the successful plan and its AX elements during monitoring. On
         // activation, the bounded probe is only a hint; a single targeted,
@@ -747,6 +792,7 @@ final class WeChatBridge: @unchecked Sendable {
         }
 
         let capturePlan = plan
+        attempt.source = plan.messages
         var capturedAXMessages: [ChatMessage]?
         var capturedAXRowCount = 0
         var axMessageReadMilliseconds = 0
@@ -754,6 +800,8 @@ final class WeChatBridge: @unchecked Sendable {
         if plan.messages == .accessibility, let list {
             let readStarted = Date()
             let parsed = readAccessibilityMessages(in: list, limit: max(0, limit ?? 50))
+            attempt.rawCount = parsed.bubbles
+            attempt.candidateCount = parsed.messages.count
             axMessageReadMilliseconds = Int(Date().timeIntervalSince(readStarted) * 1000)
             if let failure = parsed.failure {
                 updateCaptureDiagnostic(plan: plan, hasAXIdentity: axContact != nil, hasAXMessages: true,
@@ -798,6 +846,12 @@ final class WeChatBridge: @unchecked Sendable {
                 previousMessageFingerprint: previousMessageFingerprint,
                 paneGeometry: resolvedGeometry
             )
+            attempt.geometryVerified = observation.paneGeometry.isValidated
+            attempt.ocrMode = observation.messageRecognitionLevel
+            if plan.messages == .vision {
+                attempt.rawCount = observation.messageObservationCount
+                attempt.candidateCount = observation.messages.count
+            }
             guard observation.captureSucceeded else {
                 updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil, hasAXMessages: hasValidatedAXMessages,
                                         failure: "Vision capture unavailable", hasAXTitle: axIdentity.hasTitle,
@@ -904,6 +958,7 @@ final class WeChatBridge: @unchecked Sendable {
                 visionTimingDiagnostic($0, titleFound: $0.title != nil, geometry: capturedGeometry)
             } ?? "Vision: not used"
         ].joined(separator: "\n")
+        attempt.geometryVerified = capturedGeometry.isValidated
         validatedCapture = extractionTrustworthy && capturedGeometry.isValidated
         updateCaptureDiagnostic(plan: capturePlan, hasAXIdentity: axContact != nil,
                                 hasAXMessages: capturePlan.messages == .accessibility && list != nil,
@@ -1057,51 +1112,44 @@ final class WeChatBridge: @unchecked Sendable {
 
     private func accessibilityPaneGeometry(in window: AXUIElement,
                                            windowFrame: CGRect) -> ConversationPaneGeometry? {
-        guard windowFrame.width > 0, windowFrame.height > 0 else { return nil }
-        let calibration = VisionLayoutCalibration.current
-        func geometry(for element: AXUIElement, source: ConversationPaneGeometrySource,
-                      confidence: Float, minimumHeightRatio: CGFloat) -> ConversationPaneGeometry? {
-            let bounds = frame(element, timeout: 0.03)
-            let left = (bounds.minX - windowFrame.minX) / windowFrame.width
-            let width = bounds.width / windowFrame.width
-            let height = bounds.height / windowFrame.height
-            guard bounds.width > 180, (0.01...0.70).contains(left),
-                  width >= 0.28, height >= minimumHeightRatio,
-                  bounds.maxX <= windowFrame.maxX + 12 else { return nil }
-            let source: ConversationPaneGeometrySource = left <= 0.035 && width >= 0.90
-                ? .detachedWindow : source
-            return VisionLayoutRegions.geometry(
-                leftX: left, headerBottomY: calibration.headerBottomY,
-                composerTopY: calibration.composerTopY, source: source, confidence: confidence
-            )
+        backendLock.lock()
+        let matches = geometryWindow.map { CFEqual($0, window) } == true
+        let cachedViewport = matches ? geometryViewport : nil
+        let cachedComposer = matches ? geometryComposer : nil
+        let cachedSource = matches ? geometrySource : nil
+        backendLock.unlock()
+        func measured(_ viewport: AXUIElement, composer: AXUIElement?, source: ConversationPaneGeometrySource) -> ConversationPaneGeometry? {
+            VisionLayoutRegions.accessibilityTranscript(viewport: frame(viewport, timeout: 0.02),
+                composer: composer.map { frame($0, timeout: 0.02) }, window: windowFrame, source: source)
         }
-
-        if let list = messageListElement(in: window),
-           let result = geometry(for: list, source: .accessibilityMessageList,
-                                 confidence: 0.98, minimumHeightRatio: 0.30) {
-            return result
+        if let cachedViewport, let cachedSource,
+           let geometry = measured(cachedViewport, composer: cachedComposer, source: cachedSource) { return geometry }
+        let list = messageListElement(in: window)
+        var viewport = list
+        var composer: AXUIElement?
+        var source: ConversationPaneGeometrySource = .accessibilityMessageList
+        if list == nil {
+            let nodes = find(window, depth: 8) { node in
+                let role = string(node, "AXRole", timeout: 0.01)
+                return role == "AXScrollArea" || role == "AXTextArea"
+            }
+            composer = nodes.filter { string($0, "AXRole", timeout: 0.01) == "AXTextArea" }
+                .filter { frame($0, timeout: 0.02).minY > windowFrame.minY + windowFrame.height * 0.60 }
+                .max { frame($0, timeout: 0.02).width < frame($1, timeout: 0.02).width }
+            viewport = nodes.filter { string($0, "AXRole", timeout: 0.01) == "AXScrollArea" }
+                .first { measured($0, composer: composer, source: .accessibilityScrollArea) != nil }
+            source = .accessibilityScrollArea
         }
-        if let composer = firstMatch(window, depth: 18, where: { element in
-            guard string(element, "AXRole", timeout: 0.02) == "AXTextArea" else { return false }
-            let bounds = frame(element, timeout: 0.02)
-            return bounds.width > 180 && bounds.height > 30 &&
-                bounds.minY > windowFrame.minY + windowFrame.height * 0.60
-        }), let result = geometry(for: composer, source: .accessibilityComposer,
-                                  confidence: 0.90, minimumHeightRatio: 0.015) {
-            return result
+        guard let viewport, let geometry = measured(viewport, composer: composer, source: source) else {
+            backendLock.lock()
+            geometryViewport = nil; geometryComposer = nil; geometryWindow = nil; geometrySource = nil
+            backendLock.unlock()
+            return nil
         }
-        if let area = find(window, depth: 18, where: { element in
-            guard string(element, "AXRole", timeout: 0.02) == "AXScrollArea" else { return false }
-            let bounds = frame(element, timeout: 0.02)
-            let left = (bounds.minX - windowFrame.minX) / windowFrame.width
-            let width = bounds.width / windowFrame.width
-            return (0.01...0.70).contains(left) && width >= 0.28 && bounds.height > windowFrame.height * 0.35
-        }).max(by: { frame($0).width < frame($1).width }),
-           let result = geometry(for: area, source: .accessibilityScrollArea,
-                                 confidence: 0.82, minimumHeightRatio: 0.35) {
-            return result
-        }
-        return nil
+        backendLock.lock()
+        geometryWindow = window; geometryViewport = viewport; geometryComposer = composer; geometrySource = source
+        backendLock.unlock()
+        return geometry
     }
 
     private func configuredPaneGeometry() -> ConversationPaneGeometry {
@@ -1457,12 +1505,14 @@ final class WeChatBridge: @unchecked Sendable {
         guard let window = mainWindow() else {
             return "Screen Recording permission: \(WeChatScreenReader.hasScreenCapturePermission ? "granted" : "not granted")\nTarget WeChat PID: \(app.processIdentifier)\nWindow capture: WeChat window not found\n"
         }
-        return "\(readerBackendDiagnostic)\n\(WeChatScreenReader.shared.diagnosticReport(pid: app.processIdentifier, windowFrame: frame(window)))"
+        return "\(readerBackendDiagnostic)\n\(WeChatScreenReader.shared.diagnosticReport(pid: app.processIdentifier, windowFrame: frame(window), paneGeometry: accessibilityPaneGeometry(in: window, windowFrame: frame(window))))"
     }
 
     func annotatedVisionPreview() -> NSImage? {
         guard let app = weChatApplication(), let window = mainWindow() else { return nil }
-        return WeChatScreenReader.shared.annotatedPreview(pid: app.processIdentifier, windowFrame: frame(window))
+        let bounds = frame(window)
+        let geometry = accessibilityPaneGeometry(in: window, windowFrame: bounds)
+        return WeChatScreenReader.shared.annotatedPreview(pid: app.processIdentifier, windowFrame: bounds, paneGeometry: geometry)
     }
 
     /// Scrollbar evidence establishes arrival direction. Missing or

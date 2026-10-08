@@ -137,3 +137,31 @@ and trust status, and makes no model requests or scroll actions. It can use the
 existing local Vision source when AX cannot supply a source. An open WeChat
 conversation and the app's macOS permissions are required. See
 [LIVE_VALIDATION.md](LIVE_VALIDATION.md) for the outstanding WeChat 4.x merge gate.
+
+
+### Transcript geometry and OCR reliability
+
+On older WeChat builds, the existing Vision fallback uses the measured AX
+transcript scroll area and aligned composer to establish its crop. A guessed
+calibration or visual divider alone stays unverified. Discovery uses bounded
+breadth-first walks that skip off-screen virtual sidebar rows. Verified elements
+are remeasured before reuse; unchanged exact header/transcript pixel fingerprints
+allow OCR results to be reused.
+
+Chinese, mixed-language, or suspicious fast observations retry accurate OCR with
+automatic language detection. Text lines require a confirmed visible bubble
+background; neighboring messages never merge solely by proximity. Low-confidence
+rows exclude their whole bubble. Unverified captures and ambiguous overlap keep
+the previous trusted history. Vision messages cannot trigger automatic analysis.
+The sidebar shows source, geometry, OCR mode, duration, raw/candidate/accepted
+counts, and rejection reasons after every attempt.
+
+Run the synthetic screenshot regression suite with:
+
+```bash
+bash test-wechat-vision.sh
+```
+
+Fixtures contain public test text only. Private screenshots are never committed.
+See [LIVE_VALIDATION.md](LIVE_VALIDATION.md) for measured results and outstanding
+interactive tests, including the unresolved visual-only geometry fallback.

@@ -41,6 +41,7 @@ final class MessageMonitor: ObservableObject {
     @Published private(set) var isReturningToLatest = false
     @Published private(set) var isSyncing = false
     @Published private(set) var captureDuration = "Capture: not run"
+    @Published private(set) var captureDetails = CaptureAttemptDiagnostics()
 
     var onBurst: ((String, [ChatMessage], Bool) -> Void)?
     var onDeactivated: (() -> Void)?
@@ -156,6 +157,7 @@ final class MessageMonitor: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token, self.isCheckingConversation else { return }
                 self.isCheckingConversation = false
+                self.updateCaptureDiagnostics()
                 if case .identityPending(let observation) = captureResult {
                     self.retainPendingIdentityObservation(observation)
                     self.isRunning = true
@@ -301,7 +303,9 @@ final class MessageMonitor: ObservableObject {
                 cancellation: cancellation, generation: token)
             guard self.isRunning, self.generation == token else { return }
             self.isSyncing = false
-            if case .merged = result { self.status = "Refreshed · \(self.messages.count) captured messages" }
+            if case .merged(let merge) = result, merge.viewport != .uncertain {
+                self.status = "Refreshed · \(self.messages.count) validated messages"
+            }
         }
     }
 
@@ -543,7 +547,7 @@ final class MessageMonitor: ObservableObject {
             return .snapshot(snapshot)
         }
         guard isRunning, generation == token, cancellation?.isCancelled != true else { return .unavailable }
-        captureDuration = bridge.capturePerformanceSummary
+        updateCaptureDiagnostics()
         let snapshot: WeChatSnapshot?
         switch captured {
         case .snapshot(let value): snapshot = value
@@ -642,7 +646,7 @@ final class MessageMonitor: ObservableObject {
             hasUnverifiedMessageChanges = true
             return ConversationMergeResult(appended: [], prepended: [], unchanged: true, viewport: .uncertain)
         }
-        captureDuration = bridge.capturePerformanceSummary
+        updateCaptureDiagnostics()
         unverifiedCaptureMessages.removeAll()
         let result = conversationStore.merge(snapshot.messages, trust: captureTrust(snapshot), liveEdgeState: snapshot.liveEdgeState)
         if lockedVisionIdentity == nil { lockedVisionIdentity = snapshot.visionIdentity }
@@ -692,7 +696,7 @@ final class MessageMonitor: ObservableObject {
         if observation.paneGeometry.isValidated && activePaneGeometry == nil {
             activePaneGeometry = observation.paneGeometry
         }
-        pendingIdentityMessages = Array((pendingIdentityMessages + observation.messages).suffix(50))
+        pendingIdentityMessages = Array(observation.messages.suffix(50))
         messages = pendingIdentityMessages
         latestSnapshotBlockCount = observation.messageRowCount
         messageCaptureCount += 1
@@ -831,6 +835,7 @@ final class MessageMonitor: ObservableObject {
                 guard let self else { return }
                 self.isPolling = false
                 guard self.isRunning, self.generation == token else { return }
+                self.updateCaptureDiagnostics()
                 if case .identityPending(let observation) = capture {
                     self.retainPendingIdentityObservation(observation)
                     self.conversationIdentityState = .temporarilyUncertain
@@ -948,11 +953,16 @@ final class MessageMonitor: ObservableObject {
             activePaneGeometry = snapshot.paneGeometry
         }
         guard !snapshot.messages.isEmpty else { return }
-        unverifiedCaptureMessages = Array((unverifiedCaptureMessages + snapshot.messages).suffix(50))
+        unverifiedCaptureMessages = Array(snapshot.messages.suffix(50))
+    }
+
+    private func updateCaptureDiagnostics() {
+        captureDuration = bridge.capturePerformanceSummary
+        captureDetails = bridge.captureAttemptDiagnostics
     }
 
     private func noteCaptureFailure() {
-        captureDuration = bridge.capturePerformanceSummary
+        updateCaptureDiagnostics()
         consecutiveCaptureFailures += 1
         guard consecutiveCaptureFailures >= 3 else { return }
         bridge.resetReaderBackend()

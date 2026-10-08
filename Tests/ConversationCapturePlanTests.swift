@@ -51,11 +51,41 @@ enum ConversationCapturePlanTests {
         expect(!dividerCandidate.validatingVisualEvidence(titleBounds: acceptedTitle,
                                                           messageBounds: [CGRect(x: 0.56, y: 0.45, width: 0.10, height: 0.03)]).isValidated,
                "pane validation rejects text that does not align like a bubble")
+        expect(!dividerCandidate.validatingVisualEvidence(titleBounds: acceptedTitle,
+            messageBounds: [incomingBubble, outgoingBubble]).isValidated,
+            "title and aligned bubbles alone cannot prove the composer's exclusion boundary")
+        var failedAttempt = CaptureAttemptDiagnostics()
+        failedAttempt.hasRun = true
+        failedAttempt.durationMilliseconds = 72
+        failedAttempt.source = .vision
+        failedAttempt.rejectionReason = "transcript geometry unverified"
+        expect(!failedAttempt.summary.contains("not run") && failedAttempt.summary.contains("72 ms"),
+               "failed and unverified attempts still report source, duration, and rejection")
+
         let validatedDivider = dividerCandidate.validatingVisualEvidence(
-            titleBounds: acceptedTitle, messageBounds: [incomingBubble, outgoingBubble]
+            titleBounds: acceptedTitle, messageBounds: [incomingBubble, outgoingBubble],
+            composerBounds: CGRect(x: 0.30, y: 0, width: 0.70, height: 0.17)
         )
         expect(validatedDivider.isValidated && validatedDivider.source == .visualDivider,
                "visual pane validation requires both an in-pane title and aligned transcript bubbles")
+        let measuredWindow = CGRect(x: 127, y: 73, width: 1269, height: 788)
+        let measuredViewport = CGRect(x: 447, y: 164, width: 950, height: 486)
+        // Actual AX frames can exceed the outer frame by one point through rounding.
+        let measuredComposer = CGRect(x: 453, y: 726, width: 938, height: 129)
+        let exactGeometry = VisionLayoutRegions.accessibilityTranscript(viewport: measuredViewport,
+            composer: measuredComposer, window: measuredWindow, source: .accessibilityScrollArea)
+        expect(exactGeometry?.isValidated == true, "measured transcript plus aligned composer validates geometry")
+        expect(abs((exactGeometry?.messageRegion.minY ?? 0) - (1 - 577.0 / 788)) < 0.001,
+               "AX top-left viewport maps to Vision bottom-left exactly")
+        expect(abs((exactGeometry?.headerRegion.minY ?? 0) - (1 - 91.0 / 788)) < 0.001,
+               "header boundary comes from the transcript frame rather than calibration")
+        expect(VisionLayoutRegions.accessibilityTranscript(viewport: CGRect(x: 187, y: 133, width: 261, height: 728),
+            composer: measuredComposer, window: measuredWindow, source: .accessibilityScrollArea) == nil,
+               "sidebar scroll area cannot become transcript geometry")
+        expect(VisionLayoutRegions.accessibilityTranscript(viewport: measuredViewport,
+            composer: nil, window: measuredWindow, source: .accessibilityScrollArea) == nil,
+               "unidentified scroll area needs independent composer evidence")
+
         let scroll = mainWindowGeometry.scrollTarget(in: CGRect(x: 100, y: 50, width: 1000, height: 800))
         expect(abs(scroll.x - (100 + 1000 * mainWindowGeometry.messageRegion.midX)) < 0.01,
                "scroll target uses the resolved pane center")
