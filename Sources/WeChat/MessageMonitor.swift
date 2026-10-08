@@ -744,9 +744,7 @@ final class MessageMonitor: ObservableObject {
             activePaneGeometry = observation.paneGeometry
         }
         pendingIdentityMessages = Array(observation.messages.suffix(50))
-        messages = PendingIdentityPolicy.displayedMessages(validated: conversationStore.messages,
-            pending: pendingIdentityMessages, hasLockedContact: lockedContact != nil)
-        hasUnverifiedMessageChanges = true
+        messages = pendingIdentityMessages
         latestSnapshotBlockCount = observation.messageRowCount
         messageCaptureCount += 1
     }
