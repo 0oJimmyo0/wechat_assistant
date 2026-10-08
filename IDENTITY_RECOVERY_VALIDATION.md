@@ -49,32 +49,10 @@ validated observations out of five. Deactivation cleared contact and both
 published and trusted histories. These timings measure capture rather than
 end-to-end sidebar latency. No model callback was installed in this probe.
 
-The user initially reported wrong or missing contact/text while the installed
-app was still from the earlier branch. After PR #4 plus the preservation fix
-was installed and relaunched, the user confirmed **correct contact, correct
-content**. Basic live detection is now confirmed; transient-failure and switch
-acceptance remain incomplete. Existing P1–P4 functionality was regression
-checked rather than rewritten.
-
-A further actual-monitor run captured nine messages, preserved the full array
-through three Refresh comparisons, and loaded one older message. It retained
-the original nine occurrence IDs in order, emitted zero incoming flags and
-zero analysis callbacks during manual backfill, and verified return to the live
-tail. Loading stopped with "History overlap found, but no unseen older rows
-were added" rather than claiming 20 messages. This proves limited real backfill
-and return behavior, not complete historical coverage. Capture P50/P95:
-**150/1343 ms**, six validated observations out of seven. Deactivation again
-cleared contact and histories.
-
-## P1–P5 regression status
-
-| Stage | Evidence | Remaining live limit |
-| --- | --- | --- |
-| P1 | Store tests: ordered 200-row cap, repeated occurrences, unique overlap, retained separator events; live original IDs preserved after one older row. | Full 20-row historical retrieval and repeated identical real messages remain unverified. |
-| P2 | Native UI tests: stationary local history on append, unread persistence, 0 px prepend error; live backfill/return produced no false arrivals. | Receiving an actual new message while browsing local history and checking Jump to latest is pending. |
-| P3 | Existing asynchronous serial captures/caches retained; all measured validated P95 values below 2 seconds in these small samples; resizable transcript tests pass. | These are capture timings, not full UI latency/CPU benchmarks across all conversations. |
-| P4 | Context tests verify latest/selected limit 20, chronological sender/separator serialization, and stale-session rejection. | No model request was made; user review of actual preview and request flow remains a live check. |
-| P5 | Actual monitor start, three Refresh actions, limited backfill, return, and stop tested; user confirmed correct contact/content. | Actual incoming event, switch clearing, and forced transient capture failure remain incomplete. |
+The user reported **wrong or missing contact/text** while the installed app was
+still from the earlier branch. PR #4 plus the preservation fix was subsequently
+installed and relaunched. A new visual comparison on that installed version is
+pending. Therefore **P0 is not accepted**, and P1–P5 changes are deferred.
 
 No private contact or message text was printed or written by these probes, and
 no screenshots were saved. No WeChat messages were sent. Diagnostic probe
@@ -82,9 +60,8 @@ sources/binaries remain in ignored `.build`; only synthetic tests are tracked.
 
 ## Live gates still required
 
-- Correct contact/content is user-confirmed and three actual-monitor Refresh
-  comparisons passed. Explicit mixed-language/multiline comparison and three
-  user-operated sidebar Refresh actions remain to be confirmed.
+- User verifies exact contact and Chinese/English/multiline content in the
+  installed app, then repeats three sidebar Refresh actions.
 - Reproduce a transient title/capture failure and verify visible trusted history
   survives and analysis remains disabled until identity is confirmed again.
 - Test auxiliary focused windows, repeated pending recovery, and contact
