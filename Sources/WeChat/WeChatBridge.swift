@@ -1188,6 +1188,7 @@ final class WeChatBridge: @unchecked Sendable {
         result.rowAttributesUnavailable = visible == nil && fallback == nil
         result.rows = rows.count
         var rowStack = rows.reversed().map { ($0, 0) }
+        var pendingTimeSeparator: String?
         while let (row, rowDepth) = rowStack.popLast() {
             guard Date() < deadline, result.nodes < 500 else { result.exhausted = true; break }
             result.nodes += 1
@@ -1195,9 +1196,16 @@ final class WeChatBridge: @unchecked Sendable {
             let id = fields["AXIdentifier"] as? String ?? ""
             if id == WeChatParsing.placeholderRowIdentifier { result.placeholders += 1; continue }
             guard id == WeChatParsing.messageRowIdentifier else {
+                // Only a stand-alone label inside the confirmed message list can
+                // act as a time divider. Other UI text is never message content.
+                let role = fields["AXRole"] as? String ?? ""
+                if ["AXStaticText", "AXGroup", "AXRow", "AXCell"].contains(role),
+                   let label = WeChatParsing.timeSeparatorLabel(
+                    fields["AXTitle"] as? String ?? fields["AXValue"] as? String) {
+                    pendingTimeSeparator = label
+                }
                 // Some releases wrap confirmed bubbles in list rows/cells.
                 // These wrappers never supply message text themselves.
-                let role = fields["AXRole"] as? String ?? ""
                 if rowDepth < 2, ["AXRow", "AXCell", "AXGroup", "AXUnknown"].contains(role) {
                     rowStack.append(contentsOf: (boundedChildren(row, maximum: 8) ?? []).reversed().map { ($0, rowDepth + 1) })
                 }
@@ -1230,8 +1238,13 @@ final class WeChatBridge: @unchecked Sendable {
             }
             if let text {
                 result.messages.append(ChatMessage(text: text,
-                    sender: WeChatParsing.sender(from: fields["AXDescription"] as? String ?? ""), source: .accessibility))
-            } else { result.unreadableBubbles += 1 }
+                    sender: WeChatParsing.sender(from: fields["AXDescription"] as? String ?? ""),
+                    source: .accessibility, timeSeparatorBefore: pendingTimeSeparator))
+                pendingTimeSeparator = nil
+            } else {
+                result.unreadableBubbles += 1
+                pendingTimeSeparator = nil
+            }
         }
         result.messages = Array(result.messages.suffix(max(0, limit)))
         captureDiagnosticLock.lock()
