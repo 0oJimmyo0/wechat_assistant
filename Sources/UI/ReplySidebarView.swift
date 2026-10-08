@@ -140,7 +140,7 @@ struct ReplySidebarView: View {
                 .foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 3) {
                 sectionLabel("CURRENT CHAT")
-                Text(monitor.contactName ?? "No conversation selected")
+                Text(monitor.contactName ?? (monitor.isRunning ? "Verifying open WeChat chat…" : "No conversation selected"))
                     .font(.headline)
                     .lineLimit(1)
                 Text(monitor.status)
@@ -165,6 +165,15 @@ struct ReplySidebarView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(!monitor.canSyncNow)
+                if monitor.isRunning && monitor.contactName == nil {
+                    Button {
+                        monitor.retryChatDetection()
+                    } label: {
+                        Label("Retry detection", systemImage: "arrow.clockwise.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
 
                 // This button moves WECHAT's viewport. Jump to latest inside
                 // the chat pane only changes the Copilot's local scroll position.
