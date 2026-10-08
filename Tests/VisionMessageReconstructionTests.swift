@@ -50,6 +50,11 @@ enum VisionMessageReconstructionTests {
         expect(regions.count == 4, "pixel evidence identifies all four sanitized bubble backgrounds")
         let read = WeChatScreenReader.shared.readFixture(fixture, geometry: geometry)
         let expected = ["今天一起吃饭。", "Hello, see you tomorrow!", "review paper\n明天讨论结果。", "好的"]
+        if read.messages.map(\.text) != expected {
+            // Public synthetic fixture only: safe to print recognized text for
+            // diagnosing hosted runners without leaking live chat content.
+            fputs("Synthetic OCR expected: \(expected)\nSynthetic OCR actual: \(read.messages.map(\.text))\n", stderr)
+        }
         expect(read.messages.map(\.text) == expected, "accurate OCR reads Chinese, English, mixed-language, and multiline fixture text")
         expect(read.bounds.allSatisfy { region.contains($0) }, "every accepted fixture box lies inside the transcript ROI")
         expect(!read.messages.contains { $0.text.contains("SIDEBAR") || $0.text.contains("COMPOSER") },
