@@ -69,6 +69,12 @@ enum WeChatParsingTests {
         expect(WeChatParsing.timeSeparatorLabel("Can we meet at 10:30?") == nil,
                "conversation sentences cannot masquerade as time separators")
         expect(WeChatParsing.timeSeparatorLabel("random content") == nil, "unknown metadata is not a timestamp")
+        for label in ["Today", "Yesterday 3:05 PM", "今天 上午9:30", "星期三 14:05", "Monday 14:05", "October 7, 2026 14:05", "10/7/2026 09:05"] {
+            expect(WeChatParsing.timeSeparatorLabel(label) == label, "Chinese/English labels retain literal observed text")
+        }
+        for label in ["25:00", "10:75", "2026/19/45", "Today we met", "2026-10-07\nhello"] {
+            expect(WeChatParsing.timeSeparatorLabel(label) == nil, "invalid clocks/dates and sentences cannot become dividers")
+        }
         let originalTimed = ChatMessage(text: "message", sender: .other)
         let observedTimed = originalTimed.withTimeSeparator("Yesterday 10:30")
         expect(originalTimed.timeSeparatorBefore == nil && observedTimed.timeSeparatorBefore == "Yesterday 10:30",

@@ -185,3 +185,29 @@ bash test-wechat-vision.sh
 Fixtures contain public test text only. Private screenshots are never committed.
 See [LIVE_VALIDATION.md](LIVE_VALIDATION.md) for measured results and outstanding
 interactive tests, including the unresolved visual-only geometry fallback.
+
+### Transcript refinements
+
+The local timeline and assistant suggestions occupy independently scrollable,
+resizable split panes. The timeline renders all retained validated messages in
+chronological order (up to 200). Loading 20 earlier preserves the visible local
+row and offset; Jump to latest changes only Copilot's scroll position. Confirmed
+incoming occurrences increment the local unread badge while browsing history.
+“WeChat: follow latest” separately controls the WeChat viewport. Missing live-tail
+evidence is shown as Monitoring uncertain and cannot authorize automatic analysis.
+
+Observed time separators retain their literal label and capture evidence beside
+the following occurrence. Individual send times remain unknown. Ambiguous
+historical overlap cannot attach a label to a guessed repeated message.
+
+Manual analysis previews the latest 20 validated messages or a selected contiguous
+range of up to 20. Select the first and last rows using Analyze selected context;
+then review the exact chronological message block, separators, model, profile,
+and instruction before sending. A changed session or evicted/changed context
+invalidates the preview. Capture times and contact metadata are excluded.
+Detailed capture diagnostics are in Settings.
+
+`bash test-transcript-ui.sh` exercises the real SwiftUI scroll viewport with public
+fixture data in a temporary macOS window. It requires a logged-in desktop and
+never interacts with WeChat or a model. See [REFINEMENT_VALIDATION.md](REFINEMENT_VALIDATION.md)
+for per-stage files, test results, measurements, and the outstanding live merge gate.

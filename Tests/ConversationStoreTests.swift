@@ -29,6 +29,23 @@ enum ConversationStoreTests {
                timedStore.messages[0].timeSeparatorBefore == "Yesterday",
                "older messages and their observed dividers prepend chronologically")
 
+        let beforeTimedRefresh = timedStore.messages
+        let observedEvents = timedStore.timeSeparatorEvents
+        for _ in 0..<3 { _ = timedStore.merge(rows("Earlier", "A", "B", "C"), trust: .validated) }
+        expect(timedStore.messages == beforeTimedRefresh && timedStore.timeSeparatorEvents == observedEvents,
+            "observed time events retain exact positions, evidence and identities on unchanged Refresh")
+        let rejectedMetadata = timedStore.merge([row("Unanchored"), row("B").withTimeSeparator("Today"), row("C")], trust: .validated)
+        expect(rejectedMetadata.viewport == .uncertain && timedStore.messages == beforeTimedRefresh,
+            "failed internal-prefix merge cannot mutate time metadata")
+        let ambiguousTimedHistory = ConversationStore()
+        _ = ambiguousTimedHistory.merge(rows("A", "B", "X", "A", "B", "Tail"), trust: .validated)
+        let beforeRepeated = ambiguousTimedHistory.messages
+        let ambiguousBackfill = ambiguousTimedHistory.merge([row("Older"), row("A").withTimeSeparator("Today"), row("B")], trust: .validated, liveEdgeState: false)
+        expect(ambiguousBackfill.viewport == .uncertain && ambiguousTimedHistory.messages == beforeRepeated,
+            "repeated history anchors cannot attach dividers to an arbitrary occurrence")
+        expect(observedEvents.allSatisfy { event in timedStore.messages.contains { $0.localID == event.beforeMessageID } },
+            "separator events point to retained message occurrences")
+
         let duplicateStore = ConversationStore()
         _ = duplicateStore.merge(rows("A", "哈哈"), trust: .validated)
         let duplicate = duplicateStore.merge(rows("A", "哈哈", "哈哈", "B"), trust: .validated)

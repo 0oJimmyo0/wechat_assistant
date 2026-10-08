@@ -13,16 +13,22 @@ struct ReplySidebarView: View {
     @State private var generationID: UUID?
     @AppStorage("auto_analyze_enabled") private var autoAnalyze = false
     @State private var usageLimitReached = false
-    private let manualAnalysisContextLimit = 20
+    @State private var selectHistoricalContext = false
+    @State private var contextSelection = AnalysisContextSelection()
+    @State private var pendingAnalysis: AnalysisPreviewRequest?
+
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+            VSplitView {
+                VStack(alignment: .leading, spacing: 10) {
                     currentConversationCard
                     recentMessagesSection
+                }.padding(12).frame(minHeight: 270, idealHeight: 380, maxHeight: .infinity)
+                ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
 
                     if let suggestion {
                         sectionLabel("SITUATION")
@@ -50,20 +56,26 @@ struct ReplySidebarView: View {
                          ? "Clearly identified incoming messages may be sent to OpenAI after the conversation pauses."
                          : "Messages stay on this Mac until you choose Analyze.")
                         .font(.caption2).foregroundStyle(.secondary)
-                    Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.everydayModel) } label: {
-                        Label(isGenerating ? "Analyzing…" : "Analyze latest message", systemImage: "sparkles")
+                    Toggle("Analyze selected context", isOn: $selectHistoricalContext).font(.caption)
+                    Text(selectHistoricalContext
+                         ? "Choose the first and last messages in the timeline. Preview a range of up to 20."
+                         : "Analysis uses the latest 20 validated messages. Preview the exact context before sending.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Button { previewAnalysis(model: auth.everydayModel) } label: {
+                        Label(isGenerating ? "Analyzing…" : "Preview analysis context", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
                     }.buttonStyle(.borderedProminent).disabled(isGenerating || monitor.isLoadingOlderContext || monitor.isSyncing || !monitor.canAnalyzeManually || usageLimitReached || !auth.isSignedIn || monitor.messages.isEmpty)
-                    Button { generate(context: Array(monitor.messages.suffix(manualAnalysisContextLimit)), model: auth.carefulModel) } label: {
+                    Button { previewAnalysis(model: auth.carefulModel) } label: {
                         Label("Regenerate carefully", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
                     }.buttonStyle(.bordered).disabled(isGenerating || monitor.isLoadingOlderContext || monitor.isSyncing || !monitor.canAnalyzeManually || usageLimitReached || !auth.isSignedIn || auth.carefulModel.isEmpty || monitor.messages.isEmpty)
                 }
                 .padding(16)
+                }.frame(minHeight: 180, idealHeight: 240)
             }
             Divider()
             footer
         }
-        .frame(minWidth: 320, idealWidth: 360, maxWidth: 390, minHeight: 620)
+        .frame(minWidth: 320, idealWidth: 360, maxWidth: .infinity, minHeight: 620)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             monitor.onBurst = { _, context, canAutoAnalyze in
@@ -73,13 +85,16 @@ struct ReplySidebarView: View {
             monitor.onDeactivated = { clearSession() }
             if auth.isSignedIn, monitor.messages.isEmpty { monitor.pollNow() }
         }
-        .onChange(of: monitor.contactName) { _, _ in
+        .onChange(of: monitor.sessionID) { _, _ in
             generationTask?.cancel()
             generationTask = nil
             generationID = nil
             isGenerating = false
             suggestion = nil
             errorMessage = nil
+            pendingAnalysis = nil
+            contextSelection = AnalysisContextSelection()
+            selectHistoricalContext = false
         }
         .onDisappear {
             monitor.onBurst = nil
@@ -89,8 +104,21 @@ struct ReplySidebarView: View {
             generationID = nil
             isGenerating = false
             suggestion = nil
+            pendingAnalysis = nil
+            contextSelection = AnalysisContextSelection()
         }
-        .sheet(isPresented: $showSettings) { SettingsView(profileStore: profileStore).frame(width: 390, height: 380) }
+        .sheet(isPresented: $showSettings) { SettingsView(profileStore: profileStore).frame(width: 460, height: 600) }
+        .sheet(item: $pendingAnalysis) { request in
+            AnalysisContextPreview(request: request) {
+                pendingAnalysis = nil
+                guard AnalysisContext.isCurrent(request.messages, session: request.sessionID,
+                    currentSession: monitor.sessionID, retained: monitor.trustedMessages) else {
+                    errorMessage = AnalysisContextError.staleContext.localizedDescription
+                    return
+                }
+                generate(context: request.messages, model: request.model, specialInstruction: request.instruction, profile: request.profile)
+            }
+        }
     }
 
     private var header: some View {
@@ -151,16 +179,22 @@ struct ReplySidebarView: View {
                 }
                 Spacer(minLength: 0)
             }
-            Text(monitor.captureDetails.summary)
-                .font(.caption2).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(monitor.captureDuration).font(.caption2).foregroundStyle(.secondary)
+            Label(monitor.monitoringState.rawValue,
+                systemImage: monitor.monitoringState == .live ? "dot.radiowaves.left.and.right" : "eye")
+                .font(.caption).foregroundStyle(monitor.monitoringState == .live ? .green : .secondary)
+            if monitor.monitoringState == .viewingHistory {
+                Text("WeChat's live tail is not being observed. Follow latest to resume arrival tracking.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if monitor.monitoringState == .uncertain && monitor.isRunning {
+                Text("Identity, readable context, or live-tail evidence is uncertain. Automatic analysis is suspended.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
             if monitor.captureDetails.candidateCount > monitor.captureDetails.acceptedCount {
                 Text("Unverified observations are excluded from stored messages and analysis.")
                     .font(.caption2).foregroundStyle(.orange)
             }
             ChatTranscriptView(
-                messages: monitor.messages,
+                messages: monitor.trustedMessages,
                 contactName: monitor.contactName ?? "Contact",
                 canLoadEarlier: monitor.isRunning && monitor.messages.count < 200 &&
                     monitor.canLoadOlderContext && monitor.conversationIdentityState == .confirmed &&
@@ -168,9 +202,13 @@ struct ReplySidebarView: View {
                 loadingEarlier: monitor.isLoadingOlderContext,
                 onLoadEarlier: {
                     monitor.loadOlderContext(targetCount: min(200, monitor.messages.count + 20))
-                }
+                },
+                newIncomingIDs: monitor.newIncomingMessageIDs,
+                selectionEnabled: selectHistoricalContext,
+                selectedIDs: contextSelection.selectedIDs(in: monitor.trustedMessages),
+                onSelect: { contextSelection.select($0) }
             )
-            .id(monitor.contactName ?? "no-chat")
+            .id(monitor.sessionID)
 
             if monitor.isLoadingOlderContext {
                 Text(monitor.isReturningToLatest
@@ -225,16 +263,33 @@ struct ReplySidebarView: View {
         suggestion = nil
         errorMessage = nil
         instruction = ""
+        pendingAnalysis = nil
+        contextSelection = AnalysisContextSelection()
+        selectHistoricalContext = false
     }
 
-    private func generate(context: [ChatMessage], model: String) {
+    private func previewAnalysis(model: String) {
+        guard monitor.canAnalyzeManually, !isGenerating, auth.isSignedIn else { return }
+        do {
+            let context = try selectHistoricalContext ? contextSelection.messages(in: monitor.trustedMessages) : AnalysisContext.latest(in: monitor.trustedMessages)
+            guard !context.isEmpty else { return }
+            pendingAnalysis = AnalysisPreviewRequest(sessionID: monitor.sessionID, messages: context,
+                model: model, instruction: instruction, profile: profileStore.profile)
+            errorMessage = nil
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func generate(context: [ChatMessage], model: String, specialInstruction frozenInstruction: String? = nil,
+        profile frozenProfile: RelationshipProfile? = nil) {
         guard auth.isSignedIn, !isGenerating, !monitor.isLoadingOlderContext, !monitor.isSyncing, monitor.canAnalyzeManually else { return }
+        guard AnalysisContext.isCurrent(context, session: monitor.sessionID, currentSession: monitor.sessionID,
+            retained: monitor.trustedMessages) else { errorMessage = AnalysisContextError.staleContext.localizedDescription; return }
         guard !model.isEmpty else { errorMessage = "Choose an available model in settings."; return }
         let requestID = UUID()
         generationID = requestID
         isGenerating = true; errorMessage = nil; suggestion = nil
-        let profile = profileStore.profile
-        let specialInstruction = instruction
+        let profile = frozenProfile ?? profileStore.profile
+        let specialInstruction = frozenInstruction ?? instruction
         generationTask?.cancel()
         generationTask = Task { @MainActor in
             do {

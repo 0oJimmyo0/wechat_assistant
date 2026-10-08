@@ -1,17 +1,23 @@
 import SwiftUI
+import AppKit
 
-/// Independently scrolling, session-only transcript. Scrolling here NEVER scrolls
-/// the WeChat window; the monitor keeps tracking the live conversation in parallel.
+/// A local scroll viewport, independent of WeChat capture and scrolling.
 struct ChatTranscriptView: View {
     let messages: [ChatMessage]
     let contactName: String
     let canLoadEarlier: Bool
     let loadingEarlier: Bool
     let onLoadEarlier: () -> Void
+    var newIncomingIDs: [UUID] = []
+    var selectionEnabled = false
+    var selectedIDs: Set<UUID> = []
+    var onSelect: (UUID) -> Void = { _ in }
+    var onViewportChange: (TranscriptScrollState) -> Void = { _ in }
 
-    @State private var viewingLatest = true
-    @State private var unseenMessages = 0
-    @State private var restoreAfterPrepend: UUID?
+    @State private var scrollState = TranscriptScrollState()
+    @State private var nativeScrollView: NSScrollView?
+    @State private var restoringAnchor: (id: UUID, offset: CGFloat)?
+    @State private var previousIDs: [UUID] = []
     private let bottomID = "local-chat-timeline-bottom"
 
     var body: some View {
@@ -19,134 +25,161 @@ struct ChatTranscriptView: View {
             HStack {
                 Text("CHAT TIMELINE").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Spacer()
-                Text("\(messages.count) in memory")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Text("\(messages.count) / 200 retained").font(.caption2).foregroundStyle(.secondary)
             }
-            ScrollViewReader { proxy in
-                VStack(spacing: 6) {
+            GeometryReader { viewport in
+                ScrollViewReader { proxy in
                     ScrollView(.vertical) {
                         LazyVStack(spacing: 12) {
-                            if canLoadEarlier {
-                                Button {
-                                    // Preserve the previous oldest message when
-                                    // verified older context is prepended.
-                                    restoreAfterPrepend = messages.first?.localID
-                                    onLoadEarlier()
-                                } label: {
-                                    Label(loadingEarlier ? "Loading earlier…" : "Load 20 earlier",
-                                          systemImage: "arrow.up.circle")
-                                }
-                                .buttonStyle(.borderless)
-                                .font(.caption)
-                                .disabled(loadingEarlier)
-                            } else if loadingEarlier {
-                                ProgressView("Loading earlier messages…")
-                                    .controlSize(.small).font(.caption)
+                            if canLoadEarlier || loadingEarlier {
+                                Button(action: onLoadEarlier) {
+                                    Label(loadingEarlier ? "Loading earlier…" : "Load 20 earlier", systemImage: "arrow.up.circle")
+                                }.buttonStyle(.borderless).font(.caption).disabled(loadingEarlier)
                             }
                             if messages.isEmpty {
-                                Text("No verified messages are available yet.")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                    .padding(.vertical, 32)
+                                Text("No verified messages are available yet.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 32)
                             }
                             ForEach(messages, id: \.localID) { message in
                                 VStack(spacing: 7) {
                                     if let label = message.timeSeparatorBefore {
-                                        Text(label)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                            .padding(.vertical, 3)
-                                            .frame(maxWidth: .infinity)
+                                        Text(label).font(.caption2).foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity).padding(.vertical, 3)
                                     }
-                                    bubble(message)
+                                    HStack(spacing: 6) {
+                                        if selectionEnabled {
+                                            Button { onSelect(message.localID) } label: {
+                                                Image(systemName: selectedIDs.contains(message.localID) ? "checkmark.circle.fill" : "circle")
+                                            }.buttonStyle(.plain).accessibilityLabel("Select message for analysis")
+                                        }
+                                        bubble(message)
+                                    }
                                 }
                                 .id(message.localID)
+                                .background(GeometryReader { row in
+                                    Color.clear.preference(key: TranscriptFrames.self,
+                                        value: [message.localID: row.frame(in: .named("transcript-viewport"))])
+                                })
                             }
                             Color.clear.frame(height: 2).id(bottomID)
-                                .onAppear {
-                                    viewingLatest = true
-                                    unseenMessages = 0
-                                }
-                                .onDisappear { viewingLatest = false }
+                                .background(GeometryReader { row in
+                                    Color.clear.preference(key: TranscriptBottom.self,
+                                        value: row.frame(in: .named("transcript-viewport")).maxY)
+                                })
                         }
                         .padding(12)
+                        .background(TranscriptScrollResolver { nativeScrollView = $0 })
                     }
-                    .frame(height: 325)
-                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.35),
-                                in: RoundedRectangle(cornerRadius: 12))
+                    .coordinateSpace(name: "transcript-viewport")
+                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+                    .onPreferenceChange(TranscriptFrames.self) { frames in
+                        if let target = restoringAnchor {
+                            guard let row = frames[target.id] else { return }
+                            let delta = row.minY - target.offset
+                            if abs(delta) > 1, let scroll = nativeScrollView {
+                                DispatchQueue.main.async {
+                                    var point = scroll.contentView.bounds.origin
+                                    point.y += delta
+                                    scroll.contentView.scroll(to: point)
+                                    scroll.reflectScrolledClipView(scroll.contentView)
+                                }
+                                return
+                            }
+                            restoringAnchor = nil
+                        }
+                        scrollState.observe(frames: frames, viewportHeight: viewport.size.height,
+                            latestVisible: scrollState.viewingLatest)
+                        onViewportChange(scrollState)
+                    }
+                    .onPreferenceChange(TranscriptBottom.self) { bottom in
+                        guard restoringAnchor == nil else { return }
+                        scrollState.observe(frames: [:], viewportHeight: viewport.size.height,
+                            latestVisible: bottom > 0 && bottom <= viewport.size.height + 3)
+                        onViewportChange(scrollState)
+                    }
                     .onAppear {
-                        // Open each conversation at its latest locally stored row.
-                        if !messages.isEmpty {
-                            DispatchQueue.main.async {
-                                proxy.scrollTo(bottomID, anchor: .bottom)
-                            }
+                        previousIDs = messages.map(\.localID)
+                        DispatchQueue.main.async { proxy.scrollTo(bottomID, anchor: .bottom) }
+                    }
+                    .onChange(of: messages.map(\.localID)) { _, current in
+                        let intent = scrollState.reconcile(previous: previousIDs, current: current, newIncoming: newIncomingIDs)
+                        previousIDs = current
+                        onViewportChange(scrollState)
+                        switch intent {
+                        case .none: break
+                        case .latest:
+                            DispatchQueue.main.async { proxy.scrollTo(bottomID, anchor: .bottom) }
+                        case .anchor(let id, let offset):
+                            restoringAnchor = (id, offset)
+                            // Bring a lazily realized row into view; subsequent
+                            // measured frames restore its exact previous offset.
+                            DispatchQueue.main.async { proxy.scrollTo(id, anchor: .top) }
                         }
                     }
-                    .onChange(of: messages.map(\.localID)) { previous, current in
-                        guard previous != current else { return }
-                        if let anchor = restoreAfterPrepend, current.first != previous.first,
-                           current.contains(anchor) {
-                            restoreAfterPrepend = nil
-                            // Wait for SwiftUI to lay out newly prepended rows.
-                            DispatchQueue.main.async {
-                                proxy.scrollTo(anchor, anchor: .top)
-                            }
-                            return
-                        }
-                        let appended: Int
-                        if let last = previous.last, let index = current.firstIndex(of: last) {
-                            appended = current.count - index - 1
-                        } else {
-                            appended = 0  // no reliable tail anchor; do not call it new
-                        }
-                        if viewingLatest {
-                            unseenMessages = 0
-                            DispatchQueue.main.async {
-                                proxy.scrollTo(bottomID, anchor: .bottom)
-                            }
-                        } else if appended > 0 {
-                            unseenMessages += appended
-                        }
+                    .onChange(of: newIncomingIDs) { previous, current in
+                        _ = scrollState.reconcile(previous: previousIDs, current: messages.map(\.localID),
+                            newIncoming: current)
+                        onViewportChange(scrollState)
                     }
-                    HStack {
-                        Text("Oldest → newest · time labels only when observed in WeChat")
-                            .font(.caption2).foregroundStyle(.tertiary)
-                            .lineLimit(2)
-                        Spacer(minLength: 6)
-                        Button {
-                            viewingLatest = true
-                            unseenMessages = 0
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                proxy.scrollTo(bottomID, anchor: .bottom)
-                            }
-                        } label: {
-                            Label(unseenMessages > 0 ? "\(unseenMessages) new · Latest" : "Jump to latest",
-                                  systemImage: "arrow.down.to.line")
+                    .onReceive(NotificationCenter.default.publisher(for: NSScrollView.willStartLiveScrollNotification)) { notification in
+                        guard let scroll = notification.object as? NSScrollView, scroll === nativeScrollView else { return }
+                        restoringAnchor = nil // A user's new scroll takes precedence over restoration.
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if !scrollState.viewingLatest || !scrollState.unreadIDs.isEmpty {
+                            Button {
+                                scrollState.jumpToLatest()
+                                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(bottomID, anchor: .bottom) }
+                            } label: {
+                                Label(scrollState.unreadIDs.isEmpty ? "Jump to latest" : "\(scrollState.unreadIDs.count) new · Latest",
+                                    systemImage: "arrow.down.to.line")
+                            }.buttonStyle(.borderedProminent).controlSize(.small).padding(10)
                         }
-                        .controlSize(.small)
-                        .buttonStyle(.bordered)
                     }
                 }
             }
+            Text(scrollState.viewingLatest ? "Latest local messages · WeChat monitoring is independent" : "Viewing local history · monitoring continues")
+                .font(.caption2).foregroundStyle(.secondary)
         }
+        .frame(minHeight: 160, maxHeight: .infinity)
     }
 
     private func bubble(_ message: ChatMessage) -> some View {
         let mine = message.sender == .me
-        let senderLabel = mine ? "Self" : (message.sender == .other ? contactName : "Sender unclear")
         return HStack(spacing: 0) {
-            if mine { Spacer(minLength: 42) }
+            if mine { Spacer(minLength: 30) }
             VStack(alignment: mine ? .trailing : .leading, spacing: 3) {
-                Text(senderLabel).font(.caption2).foregroundStyle(.secondary)
-                Text(message.text)
-                    .font(.system(size: 13))
-                    .textSelection(.enabled)
+                Text(mine ? "Self" : (message.sender == .other ? contactName : "Sender unclear"))
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text(message.text).font(.system(size: 13)).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 10).padding(.vertical, 8)
-                    .background(mine ? Color.accentColor.opacity(0.14) :
-                                Color(nsColor: .windowBackgroundColor),
-                                in: RoundedRectangle(cornerRadius: 10))
+                    .background(mine ? Color.accentColor.opacity(0.14) : Color(nsColor: .windowBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 10))
+            }.frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
+            if !mine { Spacer(minLength: 30) }
+        }
+    }
+}
+
+private struct TranscriptFrames: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) { value.merge(nextValue(), uniquingKeysWith: { _, new in new }) }
+}
+private struct TranscriptBottom: PreferenceKey {
+    static var defaultValue: CGFloat = .infinity
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+private struct TranscriptScrollResolver: NSViewRepresentable {
+    let resolved: (NSScrollView) -> Void
+    func makeNSView(context: Context) -> ResolverView { let view = ResolverView(); view.resolved = resolved; return view }
+    func updateNSView(_ view: ResolverView, context: Context) { view.resolved = resolved }
+    final class ResolverView: NSView {
+        var resolved: ((NSScrollView) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in
+                if let scroll = self?.enclosingScrollView { self?.resolved?(scroll) }
             }
-            .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
-            if !mine { Spacer(minLength: 42) }
         }
     }
 }

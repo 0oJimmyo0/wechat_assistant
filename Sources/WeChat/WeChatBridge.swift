@@ -964,6 +964,14 @@ final class WeChatBridge: @unchecked Sendable {
                                 hasAXMessages: capturePlan.messages == .accessibility && list != nil,
                                 failure: "none", hasAXTitle: axIdentity.hasTitle, timing: timing)
         cacheActivePlan(capturePlan, pid: app.processIdentifier, window: window)
+        backendLock.lock()
+        let verifiedViewport = capturedGeometry.isValidated && geometryWindow.map({ CFEqual($0, window) }) == true
+            ? geometryViewport : nil
+        backendLock.unlock()
+        // Older builds can expose a verified native transcript viewport without
+        // semantic bubble identifiers. Use the same scrollbar evidence there.
+        let observedLiveEdge = axHasUnreadableBubbles || !capturedGeometry.isValidated
+            ? nil : (list ?? verifiedViewport).flatMap { liveEdgeState(in: $0) }
         return .success(WeChatSnapshot(contact: contact, messages: messages, capturedAt: Date(),
                               messageRowCount: rowCount, identitySource: capturePlan.identity,
                               messageSource: capturePlan.messages,
@@ -976,7 +984,7 @@ final class WeChatBridge: @unchecked Sendable {
                               messagesUnchanged: messagesUnchanged,
                               headerUnchanged: visionObservation?.headerFrameUnchanged ?? false,
                               captureTimingDiagnostic: timing,
-                              liveEdgeState: axHasUnreadableBubbles ? nil : list.flatMap { liveEdgeState(in: $0) }))
+                              liveEdgeState: observedLiveEdge))
     }
 
     private func axProbeDiagnostic(_ fastProbe: AXCapabilityProbe?, resolvedProbe: AXCapabilityProbe?, fallbackAttempted: Bool,

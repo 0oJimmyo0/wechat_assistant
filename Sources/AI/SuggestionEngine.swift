@@ -4,10 +4,7 @@ final class SuggestionEngine {
     static let shared = SuggestionEngine()
 
     func generate(context: [ChatMessage], profile: RelationshipProfile, instruction: String, model: String) async throws -> ReplySuggestion {
-        let text = context.suffix(100).map { message in
-            let speaker = message.senderIdentified ? (message.isFromMe ? "我" : "对方") : "说话方不确定"
-            return "\(speaker)：\(message.text)"
-        }.joined(separator: "\n")
+        let text = try AnalysisContext.modelText(context)
         let profileText = "关系：\(profile.relationship)\n沟通提醒：\(profile.communicationNotes)\n语气：\(profile.tone)"
         let request = """
         你是用户的微信回复建议助手。默认用自然中文，温暖真诚、简洁，不像机器人或心理咨询师。回复 1 到 3 句，不盲目赞同，不推测对方动机；适当时先回应情绪再解释。绝不替用户编造感受、承诺、事实、计划或承诺。不要写成长篇道歉。

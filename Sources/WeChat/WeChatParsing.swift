@@ -9,12 +9,21 @@ enum WeChatParsing {
 
     /// Only literal stand-alone time/date labels qualify. Never infer a message
     /// send time from the moment the assistant read it.
+    private static let timeLabelPattern: NSRegularExpression = {
+        let clock = #"(?:(?:上午|下午|早上|晚上)\s*)?(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:AM|PM|上午|下午))?"#
+        let day = #"(?:今天|昨天|前天|Today|Yesterday|星期[一二三四五六日天]|周[一二三四五六日天]|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)"#
+        let date = #"(?:\d{4}[-/年](?:0?[1-9]|1[0-2])[-/月](?:0?[1-9]|[12]\d|3[01])日?|(?:0?[1-9]|1[0-2])月(?:0?[1-9]|[12]\d|3[01])日|(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/\d{4})?|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(?:0?[1-9]|[12]\d|3[01])(?:,?\s*\d{4})?)"#
+        return try! NSRegularExpression(pattern: "^(?:" + clock + "|(?:" + day + "|" + date + ")(?:[ ,，]+" + clock + ")?)$", options: [.caseInsensitive])
+    }()
+
     static func timeSeparatorLabel(_ raw: String?) -> String? {
         guard let raw else { return nil }
         let label = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !label.isEmpty, label.count <= 48, !label.contains("\n") else { return nil }
-        let pattern = #"^(?:(?:今天|昨天|前天|Today|Yesterday|星期[一二三四五六日天]|周[一二三四五六日天])(?:[ ,，]+\d{1,2}:\d{2}(?:\s*(?:AM|PM|上午|下午))?)?|\d{1,2}:\d{2}(?:\s*(?:AM|PM|上午|下午))?|\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?(?:\s+\d{1,2}:\d{2})?|\d{1,2}月\d{1,2}日(?:\s+\d{1,2}:\d{2})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}(?:,\s*\d{4})?(?:\s+\d{1,2}:\d{2}(?:\s*(?:AM|PM))?)?)$"#
-        return label.range(of: pattern, options: .regularExpression.union(.caseInsensitive)) != nil ? label : nil
+        guard !label.isEmpty, label.count <= 48, !label.contains("\n"),
+              timeLabelPattern.firstMatch(in: label, range: NSRange(label.startIndex..., in: label)) != nil else { return nil }
+        // Preserve the literal label. A relative date is never converted into
+        // an invented per-message send time or the local observation time.
+        return label
     }
 
     static func messageSide(_ bounds: CGRect, in region: CGRect) -> MessageSender {
