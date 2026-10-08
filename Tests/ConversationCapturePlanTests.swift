@@ -12,6 +12,20 @@ enum ConversationCapturePlanTests {
         expectPlan(axIdentity: true, axMessages: false, identity: .accessibility, messages: .vision,
                    "AX identity combines with Vision messages")
 
+        let visionCached = ConversationCapturePlan(identity: .vision, messages: .vision)
+        let recoveredIdentity = ConversationCapturePlan.recover(
+            cached: visionCached, hasAXIdentity: true, hasAXMessages: false)
+        expect(recoveredIdentity.identity == .accessibility && recoveredIdentity.messages == .vision,
+               "AX identity can recover from an earlier Vision-only cached plan")
+        let stillPending = ConversationCapturePlan.recover(
+            cached: visionCached, hasAXIdentity: false, hasAXMessages: false)
+        expect(stillPending == visionCached, "unavailable AX title remains a Vision candidate, not a guessed contact")
+        let lostAX = ConversationCapturePlan.recover(
+            cached: ConversationCapturePlan(identity: .accessibility, messages: .accessibility),
+            hasAXIdentity: false, hasAXMessages: false)
+        expect(lostAX.identity == .vision && lostAX.messages == .vision,
+               "lost cached AX evidence safely returns to Vision rather than trusting stale identity")
+
         let unavailable = ConversationCapturePlan.select(hasAXIdentity: false, hasAXMessages: false,
                                                           hasVisionIdentity: false, hasVisionMessages: true)
         expect(unavailable == nil, "capture requires an identity source")
