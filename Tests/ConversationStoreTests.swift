@@ -10,6 +10,25 @@ enum ConversationStoreTests {
         expect(texts(store) == ["A", "B", "C", "D", "E", "F"], "ordered tail overlap appends unseen messages")
         expect(live.appended.map(\.text) == ["E", "F"], "only appended rows are new")
 
+        let timedStore = ConversationStore()
+        _ = timedStore.merge(rows("A", "B", "C"), trust: .validated)
+        let existingIDs = timedStore.messages.map(\.localID)
+        let recovered = timedStore.merge([
+            row("B").withTimeSeparator("Yesterday 10:30"),
+            row("C")
+        ], trust: .validated)
+        expect(recovered.unchanged && timedStore.messages[1].timeSeparatorBefore == "Yesterday 10:30",
+               "an overlapping transcript can enrich a known message with an observed time divider")
+        expect(timedStore.messages.map(\.localID) == existingIDs,
+               "timestamp recovery keeps stable in-memory ordering and identities")
+        _ = timedStore.merge([
+            row("Earlier").withTimeSeparator("Yesterday"),
+            row("A"), row("B")
+        ], trust: .validated)
+        expect(texts(timedStore) == ["Earlier", "A", "B", "C"] &&
+               timedStore.messages[0].timeSeparatorBefore == "Yesterday",
+               "older messages and their observed dividers prepend chronologically")
+
         let duplicateStore = ConversationStore()
         _ = duplicateStore.merge(rows("A", "哈哈"), trust: .validated)
         let duplicate = duplicateStore.merge(rows("A", "哈哈", "哈哈", "B"), trust: .validated)
