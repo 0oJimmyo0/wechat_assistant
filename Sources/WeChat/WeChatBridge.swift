@@ -777,10 +777,8 @@ final class WeChatBridge: @unchecked Sendable {
         backendLock.unlock()
         let plan: ConversationCapturePlan?
         if let reusedPlan {
-            plan = ConversationCapturePlan(
-                identity: axContact != nil ? .accessibility :
-                    (reusedPlan.identity == .accessibility ? .vision : reusedPlan.identity),
-                messages: reusedPlan.messages == .accessibility && list == nil ? .vision : reusedPlan.messages
+            plan = ConversationCapturePlan.recover(
+                cached: reusedPlan, hasAXIdentity: axContact != nil, hasAXMessages: list != nil
             )
         } else {
             plan = ConversationCapturePlan.select(hasAXIdentity: axContact != nil,
