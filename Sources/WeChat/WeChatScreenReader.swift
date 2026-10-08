@@ -947,6 +947,7 @@ final class WeChatScreenReader {
                                          region: CGRect, bubbles: [VisionBubbleRegion]) -> ParsedMessageCapture {
         var rejectedBounds: [CGRect] = []
         var lines: [VisionMessageLine] = []
+        var observedTimeSeparators: [(label: String, bounds: CGRect)] = []
         var unreadableBubbleIDs: Set<Int> = []
         var plausibleTextCount = 0
         var geometryRejectedCount = 0
@@ -957,6 +958,16 @@ final class WeChatScreenReader {
                 continue
             }
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            let mappedBounds = mapBounds(observation.boundingBox, from: region)
+            // WeChat's own centered time dividers are metadata, not chat bubbles.
+            if candidate.confidence >= 0.70,
+               let label = WeChatParsing.timeSeparatorLabel(text),
+               abs(mappedBounds.midX - region.midX) <= region.width * 0.16,
+               mappedBounds.minY >= region.minY, mappedBounds.maxY <= region.maxY,
+               !bubbles.contains(where: { $0.bounds.intersects(mappedBounds) }) {
+                observedTimeSeparators.append((label, mappedBounds))
+                continue
+            }
             guard WeChatParsing.isReliableOCRText(text, confidence: candidate.confidence) else {
                 let bounds = mapBounds(observation.boundingBox, from: region)
                 let line = VisionMessageLine(text: text, bounds: bounds, confidence: candidate.confidence)
@@ -993,7 +1004,17 @@ final class WeChatScreenReader {
             return true
         }
         let (messages, bounds) = VisionMessageReconstruction.reconstruct(confirmed, bubbles: bubbles, region: region)
-        return ParsedMessageCapture(messages: messages, bounds: bounds,
+        var timedMessages = messages
+        // Associate a centered divider with only the *first* confirmed bubble below
+        // it; later messages cannot inherit the divider as their send timestamp.
+        for separator in observedTimeSeparators.sorted(by: { $0.bounds.midY > $1.bounds.midY }) {
+            guard let index = bounds.indices.first(where: { i in
+                let distance = separator.bounds.minY - bounds[i].maxY
+                return distance >= 0 && distance < 0.09 && timedMessages[i].timeSeparatorBefore == nil
+            }) else { continue }
+            timedMessages[index] = timedMessages[index].withTimeSeparator(separator.label)
+        }
+        return ParsedMessageCapture(messages: timedMessages, bounds: bounds,
                                     rejectedBounds: rejectedBounds,
                                     plausibleTextCount: plausibleTextCount,
                                     geometryRejectedCount: geometryRejectedCount,
