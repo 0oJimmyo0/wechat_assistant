@@ -7,6 +7,16 @@ enum WeChatParsing {
     static let messageRowIdentifier = "chat_bubble_item_view"
     static let placeholderRowIdentifier = "virtual_cell"
 
+    /// Only literal stand-alone time/date labels qualify. Never infer a message
+    /// send time from the moment the assistant read it.
+    static func timeSeparatorLabel(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let label = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty, label.count <= 48, !label.contains("\n") else { return nil }
+        let pattern = #"^(?:(?:今天|昨天|前天|Today|Yesterday|星期[一二三四五六日天]|周[一二三四五六日天])(?:[ ,，]+\d{1,2}:\d{2}(?:\s*(?:AM|PM|上午|下午))?)?|\d{1,2}:\d{2}(?:\s*(?:AM|PM|上午|下午))?|\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?(?:\s+\d{1,2}:\d{2})?|\d{1,2}月\d{1,2}日(?:\s+\d{1,2}:\d{2})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}(?:,\s*\d{4})?(?:\s+\d{1,2}:\d{2}(?:\s*(?:AM|PM))?)?)$"#
+        return label.range(of: pattern, options: .regularExpression.union(.caseInsensitive)) != nil ? label : nil
+    }
+
     static func messageSide(_ bounds: CGRect, in region: CGRect) -> MessageSender {
         guard region.width > 0, bounds.minX >= region.minX, bounds.maxX <= region.maxX else { return .unknown }
         let leftMargin = bounds.minX - region.minX
