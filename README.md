@@ -95,6 +95,15 @@ For target-Mac diagnostics, **Inspect WeChat AX** saves structural metadata only
 - [ ] Relaunch and confirm ChatGPT authorization remains connected; test sign-in again after token expiry/revocation.
 - [ ] Inspect logs and source behavior: chat text and tokens are not logged, and there is no WeChat input or send path.
 
+## Local conversation timeline (development branch)
+
+- The sidebar has an **independently scrollable chat transcript**. Scrolling in this pane never scrolls or changes WeChat, so real-time monitoring can continue while the user reads older locally captured messages.
+- **Jump to latest** navigates to the newest *local* message. If verified new messages arrive while the user reads older rows, the button shows a pending count without pulling the viewport away. **WeChat: follow latest** is a separate control that moves WeChat's own window when monitoring has switched into a historical viewport.
+- **Load 20 earlier** calls the existing controlled WeChat scroll-and-capture workflow. It restores WeChat to its latest viewport after loading and merges older messages into session-only history. The history is capped at 200 message occurrences; more history requires a subsequent load and can stop on ambiguous overlap or unavailable content.
+- Message display order follows the verified conversation sequence, not an assumed timestamp. The UI shows *literal* time/date separators only when recovered from recognized Accessibility message-list rows or high-confidence centered OCR within validated transcript geometry. Not every message exposes a send time; the `firstSeenAt` field records observation time and is never presented as a sent timestamp.
+- This feature does not persist chat text or inferred time metadata to disk. Deactivation/chat changes clear the in-memory history and existing privacy controls still gate analysis.
+- Before merging, verify AX and Vision timestamp-label placement on the user's installed WeChat version, scrolling/bottom anchoring, repeated-message identity, incoming badges, and that backfill never triggers automatic analysis. A passing macOS compile cannot validate live WeChat behavior.
+
 ## Known limitations
 
 - Accessibility structure varies by WeChat release. When AX lacks the identity or message list, local Vision capture fills the missing source and requires Screen Recording permission. If neither source can identify the chat or read messages, live capture cannot proceed.
